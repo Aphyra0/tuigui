@@ -198,6 +198,7 @@ impl FrameSource for Mp4VideoSource {
                     metadata: self.metadata(),
                     data: Bytes::from(buf[..filled].to_vec()),
                     presentation_timestamp: None,
+                    timing: None,
                     damage: Vec::new(),
                 };
                 self.child = Some(child);
@@ -210,6 +211,7 @@ impl FrameSource for Mp4VideoSource {
                 presentation_timestamp: Some(std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or(Duration::ZERO)),
+                timing: None,
                 damage: Vec::new(),
             })));
         }

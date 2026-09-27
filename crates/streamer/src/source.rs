@@ -225,6 +225,7 @@ mod tests {
             },
             data: bytes::Bytes::from(vec![0u8; 4 * 4 * 3]),
             presentation_timestamp: None,
+            timing: None,
             damage: vec![r],
         };
         assert_eq!(f.effective_damage(), &[r]);

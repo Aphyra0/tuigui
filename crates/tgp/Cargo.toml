@@ -14,5 +14,9 @@ thiserror = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 
+# base64: byte-to-ASCII for the TGP payload, dramatically faster than the
+# hand-rolled loop this replaced.
+base64 = { version = "0.22" }
+
 # internal
 tuigui-streamer = { workspace = true }

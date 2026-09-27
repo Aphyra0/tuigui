@@ -3,12 +3,13 @@
 //! output into a wl_shm buffer, converts XRGB8888 to RGBA, and emits frames.
 
 use std::fs::File;
-use std::os::unix::io::AsFd;
+use std::os::unix::io::{AsFd, FromRawFd};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use memmap2::MmapMut;
+use tuigui_streamer::frame::CaptureTiming;
 use tuigui_streamer::{Cadence, Frame, FrameMetadata, FrameSource, FrameUpdate, PixelFormat, Rect};
 use wayland_client::delegate_noop;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
@@ -31,6 +32,8 @@ pub struct Screenshot {
     pub height: u32,
     /// `width * height * 4` bytes.
     pub rgba: Vec<u8>,
+    /// Per-phase capture timing breakdown.
+    pub timing: Option<CaptureTiming>,
     /// Damage regions reported by the compositor (pixel coords). May be empty.
     pub damage: Vec<Rect>,
 }
@@ -62,6 +65,7 @@ impl Screenshot {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or(Duration::ZERO),
             ),
+            timing: self.timing,
             damage: self.damage.clone(),
         }
     }
@@ -222,10 +226,13 @@ impl ScreenDriver {
         })
     }
 
-    /// Capture the whole output exactly once and return the RGBA pixels.
+    /// Capture the whole output exactly once and return the RGBA pixels,
+    /// along with a per-phase timing breakdown.
     pub fn grab_once(&mut self) -> Result<Screenshot, CageError> {
         let qh = self.queue.handle();
         tracing::debug!("capture: begin");
+
+        let mut t_phase = std::time::Instant::now();
 
         // overlay_cursor=1 so the headless cursor (if any) is baked in. This
         // only creates the frame object; the compositor will announce the
@@ -233,29 +240,40 @@ impl ScreenDriver {
         let frame = self.manager.capture_output(1, &self.output, &qh, ());
         self.state.start(None);
 
-        // Phase 1: dispatch until the `buffer` (dimensions + format) event arrives.
-        while self.state.get_dims().is_none() || self.state.get_format().is_none() {
-            self.queue
-                .blocking_dispatch(&mut self.state)
-                .map_err(|e| CageError::Capture(e.to_string()))?;
-        }
+        // Phase 1: dispatch until the `buffer` (dimensions + format) event
+        // arrives; the elapsed time is the announce cost.
+        let announce_ms = {
+            while self.state.get_dims().is_none() || self.state.get_format().is_none() {
+                self.queue
+                    .blocking_dispatch(&mut self.state)
+                    .map_err(|e| CageError::Capture(e.to_string()))?;
+            }
+            t_phase.elapsed().as_secs_f64() * 1000.0
+        };
+        t_phase = std::time::Instant::now();
 
         // The compositor dictates the pixel format and layout; honor it.
         let (w, h) = self.state.get_dims().unwrap();
         let fmt = self.state.get_format().unwrap();
         let stride = self.state.get_stride().unwrap_or(w * 4);
         let size = (stride * h) as usize;
-        let file = tempfile::tempfile().map_err(CageError::Io)?;
+        // Back the wl_shm pool with an anonymous memfd (RAM only) instead of a
+        // disk tempfile, so the compositor's frame is never read off disk.
+        let file = memfd_file()?;
+        // Size the pool backing before exposing it to the compositor.
         file.set_len(size as u64).map_err(CageError::Io)?;
-        file.sync_all().map_err(CageError::Io)?;
         let pool = self.shm.create_pool(file.as_fd(), size as i32, &qh, ());
         let buffer = pool.create_buffer(0, w as i32, h as i32, stride as i32, fmt, &qh, ());
 
         self.state.set_file(Some(file));
         frame.copy(&buffer);
+        let setup_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
+        t_phase = std::time::Instant::now();
 
-        // Phase 2: dispatch until ready / failed.
-        loop {
+        // Phase 2: dispatch until ready / failed; the elapsed time is the
+        // compositor's copy cost. The readout cost is measured inside
+        // `build_screenshot`.
+        let (monotonic_copy_ms, mut shot) = 'phase2: loop {
             self.queue
                 .blocking_dispatch(&mut self.state)
                 .map_err(|e| CageError::Capture(e.to_string()))?;
@@ -264,10 +282,29 @@ impl ScreenDriver {
                 return Err(CageError::Capture("screencopy frame failed".into()));
             }
             if let Some(req) = self.state.take_done() {
-                return build_screenshot(&req)
-                    .ok_or_else(|| CageError::Capture("screencopy produced no bytes".into()));
+                let copy_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
+                let shot = build_screenshot(&req)
+                    .ok_or_else(|| CageError::Capture("screencopy produced no bytes".into()))?;
+                break 'phase2 (copy_ms, shot);
             }
+        };
+        // Build the phase breakdown: readout was measured inside
+        // build_screenshot, the other phases are captured here.
+        let mut timing = CaptureTiming {
+            announce_ms,
+            setup_ms,
+            copy_ms: monotonic_copy_ms,
+            ..CaptureTiming::default()
+        };
+        if let Some(rt) = shot.timing.take() {
+            timing.readout_ms = rt.readout_ms;
         }
+        shot.timing = Some(timing);
+        tracing::debug!(
+            ?timing,
+            "capture phase timings"
+        );
+        Ok(shot)
     }
 }
 
@@ -348,6 +385,26 @@ delegate_noop!(CaptureState: ignore wl_shm::WlShm);
 delegate_noop!(CaptureState: ignore wl_output::WlOutput);
 delegate_noop!(CaptureState: ignore wl_buffer::WlBuffer);
 
+/// An anonymous, RAM-backed file for use as the `wl_shm` pool backing. Uses
+/// `memfd_create`, so the buffer lives in page cache / anonymous memory and is
+/// never read from or written to disk. Falls back to a plain anonymous tmpfile
+/// if the memfd syscall is unavailable (older kernels / unusual sandboxes).
+fn memfd_file() -> Result<File, CageError> {
+    // SAFETY: memfd_create is a libc syscall; MFD_CLOEXEC keeps the fd from
+    // leaking into children. The returned fd is owned by the File we wrap.
+    let fd = unsafe {
+        libc::memfd_create(
+            c"tuigui-shm".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd >= 0 {
+        return Ok(unsafe { File::from_raw_fd(fd) });
+    }
+    // Fall back to an anonymous tempfile if memfd_create isn't supported.
+    tempfile::tempfile().map_err(CageError::Io)
+}
+
 /// Build an RGBA Screenshot by reading the mapped shm pool.
 fn build_screenshot(req: &FrameRequest) -> Option<Screenshot> {
     let w = req.width.max(1);
@@ -387,6 +444,44 @@ fn build_screenshot(req: &FrameRequest) -> Option<Screenshot> {
     let native_rgba_order = matches!(pixel_fmt, Format::Xbgr8888 | Format::Abgr8888);
     let has_alpha = matches!(pixel_fmt, Format::Argb8888 | Format::Abgr8888);
     let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+    let t_read = std::time::Instant::now();
+
+    // Fast path: pixel byte order already matches RGBA and rows are tightly
+    // packed (stride == w*4) with no y-flip. Then the frame is literally the
+    // first `size` bytes of the mmap — a single bulk copy, no per-pixel work.
+    // For opaque formats the only fix-up is writing alpha=0xff (the 4th byte
+    // of every pixel), done with a word-wise fill that skips the 4th byte.
+    if !req.y_invert && stride == w * 4 && native_rgba_order {
+        if has_alpha {
+            // ABGR8888: stored R,G,B,A already — plain memcpy.
+            rgba.copy_from_slice(&mmap[..size]);
+        } else {
+            // XBGR8888: stored R,G,B,X — copy then force the X byte to 0xff.
+            rgba.copy_from_slice(&mmap[..size]);
+            let words = unsafe {
+                std::slice::from_raw_parts_mut(rgba.as_mut_ptr() as *mut u32, rgba.len() / 4)
+            };
+            let fill = u32::from_le_bytes([0, 0, 0, 0xff]);
+            for w_ in words {
+                *w_ = (*w_ & 0x00ff_ffff) | fill;
+            }
+        }
+        let readout_ms = t_read.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(readout_ms, "screencopy pixels read out (bulk)");
+        return Some(Screenshot {
+            width: w,
+            height: h,
+            rgba,
+            timing: Some(CaptureTiming {
+                readout_ms,
+                ..CaptureTiming::default()
+            }),
+            damage: req.damage.clone(),
+        });
+    }
+
+    // Slow path: handle y-flip, non-tight stride, and R/B-swapped formats by
+    // processing each pixel, one 4-byte pixel per step.
     for row in 0..h as usize {
         // The server may report y-inverted contents; read bottom-up if so.
         let src_row = if req.y_invert {
@@ -396,26 +491,37 @@ fn build_screenshot(req: &FrameRequest) -> Option<Screenshot> {
         };
         let src_off = src_row * stride as usize;
         let dst_off = row * w as usize * 4;
-        for col in 0..w as usize {
+        // Open-code the hot row loop instead of iterating over every pixel
+        // individually: copy or transform one full 4-byte pixel per step.
+        let n = w as usize;
+        for col in 0..n {
             let p = src_off + col * 4;
-            let (r, g, b) = if native_rgba_order {
-                (mmap[p], mmap[p + 1], mmap[p + 2])
-            } else {
-                (mmap[p + 2], mmap[p + 1], mmap[p])
-            };
-            let a = if has_alpha { mmap[p + 3] } else { 0xff };
             let d = dst_off + col * 4;
-            rgba[d] = r;
-            rgba[d + 1] = g;
-            rgba[d + 2] = b;
-            rgba[d + 3] = a;
+            if native_rgba_order {
+                // No byte reorder, only an alpha fill to apply.
+                rgba[d] = mmap[p];
+                rgba[d + 1] = mmap[p + 1];
+                rgba[d + 2] = mmap[p + 2];
+                rgba[d + 3] = if has_alpha { mmap[p + 3] } else { 0xff };
+            } else {
+                // R/B swapped: XRGB stored as B,G,R,A.
+                rgba[d] = mmap[p + 2];
+                rgba[d + 1] = mmap[p + 1];
+                rgba[d + 2] = mmap[p];
+                rgba[d + 3] = if has_alpha { mmap[p + 3] } else { 0xff };
+            }
         }
     }
-
+    let readout_ms = t_read.elapsed().as_secs_f64() * 1000.0;
+    tracing::debug!(readout_ms, "screencopy pixels read out");
     Some(Screenshot {
         width: w,
         height: h,
         rgba,
+        timing: Some(CaptureTiming {
+            readout_ms,
+            ..CaptureTiming::default()
+        }),
         damage: req.damage.clone(),
     })
 }
@@ -484,6 +590,7 @@ mod tests {
             width: 2,
             height: 2,
             rgba: vec![0; 16],
+            timing: None,
             damage: vec![Rect {
                 x: 0,
                 y: 0,

@@ -18,24 +18,44 @@ pub struct Stats {
     pub capture_ms: f64,
     /// Virtual frame resolution in pixels.
     pub resolution: (u32, u32),
+    /// Wall-clock cost of encoding a frame's pixels into TGP bytes (base64).
+    pub encode_ms: f64,
+    /// Wall-clock cost of writing a frame's bytes to the terminal (pty write).
+    pub sink_ms: f64,
+    /// Per-phase capture breakdown (averages), when the source reports it.
+    pub announce_ms: f64,
+    pub setup_ms: f64,
+    pub copy_ms: f64,
+    pub readout_ms: f64,
 }
 
 /// Render the shell and return the area the TGP image should be placed into —
-/// the full body above a single status footer (no header, no border).
+/// the full body above two status footer rows (no header, no border).
 pub fn draw(f: &mut Frame, app: &str, status: &str, stats: &Stats) -> Rect {
     let [body, footer] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
+        Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(f.area());
 
     let (rw, rh) = stats.resolution;
-    let line = format!(
-        " {status} · {app}  ·  {:.0} fps · {:.1} MiB/s · capture {:.1} ms · {rw}x{rh}  · q quit ",
+    let line1 = format!(
+        " {status} · {app}  ·  FPS: {:.0}  ·  Bandwidth: {:.1} MiB/s  ·  Capture: {:.1} ms  ·  Encode: {:.1} ms  ·  Sink: {:.1} ms  ·  Resolution: {rw}x{rh}",
         stats.fps,
         stats.bandwidth / (1024.0 * 1024.0),
         stats.capture_ms,
+        stats.encode_ms,
+        stats.sink_ms,
     );
 
+    let line2 = if stats.announce_ms > 0.0 {
+        format!(
+            " Capture phases: announce {:.2} ms · setup {:.2} ms · copy {:.2} ms · readout {:.2} ms  ·  q to quit",
+            stats.announce_ms, stats.setup_ms, stats.copy_ms, stats.readout_ms,
+        )
+    } else {
+        " q to quit".to_string()
+    };
+
     f.render_widget(
-        Paragraph::new(line).style(
+        Paragraph::new(vec![line1.into(), line2.into()]).style(
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

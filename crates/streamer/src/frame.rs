@@ -30,6 +30,26 @@ pub struct FrameMetadata {
     pub format: PixelFormat,
 }
 
+/// Optional per-phase capture profiling, filled in by live capturers. Purely
+/// informational; the TGP emitter ignores it but the UI surfaces it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CaptureTiming {
+    /// Wall-clock until the compositor announced dims/format (`buffer` event).
+    pub announce_ms: f64,
+    /// Setting up the shared buffer (create shm pool + buffer + copy request).
+    pub setup_ms: f64,
+    /// Waiting for the compositor to finish copying into the buffer (`ready`).
+    pub copy_ms: f64,
+    /// Reading the pixels out of the shared buffer into an owned RGBA Vec.
+    pub readout_ms: f64,
+}
+
+impl CaptureTiming {
+    pub fn total_ms(&self) -> f64 {
+        self.announce_ms + self.setup_ms + self.copy_ms + self.readout_ms
+    }
+}
+
 /// One decoded frame in a [`FrameSource`] stream.
 ///
 /// The pixel payload is opaque to the TGP emitter: it is whatever the codec
@@ -44,6 +64,8 @@ pub struct Frame {
     /// Which frames this one builds on: a decoder-produced PTS, or a capture
     /// monotonic timestamp. Purely informational for the emitter.
     pub presentation_timestamp: Option<Duration>,
+    /// Per-phase capture cost breakdown, when produced by a live capturer.
+    pub timing: Option<CaptureTiming>,
     /// Damaged regions in *pixel* coordinates, row-major top-left origin.
     /// Empty means "the whole frame changed".
     pub damage: Vec<Rect>,
@@ -63,6 +85,7 @@ impl Frame {
             metadata,
             data,
             presentation_timestamp: None,
+            timing: None,
             damage: Vec::new(),
         }
     }

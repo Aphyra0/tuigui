@@ -246,14 +246,14 @@ fn terminal_pixel_size() -> Result<(u32, u32)> {
 }
 
 /// The streamed image's area in terminal cells — the rectangle the TGP image
-/// is placed into. Must match the layout in `ui::draw`: no header, a single
-/// status footer, and no border around the body.
+/// is placed into. Must match the layout in `ui::draw`: no header, two status
+/// footers, and no border around the body.
 fn pane_placement() -> Result<(u32, u32)> {
     let (cols, rows) = crossterm::terminal::size().context("querying terminal size")?;
-    if rows <= 1 {
+    if rows <= 2 {
         return Ok((cols as u32, rows as u32));
     }
-    Ok((cols as u32, (rows - 1) as u32))
+    Ok((cols as u32, (rows - 2) as u32))
 }
 
 /// Drain any TGP stream writing raw bytes to `out` until Ended.
@@ -346,7 +346,13 @@ async fn run_ui(
     let mut t_prev = std::time::Instant::now();
     let mut frame_bytes_accum = 0usize;
     let mut cap_ms_accum = 0f64;
+    let mut encode_ms_accum = 0f64;
+    let mut sink_ms_accum = 0f64;
     let mut frame_count_accum = 0usize;
+    let mut announce_accum = 0f64;
+    let mut setup_accum = 0f64;
+    let mut copy_accum = 0f64;
+    let mut readout_accum = 0f64;
 
     while !quit {
         // Draw the shell; capture the pane's inner rect where the image lands.
@@ -367,31 +373,48 @@ async fn run_ui(
         }
         let mut written_chunks = 0usize;
         let mut written_bytes = 0usize;
+        let mut sink_ms = 0f64;
+        // Bail out after this many bytes per frame so the UI loop always
+        // yields to redraw + key polling, even when a fast encoder floods the
+        // (now bounded) channel every iteration.
+        const MAX_DRAIN_BYTES: usize = 1024 * 1024;
         // Drain with a real await so the stream gets a proper waker. A plain
         // `futures::poll!` uses a noop waker: once the channel is momentarily
         // empty it returns Pending -> break and is never woken again, freezing
         // mid-frame. `timeout` relinquishes the loop to redraw + key polling
         // when no bytes arrive for ~4ms.
         loop {
+            if written_bytes >= MAX_DRAIN_BYTES {
+                break;
+            }
             match tokio::time::timeout(std::time::Duration::from_millis(4), tgp_stream.next())
                 .await
             {
                 Ok(Some(Ok(EncoderEvent::Bytes(b)))) if !b.is_empty() => {
                     written_chunks += 1;
                     written_bytes += b.len();
+                    let t0 = std::time::Instant::now();
                     out.write_all(&b)?;
+                    sink_ms += t0.elapsed().as_secs_f64() * 1000.0;
                 }
                 // Empty batch means nothing more to drain right now; stop and
                 // return control to the UI loop so keys/mouse stay responsive
                 // even when the encoder idles between frames. Spinning on
                 // empty chunks would busy-loop and starve input polling.
                 Ok(Some(Ok(EncoderEvent::Bytes(_)))) => break,
-                Ok(Some(Ok(EncoderEvent::Frame { width, height, capture_ms }))) => {
+                Ok(Some(Ok(EncoderEvent::Frame { width, height, capture_ms, encode_ms, timing }))) => {
                     // Record the frame's resolution and capture cost into the
                     // rolling window.
                     frame_count_accum += 1;
                     cap_ms_accum += capture_ms;
+                    encode_ms_accum += encode_ms;
                     stats.resolution = (width, height);
+                    if let Some(t) = timing {
+                        announce_accum += t.announce_ms;
+                        setup_accum += t.setup_ms;
+                        copy_accum += t.copy_ms;
+                        readout_accum += t.readout_ms;
+                    }
                 }
                 Ok(Some(Ok(EncoderEvent::Ended))) => {
                     last_event = "capture ended".into();
@@ -410,6 +433,8 @@ async fn run_ui(
             }
         }
         out.flush()?;
+        // Fold the write-to-terminal cost into the per-second window.
+        sink_ms_accum += sink_ms;
 
         // Accrue this iteration's transmitted bytes into the rolling window.
         frame_bytes_accum += written_bytes;
@@ -419,13 +444,26 @@ async fn run_ui(
         let elapsed = now.saturating_duration_since(t_prev);
         if frame_count_accum > 0 && elapsed >= std::time::Duration::from_secs(1) {
             let secs = elapsed.as_secs_f64().max(1e-9);
+            let n = frame_count_accum as f64;
             stats.fps = frame_count_accum as f64 / secs;
             stats.bandwidth = frame_bytes_accum as f64 / secs;
-            stats.capture_ms = cap_ms_accum / frame_count_accum as f64;
+            stats.capture_ms = cap_ms_accum / n;
+            stats.encode_ms = encode_ms_accum / n;
+            stats.sink_ms = sink_ms_accum / n;
+            stats.announce_ms = announce_accum / n;
+            stats.setup_ms = setup_accum / n;
+            stats.copy_ms = copy_accum / n;
+            stats.readout_ms = readout_accum / n;
             t_prev = now;
             frame_count_accum = 0;
             frame_bytes_accum = 0;
             cap_ms_accum = 0.0;
+            encode_ms_accum = 0.0;
+            sink_ms_accum = 0.0;
+            announce_accum = 0.0;
+            setup_accum = 0.0;
+            copy_accum = 0.0;
+            readout_accum = 0.0;
         }
         tracing::info!(
             pane = ?pane.map(|r| (r.x, r.y, r.width, r.height)),

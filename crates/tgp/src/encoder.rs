@@ -24,6 +24,11 @@ pub enum EncoderEvent {
         /// Wall-clock time spent pulling this frame out of its source (the
         /// capture cost), measured around `source.next()`.
         capture_ms: f64,
+        /// Wall-clock time spent turning the frame's pixels into TGP bytes
+        /// (base64 + chunking), measured around `full_frame_commands`.
+        encode_ms: f64,
+        /// Per-phase capture breakdown, when the source reported it.
+        timing: Option<tuigui_streamer::frame::CaptureTiming>,
     },
     /// Bytes to write to the terminal, in order.
     Bytes(Vec<u8>),
@@ -161,17 +166,22 @@ impl TgpEncoder {
                     let cur_id = self.image_id;
                     self.image_id = self.image_id.wrapping_add(1);
                     // Announce the frame before its payload so the consumer can
-                    // timestamp it for capture/latency telemetry, then cover it.
-                    on_event(EncoderEvent::Frame {
-                        width: frame.metadata.width,
-                        height: frame.metadata.height,
-                        capture_ms: poll_ms,
-                    })?;
+                    // timestamp it for capture/latency telemetry. The bytes are
+                    // produced inline, so time the encoding here.
+                    let t_encode = Instant::now();
                     for bytes in
                         full_frame_commands(&frame, &base_control(&frame.metadata, cur_id))
                     {
                         on_event(EncoderEvent::Bytes(bytes))?;
                     }
+                    let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
+                    on_event(EncoderEvent::Frame {
+                        width: frame.metadata.width,
+                        height: frame.metadata.height,
+                        capture_ms: poll_ms,
+                        encode_ms,
+                        timing: frame.timing,
+                    })?;
                     if let Some(prev) = prev_image_id.take() {
                         on_event(EncoderEvent::Bytes(delete_image(prev)))?;
                     }
@@ -192,6 +202,9 @@ impl TgpEncoder {
     where
         S: FrameSource + 'static,
     {
+        // Unbounded buffer is fine: the consumer's drain loop caps bytes per
+        // iteration, so it always yields to input polling regardless of how
+        // fast this producer runs.
         let (tx, rx) = mpsc::unbounded_channel::<Result<EncoderEvent, EncoderError>>();
         tokio::spawn(async move {
             let result = self
@@ -239,7 +252,6 @@ fn full_frame_commands(frame: &Frame, control: &[(char, String)]) -> Vec<Vec<u8>
     ctrl.extend(control.iter().cloned());
     // a=T places at the cursor; but we do not manage the cursor here, the
     // host TUI does. Placement keys live in `control` via base_control().
-    let _ = fmt; // used via chunked_transmit below
     let mut out = Vec::new();
     for c in tgp::chunked_transmit(fmt, ctrl, &frame.data) {
         out.push(c);
