@@ -50,6 +50,13 @@ pub struct EncoderConfig {
     /// Consecutive frame number the first delta is based on. The base image
     /// itself is frame 1.
     pub first_delta_base_frame: u32,
+    /// On-screen placement size in terminal cells. When both are `>0` every
+    /// placed image is scaled to fill exactly this `columns x rows` area;
+    /// without these the image is shown at one screen cell per source pixel,
+    /// so a full-resolution frame overflows the terminal and only its top-left
+    /// corner is visible. Set both from the TUI's pane size.
+    pub placement_columns: u32,
+    pub placement_rows: u32,
 }
 
 impl Default for EncoderConfig {
@@ -57,6 +64,8 @@ impl Default for EncoderConfig {
         EncoderConfig {
             strategy: Strategy::default(),
             first_delta_base_frame: 1,
+            placement_columns: 0,
+            placement_rows: 0,
         }
     }
 }
@@ -98,13 +107,18 @@ impl TgpEncoder {
         let mut frame_no = self.config.first_delta_base_frame.max(1);
         let mut last_meta: Option<FrameMetadata> = None;
 
-        // Initial control block for this image.
+        // Initial control block for this image. Placement rect (`c`,`r`) is
+        // carried on the transmit+place so the image fills the pane on screen.
         let base_control = |m: &FrameMetadata, placed_| {
             let mut c = vec![
                 ('i', self.image_id.to_string()),
                 ('s', m.width.to_string()),
                 ('v', m.height.to_string()),
             ];
+            if self.config.placement_columns > 0 && self.config.placement_rows > 0 {
+                c.push(('c', self.config.placement_columns.to_string()));
+                c.push(('r', self.config.placement_rows.to_string()));
+            }
             if placed_ {
                 c.push(('p', 1u32.to_string()));
             }

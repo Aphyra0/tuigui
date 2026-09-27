@@ -28,14 +28,6 @@ struct Cli {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "APP_ARGS")]
     app_args: Vec<String>,
 
-    /// Virtual display width in pixels.
-    #[arg(long, global = true, default_value_t = 1280)]
-    width: u32,
-
-    /// Virtual display height in pixels.
-    #[arg(long, global = true, default_value_t = 800)]
-    height: u32,
-
     /// Stream frames from an mp4 file into the TUI (bypasses cage/Wayland).
     #[arg(long)]
     video: Option<String>,
@@ -86,7 +78,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.debug_streaming {
-        return run_pink_streaming(&cli).await;
+        return run_pink_streaming().await;
     }
     if cli.debug_capture {
         return run_capture_png(&cli).await;
@@ -105,9 +97,13 @@ async fn main() -> Result<()> {
     let app_path = cli.app.clone().unwrap();
 
     let spec = CageSpec::new(&app_path);
+    // Size the virtual display to the terminal's drawing area so the app's
+    // pixels map ~1:1 to on-screen cells; avoids resampling the capture.
+    let (tcols, trows) = terminal_pixel_size()?;
+    let (pc, pr) = pane_placement()?;
     let cfg = HeadlessConfig {
-        width: cli.width,
-        height: cli.height,
+        width: tcols,
+        height: trows,
         ..HeadlessConfig::default()
     };
 
@@ -122,9 +118,11 @@ async fn main() -> Result<()> {
     let source = CageFrameSource::connect(&CaptureConfig::new(session.wayland_socket().clone()))
         .context("connecting screencopy client")?;
 
-    // 3. Encode to a TGP byte stream.
+    // 3. Encode to a TGP byte stream, scaled to fill the pane (in cells).
     let encoder = TgpEncoder::new(EncoderConfig {
         strategy: Strategy::DeltaFrames,
+        placement_columns: pc,
+        placement_rows: pr,
         ..EncoderConfig::default()
     });
     let mut tgp_stream = encoder.into_stream(source);
@@ -162,6 +160,41 @@ async fn run_video_to_file(path: &str, out: &str, loop_forever: bool) -> Result<
     });
     let stream = encoder.into_stream(src);
     drain_to_file(stream, out).await
+}
+
+/// Query the terminal's current size and report it in pixels, suitable for
+/// sizing the cage virtual output. Reads the cell grid via crossterm and
+/// multiplies by the cell size reported by the terminal if available.
+fn terminal_pixel_size() -> Result<(u32, u32)> {
+    let (cols, rows) = crossterm::terminal::size().context("querying terminal size")?;
+    if cols == 0 || rows == 0 {
+        return Ok((1280, 800)); // headless/unknown PTY; fall back to the default.
+    }
+    // Default to the classic 8x16 monospace cell. window_size() often reports
+    // pixel dims of 0 on unix (unused), so only trust it when it gives a
+    // nonzero pixel size consistent with the reported cell grid.
+    let mut cell_w = 8u32;
+    let mut cell_h = 16u32;
+    if let Ok(ws) = crossterm::terminal::window_size() {
+        if ws.width > 0 && ws.columns > 0 {
+            cell_w = (ws.width as u32 / ws.columns as u32).max(1);
+        }
+        if ws.height > 0 && ws.rows > 0 {
+            cell_h = (ws.height as u32 / ws.rows as u32).max(1);
+        }
+    }
+    Ok((cols as u32 * cell_w, rows as u32 * cell_h))
+}
+
+/// The pane's inner area in terminal cells — the rectangle the TGP image is
+/// placed into. Must match the layout in `ui::draw`: a 1-row header, a 1-row
+/// footer, and a 1-cell border around the body.
+fn pane_placement() -> Result<(u32, u32)> {
+    let (cols, rows) = crossterm::terminal::size().context("querying terminal size")?;
+    if cols <= 2 || rows <= 4 {
+        return Ok((cols as u32, rows as u32));
+    }
+    Ok(((cols - 2) as u32, (rows - 4) as u32))
 }
 
 /// Drain any TGP stream writing raw bytes to `out` until Ended.
@@ -318,9 +351,10 @@ async fn run_capture_png(cli: &Cli) -> Result<()> {
 
     let app_path = cli.app.clone().unwrap();
     let spec = CageSpec::new(&app_path);
+    let (tcols, trows) = terminal_pixel_size()?;
     let cfg = HeadlessConfig {
-        width: cli.width,
-        height: cli.height,
+        width: tcols,
+        height: trows,
         ..HeadlessConfig::default()
     };
 
@@ -430,8 +464,8 @@ async fn run_debug_fill() -> Result<()> {
 /// `--debug-streaming`: stream solid-pink frames through the real TGP encoder
 /// (transmit + place) into the TUI. Synthetic [`PinkFrameSource`], so nothing
 /// depends on cage/Wayland/video — this isolates TGP placement itself.
-async fn run_pink_streaming(cli: &Cli) -> Result<()> {
-    let (w, h) = (cli.width, cli.height);
+async fn run_pink_streaming() -> Result<()> {
+    let (w, h) = terminal_pixel_size()?;
     let src = PinkFrameSource::infinite(w, h);
     tracing::info!(width = w, height = h, "pink streaming frame source");
 
