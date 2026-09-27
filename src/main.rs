@@ -223,15 +223,15 @@ fn terminal_pixel_size() -> Result<(u32, u32)> {
     Ok((cols as u32 * cell_w, rows as u32 * cell_h))
 }
 
-/// The pane's inner area in terminal cells — the rectangle the TGP image is
-/// placed into. Must match the layout in `ui::draw`: a 1-row header, a 1-row
-/// footer, and a 1-cell border around the body.
+/// The streamed image's area in terminal cells — the rectangle the TGP image
+/// is placed into. Must match the layout in `ui::draw`: a 1-row header, a
+/// 1-row footer, and no border around the body.
 fn pane_placement() -> Result<(u32, u32)> {
     let (cols, rows) = crossterm::terminal::size().context("querying terminal size")?;
-    if cols <= 2 || rows <= 4 {
+    if rows <= 2 {
         return Ok((cols as u32, rows as u32));
     }
-    Ok(((cols - 2) as u32, (rows - 4) as u32))
+    Ok((cols as u32, (rows - 2) as u32))
 }
 
 /// Drain any TGP stream writing raw bytes to `out` until Ended.
