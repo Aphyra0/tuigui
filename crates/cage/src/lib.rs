@@ -16,7 +16,7 @@ pub mod input;
 pub mod session;
 
 pub use capture::{CageFrameSource, CaptureConfig, PageSource, ScreenDriver, Screenshot};
-pub use input::{InputSink, KeyEvent, KeyState, PointerEvent, RecordingSink};
+pub use input::{InputSink, InputSock, KeyEvent, KeyState, PointerEvent, RecordingSink};
 pub use session::{CageSession, CageSpec, HeadlessConfig};
 
 use thiserror::Error;

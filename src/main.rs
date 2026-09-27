@@ -6,12 +6,17 @@
 mod ui;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::{Stream, StreamExt};
 use ratatui::{backend::CrosstermBackend, Terminal};
-use tuigui_cage::{CageFrameSource, CageSession, CageSpec, CaptureConfig, HeadlessConfig};
+use tuigui_cage::{
+    CageFrameSource, CageSession, CageSpec, CaptureConfig, HeadlessConfig, InputSink, InputSock,
+    KeyEvent, KeyState, PointerEvent,
+};
 use tuigui_streamer::{FrameSource, Mp4VideoSource, PinkFrameSource};
 use tuigui_tgp::proto as tgp;
 use tuigui_tgp::{EncoderConfig, EncoderEvent, EncoderError, Strategy, TgpEncoder};
@@ -135,7 +140,39 @@ async fn main() -> Result<()> {
 
     // 5. Run the ratatui shell.
     let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
-    run_ui(terminal, &mut tgp_stream, &app_path, Some(session)).await
+
+    // Connect the input sink on a background task with a timeout so a slow or
+    // refusing Wayland server can never stall the render loop (or the `q`
+    // quit key). `run_ui` polls this and begins forwarding only once ready.
+    let sink: Arc<Mutex<Option<Box<dyn InputSink>>>> = Arc::new(Mutex::new(None));
+    let sink_task = Arc::clone(&sink);
+    let sock_path = session.wayland_socket().clone();
+    let (tw, th) = (tcols, trows);
+    tokio::spawn(async move {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            let mut ins = InputSock::connect(&sock_path)?;
+            ins.set_frame_size(tw, th);
+            Ok::<_, anyhow::Error>(ins)
+        })
+        .await;
+        match result {
+            Ok(Ok(ins)) => {
+                *sink_task.lock().await = Some(Box::new(ins));
+            }
+            Ok(Err(e)) => tracing::warn!(err = %e, "input injection unavailable"),
+            Err(_) => tracing::warn!("input connect timed out; input disabled"),
+        }
+    });
+
+    run_ui(
+        terminal,
+        &mut tgp_stream,
+        &app_path,
+        Some(session),
+        (tcols, trows),
+        sink,
+    )
+    .await
 }
 
 /// Stream a video file's decoded frames through the TGP encoder into a file.
@@ -244,7 +281,7 @@ async fn run_video_tui(path: &str) -> Result<()> {
     let mut tgp_stream = encoder.into_stream(src);
 
     let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
-    run_ui(terminal, &mut tgp_stream, &format!("video: {path}"), None).await
+    run_ui(terminal, &mut tgp_stream, &format!("video: {path}"), None, (0, 0), Arc::new(Mutex::new(None))).await
 }
 
 async fn run_ui(
@@ -252,9 +289,15 @@ async fn run_ui(
     tgp_stream: &mut (impl Unpin + Stream<Item = Result<EncoderEvent, EncoderError>>),
     app_path: &str,
     session: Option<CageSession>,
+    output_px: (u32, u32),
+    sink: Arc<Mutex<Option<Box<dyn InputSink>>>>,
 ) -> Result<()> {
     crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
     terminal.clear()?;
 
     let mut last_bytes: usize = 0;
@@ -322,14 +365,33 @@ async fn run_ui(
             "ui drain iteration"
         );
 
-        // Input scaffold: 'q' quits; forwarding comes with input injection (M3).
+        // Forward input: keys and mouse to the session's input sink (if any).
+        // The pane is the live-capture region; convert cursor cell coords to
+        // the virtual frame's pixels before injecting. The sink appears on a
+        // background task once its Wayland connection is ready.
         while crossterm::event::poll(std::time::Duration::from_millis(4))? {
-            if let crossterm::event::Event::Key(k) = crossterm::event::read()? {
-                if k.kind == crossterm::event::KeyEventKind::Press
-                    && k.code == crossterm::event::KeyCode::Char('q')
-                {
-                    quit = true;
+            let ev = crossterm::event::read()?;
+            match ev {
+                crossterm::event::Event::Key(k) => {
+                    if k.kind == crossterm::event::KeyEventKind::Press
+                        && k.code == crossterm::event::KeyCode::Char('q')
+                    {
+                        quit = true;
+                    }
+                    if let Some(kev) = crossterm_key_to_key(k) {
+                        let mut guard = sink.lock().await;
+                        if let Some(s) = guard.as_mut() {
+                            (**s).send_key(kev).await.ok();
+                        }
+                    }
                 }
+                crossterm::event::Event::Mouse(m) => {
+                    let mut guard = sink.lock().await;
+                    if let Some(s) = guard.as_mut() {
+                        forward_mouse(&mut **s, m, pane, output_px).await;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -340,6 +402,140 @@ async fn run_ui(
         s.shutdown().await.ok();
     }
     Ok(())
+}
+
+/// Translate a crossterm key code into a [`KeyEvent`] for the session, or
+/// `None` if it maps to nothing we forward (control/function keys so far). Only
+/// presses are forwarded; auto-repeat is dropped by kind.
+fn crossterm_key_to_key(k: crossterm::event::KeyEvent) -> Option<KeyEvent> {
+    use crossterm::event::KeyEventKind;
+    if k.kind != KeyEventKind::Press {
+        return None;
+    }
+    use crossterm::event::KeyCode::{
+        Backspace, Char, Delete, Down, End, Enter, Esc, Home, Left, Right, Tab, Up,
+    };
+    let code = match k.code {
+        Char(c) => char_to_evdev(c)?,
+        Enter => 28,     // KEY_ENTER
+        Tab => 15,       // KEY_TAB
+        Backspace => 14, // KEY_BACKSPACE
+        Esc => 1,        // KEY_ESC
+        Left => 105,     // KEY_LEFT
+        Right => 106,    // KEY_RIGHT
+        Up => 103,       // KEY_UP
+        Down => 108,     // KEY_DOWN
+        Home => 102,     // KEY_HOME
+        End => 107,      // KEY_END
+        Delete => 111,   // KEY_DELETE
+        _ => return None,
+    };
+    Some(KeyEvent { code, state: KeyState::Press })
+}
+
+/// Map a displayable ASCII char to its Linux evdev keycode. Returns `None` for
+/// non-printable/uppercase-modified keys; callers may treat that as "skip".
+fn char_to_evdev(c: char) -> Option<u32> {
+    // Lowercase ASCII maps to the known layout-independent range.
+    let c = c.to_ascii_lowercase();
+    let code = match c {
+        'a'..='z' => 30 + (c as u8 - b'a') as u32,
+        '0'..='9' => 27 + (c as u8 - b'0') as u32,
+        ' ' => 57,   // KEY_SPACE
+        '-' => 12,   // KEY_MINUS
+        '=' => 13,   // KEY_EQUAL
+        '[' => 26,   // KEY_LEFTBRACE
+        ']' => 27,   // KEY_RIGHTBRACE
+        ';' => 39,   // KEY_SEMICOLON
+        '\'' => 40,  // KEY_APOSTROPHE
+        '`' => 41,   // KEY_GRAVE
+        '\\' => 43,  // KEY_BACKSLASH
+        ',' => 51,   // KEY_COMMA
+        '.' => 52,   // KEY_DOT
+        '/' => 53,   // KEY_SLASH
+        '\n' => 28,  // KEY_ENTER
+        _ => return None,
+    };
+    Some(code)
+}
+
+/// Dispatch a crossterm mouse event to the sink, converting cursor cell coords
+/// (relative to the pane) into virtual-frame pixels via the pane rect and the
+/// virtual output's pixel size.
+async fn forward_mouse(
+    sink: &mut dyn InputSink,
+    m: crossterm::event::MouseEvent,
+    pane: Option<ratatui::layout::Rect>,
+    output_px: (u32, u32),
+) {
+    use crossterm::event::{MouseButton as B, MouseEventKind as K};
+    let (px, py, pw, ph) = pane
+        .map(|r| (r.x, r.y, r.width, r.height))
+        .unwrap_or((0, 0, 0, 0));
+    // cell (relative to pane) -> normalized [0,1] -> virtual-frame pixel.
+    let (fw, fh) = (output_px.0.max(1) as f64, output_px.1.max(1) as f64);
+    let to_px = |col: u16, row: u16| {
+        let nx = ((col as f64 - px as f64) / pw.max(1) as f64).clamp(0.0, 1.0);
+        let ny = ((row as f64 - py as f64) / ph.max(1) as f64).clamp(0.0, 1.0);
+        (nx * fw, ny * fh)
+    };
+    match m.kind {
+        K::Moved => {
+            let (x, y) = to_px(m.column, m.row);
+            sink.send_pointer(PointerEvent::Motion { x, y })
+                .await
+                .ok();
+        }
+        K::Drag(b) => {
+            let (x, y) = to_px(m.column, m.row);
+            sink.send_pointer(PointerEvent::Motion { x, y })
+                .await
+                .ok();
+            // Keep the primary button held while dragging if it's a drag.
+            let _ = b;
+        }
+        K::Down(b) => {
+            let code = match b {
+                B::Left => 0x110,
+                B::Right => 0x111,
+                B::Middle => 0x112,
+            };
+            let (x, y) = to_px(m.column, m.row);
+            sink.send_pointer(PointerEvent::Motion { x, y })
+                .await
+                .ok();
+            sink.send_pointer(PointerEvent::Button {
+                code,
+                state: KeyState::Press,
+            })
+            .await
+            .ok();
+        }
+        K::Up(b) => {
+            let code = match b {
+                B::Left => 0x110,
+                B::Right => 0x111,
+                B::Middle => 0x112,
+            };
+            sink.send_pointer(PointerEvent::Button {
+                code,
+                state: KeyState::Release,
+            })
+            .await
+            .ok();
+        }
+        K::ScrollDown => {
+            sink.send_pointer(PointerEvent::Axis { dx: 0.0, dy: -1.0 })
+                .await
+                .ok();
+        }
+        K::ScrollUp => {
+            sink.send_pointer(PointerEvent::Axis { dx: 0.0, dy: 1.0 })
+                .await
+                .ok();
+        }
+        _ => {}
+    }
 }
 
 /// `--debug-capture`: spawn the caged session exactly like the real path, but
@@ -476,5 +672,13 @@ async fn run_pink_streaming() -> Result<()> {
     let mut tgp_stream = encoder.into_stream(src);
 
     let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
-    run_ui(terminal, &mut tgp_stream, "debug-streaming: pink", None).await
+    run_ui(
+        terminal,
+        &mut tgp_stream,
+        "debug-streaming: pink",
+        None,
+        (0, 0),
+        Arc::new(Mutex::new(None)),
+    )
+    .await
 }
