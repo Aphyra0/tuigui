@@ -6,6 +6,7 @@
 //! the caller owns the sink (PTY, SSH channel, file, ...).
 
 use futures_core::Stream;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 use crate::proto as tgp;
@@ -15,6 +16,15 @@ use tuigui_streamer::source::{FrameSource, FrameUpdate, SourceError};
 /// What the encoder tells its consumer.
 #[derive(Debug)]
 pub enum EncoderEvent {
+    /// A frame is queued for emission; carry its telemetry so the UI can show
+    /// resolution and capture cost without parsing the bytes.
+    Frame {
+        width: u32,
+        height: u32,
+        /// Wall-clock time spent pulling this frame out of its source (the
+        /// capture cost), measured around `source.next()`.
+        capture_ms: f64,
+    },
     /// Bytes to write to the terminal, in order.
     Bytes(Vec<u8>),
     /// The source ended.
@@ -97,7 +107,16 @@ impl TgpEncoder {
             c
         };
 
-        while let Some(update) = source.next().await.map_err(EncoderError::Source)? {
+        loop {
+            let t0 = Instant::now();
+            let update = source.next().await.map_err(EncoderError::Source)?;
+            let Some(update) = update else {
+                // Preserve the old `while let` behavior: Ok(None) ends the
+                // stream without an Ended update, surfacing as a transport
+                // error below.
+                break;
+            };
+            let poll_ms = t0.elapsed().as_secs_f64() * 1000.0;
             match update {
                 FrameUpdate::Resized(_m) => {
                     on_event(EncoderEvent::Bytes(quiet_probe_reposition()))?;
@@ -141,7 +160,16 @@ impl TgpEncoder {
                     // delete gap; the prior image is deleted once it's covered.
                     let cur_id = self.image_id;
                     self.image_id = self.image_id.wrapping_add(1);
-                    for bytes in full_frame_commands(&frame, &base_control(&frame.metadata, cur_id)) {
+                    // Announce the frame before its payload so the consumer can
+                    // timestamp it for capture/latency telemetry, then cover it.
+                    on_event(EncoderEvent::Frame {
+                        width: frame.metadata.width,
+                        height: frame.metadata.height,
+                        capture_ms: poll_ms,
+                    })?;
+                    for bytes in
+                        full_frame_commands(&frame, &base_control(&frame.metadata, cur_id))
+                    {
                         on_event(EncoderEvent::Bytes(bytes))?;
                     }
                     if let Some(prev) = prev_image_id.take() {
@@ -386,6 +414,7 @@ mod tests {
                         saw_m0 = true;
                     }
                 }
+                EncoderEvent::Frame { .. } => {}
                 EncoderEvent::Ended => ended = true,
             }
         }

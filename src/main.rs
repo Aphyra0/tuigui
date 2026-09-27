@@ -246,14 +246,14 @@ fn terminal_pixel_size() -> Result<(u32, u32)> {
 }
 
 /// The streamed image's area in terminal cells — the rectangle the TGP image
-/// is placed into. Must match the layout in `ui::draw`: a 1-row header, a
-/// 1-row footer, and no border around the body.
+/// is placed into. Must match the layout in `ui::draw`: no header, a single
+/// status footer, and no border around the body.
 fn pane_placement() -> Result<(u32, u32)> {
     let (cols, rows) = crossterm::terminal::size().context("querying terminal size")?;
-    if rows <= 2 {
+    if rows <= 1 {
         return Ok((cols as u32, rows as u32));
     }
-    Ok((cols as u32, (rows - 2) as u32))
+    Ok((cols as u32, (rows - 1) as u32))
 }
 
 /// Drain any TGP stream writing raw bytes to `out` until Ended.
@@ -272,6 +272,7 @@ where
                 bytes += b.len();
                 file.write_all(&b)?;
             }
+            EncoderEvent::Frame { .. } => {}
             EncoderEvent::Ended => break,
         }
     }
@@ -335,15 +336,22 @@ async fn run_ui(
     )?;
     terminal.clear()?;
 
-    let mut last_bytes: usize = 0;
     let mut last_event = "starting".to_string();
     let mut pane: Option<ratatui::layout::Rect> = None;
     let mut quit = false;
 
+    // Metrics for the status bar.
+    let mut stats = ui::Stats::default();
+    // Rolling one-second window for per-frame measurements.
+    let mut t_prev = std::time::Instant::now();
+    let mut frame_bytes_accum = 0usize;
+    let mut cap_ms_accum = 0f64;
+    let mut frame_count_accum = 0usize;
+
     while !quit {
         // Draw the shell; capture the pane's inner rect where the image lands.
         terminal.draw(|f| {
-            pane = Some(ui::draw(f, app_path, &last_event, last_bytes));
+            pane = Some(ui::draw(f, app_path, &last_event, &stats));
         })?;
 
         // Drain encoder output without blocking the UI loop. The whole batch
@@ -369,7 +377,6 @@ async fn run_ui(
                 .await
             {
                 Ok(Some(Ok(EncoderEvent::Bytes(b)))) if !b.is_empty() => {
-                    last_bytes = b.len();
                     written_chunks += 1;
                     written_bytes += b.len();
                     out.write_all(&b)?;
@@ -379,6 +386,13 @@ async fn run_ui(
                 // even when the encoder idles between frames. Spinning on
                 // empty chunks would busy-loop and starve input polling.
                 Ok(Some(Ok(EncoderEvent::Bytes(_)))) => break,
+                Ok(Some(Ok(EncoderEvent::Frame { width, height, capture_ms }))) => {
+                    // Record the frame's resolution and capture cost into the
+                    // rolling window.
+                    frame_count_accum += 1;
+                    cap_ms_accum += capture_ms;
+                    stats.resolution = (width, height);
+                }
                 Ok(Some(Ok(EncoderEvent::Ended))) => {
                     last_event = "capture ended".into();
                     quit = true;
@@ -396,6 +410,23 @@ async fn run_ui(
             }
         }
         out.flush()?;
+
+        // Accrue this iteration's transmitted bytes into the rolling window.
+        frame_bytes_accum += written_bytes;
+        // Fold the accumulated per-frame counters into the displayed averages
+        // roughly once per second (the render loop iterates far faster).
+        let now = std::time::Instant::now();
+        let elapsed = now.saturating_duration_since(t_prev);
+        if frame_count_accum > 0 && elapsed >= std::time::Duration::from_secs(1) {
+            let secs = elapsed.as_secs_f64().max(1e-9);
+            stats.fps = frame_count_accum as f64 / secs;
+            stats.bandwidth = frame_bytes_accum as f64 / secs;
+            stats.capture_ms = cap_ms_accum / frame_count_accum as f64;
+            t_prev = now;
+            frame_count_accum = 0;
+            frame_bytes_accum = 0;
+            cap_ms_accum = 0.0;
+        }
         tracing::info!(
             pane = ?pane.map(|r| (r.x, r.y, r.width, r.height)),
             written_chunks,
