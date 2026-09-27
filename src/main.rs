@@ -57,6 +57,16 @@ struct Cli {
     #[arg(long, conflicts_with = "debug_draw")]
     debug_streaming: bool,
 
+    /// Transmit frames as raw RGBA instead of PNG (`f=100`). PNG is the default;
+    /// the terminal decodes it via wuffs, shrinking the bytes a fast sink moves.
+    #[arg(long)]
+    no_png: bool,
+
+    /// Maximum capture frame rate. Defaults to 30 fps; the capture source paces
+    /// itself to stay at or below this so it doesn't outrun a slower sink.
+    #[arg(long, default_value_t = 30)]
+    max_fps: u32,
+
     /// Capture a live screenshot of the caged session to a PNG file every
     /// interval (overwriting), for inspecting the rendered app headlessly.
     #[arg(long)]
@@ -119,14 +129,15 @@ async fn main() -> Result<()> {
 
     // 2. Attach capture. The capture feed doubles as a tuigui-streamer
     //    FrameSource; the TGP encoder is codec-agnostic and only sees frames.
-    let source = CageFrameSource::connect(&CaptureConfig::new(session.wayland_socket().clone()))
-        .context("connecting screencopy client")?;
+    let capture = CaptureConfig::new(session.wayland_socket().clone()).max_fps(cli.max_fps);
+    let source = CageFrameSource::connect(&capture).context("connecting screencopy client")?;
 
     // 3. Encode to a TGP byte stream, scaled to fill the pane (in cells).
     //    Every frame is fully transmitted and placed; no delta/damage logic.
     let encoder = TgpEncoder::new(EncoderConfig {
         placement_columns: pc,
         placement_rows: pr,
+        png: !cli.no_png,
     });
     let mut tgp_stream = encoder.into_stream(source);
 

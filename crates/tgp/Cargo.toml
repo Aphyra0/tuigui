@@ -18,5 +18,9 @@ tracing = { workspace = true }
 # hand-rolled loop this replaced.
 base64 = { version = "0.22" }
 
+# png: optional PNG encoding of frames so a fast sink sends far fewer bytes
+# (the terminal decodes f=100). Only used when EncoderConfig.png is set.
+png = { workspace = true }
+
 # internal
 tuigui-streamer = { workspace = true }

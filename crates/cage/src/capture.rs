@@ -76,7 +76,8 @@ impl Screenshot {
 pub struct CaptureConfig {
     /// Absolute path to the session's Wayland socket.
     pub socket: PathBuf,
-    /// Poll interval for the live source when there is no damage event.
+    /// Poll interval for the live source (target frame period). `max_fps` maps
+    /// to this: `1000 / max_fps` ms.
     pub poll_interval: Duration,
 }
 
@@ -84,8 +85,19 @@ impl CaptureConfig {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         CaptureConfig {
             socket: socket.into(),
-            poll_interval: Duration::from_millis(33),
+            poll_interval: Duration::from_millis(Self::default_max_fps_ms()),
         }
+    }
+
+    /// Default frame rate (30 fps) expressed as a millisecond period.
+    fn default_max_fps_ms() -> u64 {
+        33
+    }
+
+    /// Set the capture's maximum frame rate, overriding the default 30 fps.
+    pub fn max_fps(mut self, fps: u32) -> Self {
+        self.poll_interval = Duration::from_millis(1000 / fps.max(1) as u64);
+        self
     }
 }
 

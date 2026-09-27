@@ -1164,6 +1164,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-core",
+ "png",
  "thiserror",
  "tokio",
  "tokio-stream",

@@ -55,6 +55,10 @@ pub struct EncoderConfig {
     /// corner is visible. Set both from the TUI's pane size.
     pub placement_columns: u32,
     pub placement_rows: u32,
+    /// Transmit frames as PNG (`f=100`) instead of raw RGBA/RGB. PNG is decoded
+    /// by the terminal (wuffs), and can shrink an uncompressed frame ~5-20x —
+    /// the dominant win when the terminal sink is the bottleneck.
+    pub png: bool,
 }
 
 /// Converts a [`FrameSource`] into a stream of TGP bytes.
@@ -169,9 +173,11 @@ impl TgpEncoder {
                     // timestamp it for capture/latency telemetry. The bytes are
                     // produced inline, so time the encoding here.
                     let t_encode = Instant::now();
-                    for bytes in
-                        full_frame_commands(&frame, &base_control(&frame.metadata, cur_id))
-                    {
+                    for bytes in full_frame_commands(
+                        &frame,
+                        &base_control(&frame.metadata, cur_id),
+                        self.config.png,
+                    ) {
                         on_event(EncoderEvent::Bytes(bytes))?;
                     }
                     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
@@ -243,20 +249,46 @@ impl Stream for EncoderStream {
 }
 
 /// Transmit + place commands for a full frame.
-fn full_frame_commands(frame: &Frame, control: &[(char, String)]) -> Vec<Vec<u8>> {
-    let fmt = match frame.metadata.format {
-        PixelFormat::Rgb24 => 24u32,
-        PixelFormat::Rgba32 => 32,
+fn full_frame_commands(frame: &Frame, control: &[(char, String)], png: bool) -> Vec<Vec<u8>> {
+    // TGP format id: 100 for PNG (terminal decodes), else raw pixel formats.
+    let fmt = if png {
+        100u32
+    } else {
+        match frame.metadata.format {
+            PixelFormat::Rgb24 => 24,
+            PixelFormat::Rgba32 => 32,
+        }
     };
     let mut ctrl: Vec<(char, String)> = vec![('a', "T".into()), ('C', "1".into())];
     ctrl.extend(control.iter().cloned());
     // a=T places at the cursor; but we do not manage the cursor here, the
     // host TUI does. Placement keys live in `control` via base_control().
+    let payload = if png {
+        encode_png(&frame.data, frame.metadata.width, frame.metadata.height)
+    } else {
+        frame.data.clone()
+    };
     let mut out = Vec::new();
-    for c in tgp::chunked_transmit(fmt, ctrl, &frame.data) {
+    for c in tgp::chunked_transmit(fmt, ctrl, &payload) {
         out.push(c);
     }
     out
+}
+
+/// Compress raw RGBA/RGB pixel data into a PNG byte string (in-memory).
+fn encode_png(data: &[u8], width: u32, height: u32) -> bytes::Bytes {
+    let mut buf = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut buf, width, height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        // Keep memory/CPU bounded for a live stream; terminal decodes PNG via
+        // wuffs, and a fast stream matters more than near-lossless size.
+        enc.set_compression(png::Compression::Fast);
+        let mut w = enc.write_header().expect("png header");
+        w.write_image_data(data).expect("png data");
+    }
+    bytes::Bytes::from(buf)
 }
 
 fn delete_image(image_id: u32) -> Vec<u8> {
