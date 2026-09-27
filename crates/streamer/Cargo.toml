@@ -1,0 +1,19 @@
+[package]
+name = "tuigui-streamer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Codec-agnostic frame sources converted into kitty graphics protocol (TGP) byte streams"
+
+[dependencies]
+futures-core = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+bytemuck = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+
+[dev-dependencies]
+png = { workspace = true }

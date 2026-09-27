@@ -1,0 +1,18 @@
+[package]
+name = "tuigui-tgp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kitty graphics protocol (TGP) wire encoding and session encoder"
+
+[dependencies]
+futures-core = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+
+# internal
+tuigui-streamer = { workspace = true }

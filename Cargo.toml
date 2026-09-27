@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = ["crates/streamer", "crates/tgp", "crates/cage"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net"] }
+tokio-stream = "0.1"
+futures = "0.3"
+futures-core = "0.3"
+async-trait = "0.1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+bytemuck = { version = "1", features = ["derive"] }
+png = "0.17"
+
+# tui
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# cli
+clap = { version = "4", features = ["derive"] }
+
+# wayland (cage capture + input)
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+memmap2 = "0.9"
+tempfile = "3"
+
+# internal
+tuigui-streamer = { path = "crates/streamer" }
+tuigui-tgp = { path = "crates/tgp" }
+tuigui-cage = { path = "crates/cage" }
+
+[package]
+name = "tuigui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GUI app in the terminal"
+
+[[bin]]
+name = "tuigui"
+path = "src/main.rs"
+
+[dependencies]
+tuigui-streamer = { workspace = true }
+tuigui-tgp = { workspace = true }
+tuigui-cage = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+futures-core = { workspace = true }
+anyhow = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
