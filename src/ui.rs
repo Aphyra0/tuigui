@@ -38,8 +38,16 @@ pub fn draw(f: &mut Frame, app: &str, status: &str, stats: &Stats) -> Rect {
         Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(f.area());
 
     let (rw, rh) = stats.resolution;
+    let phases = if stats.announce_ms > 0.0 {
+        format!(
+            " · phases: announce {:.2} · setup {:.2} · copy {:.2} · readout {:.2} ms",
+            stats.announce_ms, stats.setup_ms, stats.copy_ms, stats.readout_ms,
+        )
+    } else {
+        String::new()
+    };
     let line1 = format!(
-        " {status} · {app}  ·  FPS: {:.0}  ·  Bw: {:.1} MiB/s  ·  Cap: {:.1} ms  ·  Pace: {:.1} ms  ·  Enc: {:.1} ms  ·  Sink: {:.1} ms  ·  {rw}x{rh}",
+        " {status} · {app}  ·  FPS: {:.0}  ·  Bw: {:.1} MiB/s  ·  Cap: {:.1} ms  ·  Pace: {:.1} ms  ·  Enc: {:.1} ms  ·  Sink: {:.1} ms  ·  {rw}x{rh}{phases}  ·  q to quit",
         stats.fps,
         stats.bandwidth / (1024.0 * 1024.0),
         stats.capture_ms,
@@ -48,21 +56,14 @@ pub fn draw(f: &mut Frame, app: &str, status: &str, stats: &Stats) -> Rect {
         stats.sink_ms,
     );
 
-    let line2 = if stats.announce_ms > 0.0 {
-        format!(
-            " Capture phases: announce {:.2} ms · setup {:.2} ms · copy {:.2} ms · readout {:.2} ms  ·  q to quit",
-            stats.announce_ms, stats.setup_ms, stats.copy_ms, stats.readout_ms,
-        )
-    } else {
-        " q to quit".to_string()
-    };
-
     f.render_widget(
-        Paragraph::new(vec![line1.into(), line2.into()]).style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Paragraph::new(vec![line1.into()])
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
         footer,
     );
 

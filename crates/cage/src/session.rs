@@ -50,7 +50,9 @@ pub struct HeadlessConfig {
     /// Name of the private Wayland socket (under XDG_RUNTIME_DIR).
     /// Empty = derive a unique name from the PID.
     pub socket_name: String,
-    /// Virtual output size (the app sees a screen of this size).
+    /// Virtual output size (the app sees a screen of this size). There is no
+    /// sensible default: the caller must supply the real terminal pixel size.
+    /// 0 is rejected by [`CageSession::spawn`].
     pub width: u32,
     pub height: u32,
     /// Override the cage binary path (defaults to `cage` in PATH,
@@ -58,12 +60,13 @@ pub struct HeadlessConfig {
     pub cage_bin: Option<PathBuf>,
 }
 
+#[allow(clippy::derivable_impls)] // width/height = 0 is load-bearing: spawn rejects it.
 impl Default for HeadlessConfig {
     fn default() -> Self {
         HeadlessConfig {
             socket_name: String::new(),
-            width: 1280,
-            height: 800,
+            width: 0,
+            height: 0,
             cage_bin: None,
         }
     }
@@ -79,6 +82,12 @@ impl CageSession {
     /// Spawn cage (headless) with `spec.app` as its single client. Resolves
     /// once the Wayland socket exists.
     pub async fn spawn(spec: CageSpec, cfg: HeadlessConfig) -> Result<CageSession, CageError> {
+        if cfg.width == 0 || cfg.height == 0 {
+            return Err(CageError::Capture(format!(
+                "headless output size must be nonzero, got {}x{} (caller must supply the real terminal pixel size)",
+                cfg.width, cfg.height
+            )));
+        }
         let cage_bin = cfg
             .cage_bin
             .clone()

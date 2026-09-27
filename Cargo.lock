@@ -1181,6 +1181,7 @@ dependencies = [
  "crossterm",
  "futures",
  "futures-core",
+ "libc",
  "ratatui",
  "tokio",
  "tokio-stream",

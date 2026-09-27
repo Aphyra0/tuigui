@@ -79,6 +79,10 @@ pub struct CaptureConfig {
     /// Poll interval for the live source (target frame period). `max_fps` maps
     /// to this: `1000 / max_fps` ms.
     pub poll_interval: Duration,
+    /// Downscale factor for captured frames (1.0 = full size, 2.0 = half).
+    /// Applied after capture so the encoder sees fewer pixels regardless of the
+    /// compositor's output resolution.
+    pub scale: f32,
 }
 
 impl CaptureConfig {
@@ -86,6 +90,7 @@ impl CaptureConfig {
         CaptureConfig {
             socket: socket.into(),
             poll_interval: Duration::from_millis(Self::default_max_fps_ms()),
+            scale: 1.0,
         }
     }
 
@@ -97,6 +102,13 @@ impl CaptureConfig {
     /// Set the capture's maximum frame rate, overriding the default 30 fps.
     pub fn max_fps(mut self, fps: u32) -> Self {
         self.poll_interval = Duration::from_millis(1000 / fps.max(1) as u64);
+        self
+    }
+
+    /// Set the frame downscale factor (>=1.0). Higher values shrink each
+    /// captured frame, reducing encoder and sink load.
+    pub fn scale(mut self, s: f32) -> Self {
+        self.scale = s.max(1.0);
         self
     }
 }
@@ -553,6 +565,12 @@ pub struct CageFrameSource {
     seen_content: bool,
     /// Birth time, for the blank-skip budget window.
     boot_start: std::time::Instant,
+    /// Most recent captured pixel dims, so `metadata()` reflects the real
+    /// output instead of a hardcoded guess. `None` until the first grab.
+    last_dims: Option<(u32, u32)>,
+    /// Frame downscale factor (>=1.0). Applied to each captured frame before
+    /// emission so the encoder sees fewer pixels than the compositor output.
+    scale: f32,
 }
 
 impl CageFrameSource {
@@ -563,6 +581,8 @@ impl CageFrameSource {
             prev_emit: None,
             seen_content: false,
             boot_start: std::time::Instant::now(),
+            last_dims: None,
+            scale: cfg.scale,
         })
     }
 }
@@ -590,6 +610,42 @@ fn frame_blank(frame: &Frame) -> bool {
     true
 }
 
+/// Nearest-neighbor downscale of a captured screenshot by integer `scale`
+/// (>=1). Produces a new Screenshot of `w/scale x h/scale` with box-sampled
+/// pixels, so the encoder's resolution reflects the requested scale even when
+/// the compositor fixed its output size.
+fn downscale_frame(shot: &Screenshot, scale: f32) -> Frame {
+    let ow = shot.width;
+    let oh = shot.height;
+    let nw = ((ow as f32) / scale).floor().max(1.0) as u32;
+    let nh = ((oh as f32) / scale).floor().max(1.0) as u32;
+    let mut out = vec![0u8; (nw as usize) * (nh as usize) * 4];
+    let sx = ow as f32 / nw as f32;
+    let sy = oh as f32 / nh as f32;
+    for y in 0..nh {
+        for x in 0..nw {
+            let sy0 = ((y as f32) * sy) as usize;
+            let sx0 = ((x as f32) * sx) as usize;
+            let src = &shot.rgba[(sy0 * ow as usize + sx0) * 4..][..4];
+            let dst = &mut out[((y as usize) * nw as usize + x as usize) * 4..][..4];
+            dst.copy_from_slice(src);
+        }
+    }
+    Frame {
+        metadata: FrameMetadata {
+            width: nw,
+            height: nh,
+            format: PixelFormat::Rgba32,
+        },
+        data: bytes::Bytes::from(out),
+        presentation_timestamp: shot
+            .to_frame()
+            .presentation_timestamp,
+        timing: shot.timing,
+        damage: shot.damage.clone(),
+    }
+}
+
 /// A synchronous capture handle: connect once, then grab one screenshot at a
 /// time. Used by `--debug-capture` to write PNGs without the TGP stream layer.
 pub struct PageSource {
@@ -612,9 +668,10 @@ impl PageSource {
 #[async_trait]
 impl FrameSource for CageFrameSource {
     fn metadata(&self) -> FrameMetadata {
+        let (width, height) = self.last_dims.unwrap_or((0, 0));
         FrameMetadata {
-            width: 1280,
-            height: 800,
+            width,
+            height,
             format: PixelFormat::Rgba32,
         }
     }
@@ -639,7 +696,12 @@ impl FrameSource for CageFrameSource {
             .grab_once()
             .map_err(|e| tuigui_streamer::SourceError::Transport(e.to_string()))?;
         self.prev_emit = Some(std::time::Instant::now());
-        let frame = shot.to_frame();
+        let frame = if self.scale > 1.0 {
+            downscale_frame(&shot, self.scale)
+        } else {
+            shot.to_frame()
+        };
+        self.last_dims = Some((frame.metadata.width, frame.metadata.height));
 
         // Root cause of the boot race: a capture grab often catches the app before
         // its first paint, a fully black frame. Emitting that as the encoder's

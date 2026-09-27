@@ -67,10 +67,22 @@ struct Cli {
     #[arg(long, value_name = "N", default_value = "256")]
     max_colors: usize,
 
+    /// Disable palette quantization and emit lossless truecolor PNG instead.
+    /// Quantization shrinks payload but adds encode CPU cost; turn it off to
+    /// shave that overhead when bandwidth is not the bottleneck.
+    #[arg(long)]
+    no_quantize: bool,
+
     /// Maximum capture frame rate. Defaults to 30 fps; the capture source paces
     /// itself to stay at or below this so it doesn't outrun a slower sink.
     #[arg(long, default_value_t = 30)]
     max_fps: u32,
+
+    /// Scale down the headless output resolution (1.0–4.0). The terminal's
+    /// pixel size is divided by this to lower the capture resolution, shrinking
+    /// per-frame bytes. 1.0 keeps the full resolution.
+    #[arg(long, default_value_t = 1.0)]
+    scale: f32,
 
     /// Capture a live screenshot of the caged session to a PNG file every
     /// interval (overwriting), for inspecting the rendered app headlessly.
@@ -119,6 +131,7 @@ async fn main() -> Result<()> {
     // Size the virtual display to the terminal's drawing area so the app's
     // pixels map ~1:1 to on-screen cells; avoids resampling the capture.
     let (tcols, trows) = terminal_pixel_size()?;
+    let scale = cli.scale.clamp(1.0, 4.0);
     let (pc, pr) = pane_placement()?;
     let cfg = HeadlessConfig {
         width: tcols,
@@ -134,7 +147,10 @@ async fn main() -> Result<()> {
 
     // 2. Attach capture. The capture feed doubles as a tuigui-streamer
     //    FrameSource; the TGP encoder is codec-agnostic and only sees frames.
-    let capture = CaptureConfig::new(session.wayland_socket().clone()).max_fps(cli.max_fps);
+    //    `scale` shrinks each captured frame so the encoder sees fewer pixels.
+    let capture = CaptureConfig::new(session.wayland_socket().clone())
+        .max_fps(cli.max_fps)
+        .scale(scale);
     let source = CageFrameSource::connect(&capture).context("connecting screencopy client")?;
 
     // 3. Encode to a TGP byte stream, scaled to fill the pane (in cells).
@@ -143,7 +159,11 @@ async fn main() -> Result<()> {
         placement_columns: pc,
         placement_rows: pr,
         png: !cli.no_png,
-        max_colors: Some(cli.max_colors),
+        max_colors: if cli.no_quantize {
+            None
+        } else {
+            Some(cli.max_colors)
+        },
     });
     let mut tgp_stream = encoder.into_stream(source);
 
@@ -240,26 +260,91 @@ async fn run_video_to_file(path: &str, out: &str, loop_forever: bool) -> Result<
 
 /// Query the terminal's current size and report it in pixels, suitable for
 /// sizing the cage virtual output. Reads the cell grid via crossterm and
-/// multiplies by the cell size reported by the terminal if available.
+/// multiplies by the real cell size queried from the terminal (`CSI 16 t`).
+///
+/// The cell size cannot be assumed: hardcoding 8x16 gives a wrong resolution
+/// on HiDPI, non-standard fonts, or ghostty/foot/herdr (which often report
+/// zero pixels in `TIOCGWINSZ`). Querying the terminal directly is the only
+/// reliable source.
 fn terminal_pixel_size() -> Result<(u32, u32)> {
     let (cols, rows) = crossterm::terminal::size().context("querying terminal size")?;
     if cols == 0 || rows == 0 {
-        return Ok((1280, 800)); // headless/unknown PTY; fall back to the default.
+        return Err(anyhow::anyhow!("terminal reports zero cell grid size"));
     }
-    // Default to the classic 8x16 monospace cell. window_size() often reports
-    // pixel dims of 0 on unix (unused), so only trust it when it gives a
-    // nonzero pixel size consistent with the reported cell grid.
-    let mut cell_w = 8u32;
-    let mut cell_h = 16u32;
-    if let Ok(ws) = crossterm::terminal::window_size() {
-        if ws.width > 0 && ws.columns > 0 {
-            cell_w = (ws.width as u32 / ws.columns as u32).max(1);
-        }
-        if ws.height > 0 && ws.rows > 0 {
-            cell_h = (ws.height as u32 / ws.rows as u32).max(1);
-        }
-    }
+    let (cell_w, cell_h) = query_cell_size()?;
     Ok((cols as u32 * cell_w, rows as u32 * cell_h))
+}
+
+/// Ask the terminal for its cell size in pixels via `CSI 16 t` (returns
+/// `CSI 4 ; height ; width t`), blocking up to `TIMEOUT`. Must run before raw
+/// mode so crossterm's stdin read sees the reply. Falls back to the value
+/// `TIOCGWINSZ` reports when the terminal doesn't answer.
+fn query_cell_size() -> Result<(u32, u32)> {
+    use std::io::Write as _;
+    use std::time::{Duration, Instant};
+
+    // Send the query, then read the reply from the controlling terminal.
+    fn read_reply(deadline: Instant) -> Vec<u8> {
+        use std::fs::OpenOptions;
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Raw mode isn't on yet, so opening /dev/tty gives us the terminal
+        // without tripping over crossterm's buffered stdin.
+        let Ok(mut tty) = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open("/dev/tty")
+        else {
+            return Vec::new();
+        };
+        let mut buf = Vec::with_capacity(128);
+        let mut tmp = [0u8; 64];
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match tty.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        buf
+    }
+
+    let mut out = std::io::stdout();
+    out.write_all(b"\x1b[16t").ok();
+    out.flush().ok();
+
+    let bytes = read_reply(Instant::now() + Duration::from_millis(300));
+    // `CSI 16 t` replies `CSI 4 ; cell_height ; cell_width t` — the pixel
+    // dimensions of a single cell, not the window. Use them directly.
+    if let Ok(s) = std::str::from_utf8(&bytes) {
+        if let Some(idx) = s.find("\x1b[4;") {
+            let rest = &s[idx + 4..];
+            let end = rest.find('t').unwrap_or(rest.len());
+            let mut it = rest[..end].split(';');
+            let cell_h: u32 = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+            let cell_w: u32 = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+            if cell_w > 0 && cell_h > 0 {
+                return Ok((cell_w, cell_h));
+            }
+        }
+    }
+
+    // The terminal didn't answer `CSI 16 t`; fall back to the pixel dims the
+    // kernel reports via TIOCGWINSZ, if any.
+    if let Ok(ws) = crossterm::terminal::window_size() {
+        if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 {
+            return Ok((
+                (ws.width as u32 / ws.columns as u32).max(1),
+                (ws.height as u32 / ws.rows as u32).max(1),
+            ));
+        }
+    }
+    Err(anyhow::anyhow!(
+        "could not determine terminal cell size (CSI 16 t unanswered, TIOCGWINSZ empty)"
+    ))
 }
 
 /// The streamed image's area in terminal cells — the rectangle the TGP image
@@ -358,7 +443,13 @@ async fn run_ui(
     let mut quit = false;
 
     // Metrics for the status bar.
-    let mut stats = ui::Stats::default();
+    // Seed the resolution from the terminal's pixel size we sized the headless
+    // output to, so the footer shows it even before the first frame event (and
+    // regardless of whether the source reports per-frame dims).
+    let mut stats = ui::Stats {
+        resolution: output_px,
+        ..ui::Stats::default()
+    };
     // Rolling one-second window for per-frame measurements.
     let mut t_prev = std::time::Instant::now();
     let mut frame_bytes_accum = 0usize;
@@ -714,6 +805,11 @@ async fn run_capture_png(cli: &Cli) -> Result<()> {
 /// test.
 async fn run_debug_fill() -> Result<()> {
     use std::io::Write as _;
+
+    // Query the real cell size before entering raw mode (we need line-read
+    // access to stdin for the CSI 16 t reply).
+    let (cell_w, cell_h) =
+        query_cell_size().unwrap_or((8u32, 16u32)); // last-resort fallback for a debug helper.
     crossterm::terminal::enable_raw_mode()?;
     crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
     crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide)?;
@@ -728,10 +824,9 @@ async fn run_debug_fill() -> Result<()> {
     };
     tracing::info!(cols, rows, "debug fill pink via TGP");
 
-    // Build a solid pink RGBA image. The headless pane is ~1280x800; TGP will
-    // scale it into the placement region, so a generous source size fills the
-    // visible screen crisply.
-    let (w, h) = (1280u32, 800u32);
+    // Size the source to the terminal's real pixel area so the placement is
+    // crisp instead of the old hardcoded 1280x800 guess.
+    let (w, h) = (cols as u32 * cell_w, rows as u32 * cell_h);
     let n = (w * h) as usize;
     let mut data = vec![0u8; n * 4];
     for px in data.chunks_mut(4) {
