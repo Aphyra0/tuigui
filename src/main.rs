@@ -6,13 +6,12 @@
 mod ui;
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::{Stream, StreamExt};
 use ratatui::{backend::CrosstermBackend, Terminal};
+use tokio::sync::mpsc;
 use tuigui_cage::{
     CageFrameSource, CageSession, CageSpec, CaptureConfig, HeadlessConfig, InputSink, InputSock,
     KeyEvent, KeyState, PointerEvent,
@@ -141,26 +140,46 @@ async fn main() -> Result<()> {
     // 5. Run the ratatui shell.
     let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
 
-    // Connect the input sink on a background task with a timeout so a slow or
-    // refusing Wayland server can never stall the render loop (or the `q`
-    // quit key). `run_ui` polls this and begins forwarding only once ready.
-    let sink: Arc<Mutex<Option<Box<dyn InputSink>>>> = Arc::new(Mutex::new(None));
-    let sink_task = Arc::clone(&sink);
+    // Input pipeline: the render loop pushes events into a channel (never
+    // blocking), and a dedicated writer task drains them into the Wayland
+    // virtual pointer. This fully decouples input I/O (which can block on a
+    // full socket) from the render loop, so flooding mouse events can never
+    // stall the stream or the quit key.
+    let (tx, mut rx) = mpsc::unbounded_channel::<InputMsg>();
     let sock_path = session.wayland_socket().clone();
     let (tw, th) = (tcols, trows);
     tokio::spawn(async move {
+        // Connect with a timeout so a slow/refusing server just disables input.
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
             let mut ins = InputSock::connect(&sock_path)?;
             ins.set_frame_size(tw, th);
             Ok::<_, anyhow::Error>(ins)
         })
         .await;
-        match result {
-            Ok(Ok(ins)) => {
-                *sink_task.lock().await = Some(Box::new(ins));
+        let mut sink: Option<Box<dyn InputSink>> = match result {
+            Ok(Ok(ins)) => Some(Box::new(ins)),
+            Ok(Err(e)) => {
+                tracing::warn!(err = %e, "input injection unavailable");
+                None
             }
-            Ok(Err(e)) => tracing::warn!(err = %e, "input injection unavailable"),
-            Err(_) => tracing::warn!("input connect timed out; input disabled"),
+            Err(_) => {
+                tracing::warn!("input connect timed out; input disabled");
+                None
+            }
+        };
+        // Drain queued events into the sink until the channel closes (render
+        // loop exit). Blocking sends live here, off the render loop.
+        while let Some(msg) = rx.recv().await {
+            if let Some(s) = sink.as_mut() {
+                match msg {
+                    InputMsg::Key(kev) => {
+                        let _ = s.send_key(kev).await;
+                    }
+                    InputMsg::Pointer(pev) => {
+                        let _ = s.send_pointer(pev).await;
+                    }
+                }
+            }
         }
     });
 
@@ -170,7 +189,7 @@ async fn main() -> Result<()> {
         &app_path,
         Some(session),
         (tcols, trows),
-        sink,
+        tx,
     )
     .await
 }
@@ -281,7 +300,23 @@ async fn run_video_tui(path: &str) -> Result<()> {
     let mut tgp_stream = encoder.into_stream(src);
 
     let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
-    run_ui(terminal, &mut tgp_stream, &format!("video: {path}"), None, (0, 0), Arc::new(Mutex::new(None))).await
+    // No Wayland session here; forward inputs into a discard sink.
+    let (tx, _rx) = mpsc::unbounded_channel::<InputMsg>();
+    run_ui(
+        terminal,
+        &mut tgp_stream,
+        &format!("video: {path}"),
+        None,
+        (0, 0),
+        tx,
+    )
+    .await
+}
+
+/// A queued input event for the writer task: keyboard or pointer.
+enum InputMsg {
+    Key(KeyEvent),
+    Pointer(PointerEvent),
 }
 
 async fn run_ui(
@@ -290,7 +325,7 @@ async fn run_ui(
     app_path: &str,
     session: Option<CageSession>,
     output_px: (u32, u32),
-    sink: Arc<Mutex<Option<Box<dyn InputSink>>>>,
+    tx: mpsc::UnboundedSender<InputMsg>,
 ) -> Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     crossterm::execute!(
@@ -368,7 +403,11 @@ async fn run_ui(
         // Forward input: keys and mouse to the session's input sink (if any).
         // The pane is the live-capture region; convert cursor cell coords to
         // the virtual frame's pixels before injecting. The sink appears on a
-        // background task once its Wayland connection is ready.
+        // background task once its Wayland connection is ready; the render
+        // loop only ever does a non-blocking `tx.send`, so flooding mouse
+        // events can never stall the stream. Events are also capped per
+        // iteration so `q` and the render loop always get a slice of the loop,
+        // even under continuous mouse motion.
         while crossterm::event::poll(std::time::Duration::from_millis(4))? {
             let ev = crossterm::event::read()?;
             match ev {
@@ -379,16 +418,12 @@ async fn run_ui(
                         quit = true;
                     }
                     if let Some(kev) = crossterm_key_to_key(k) {
-                        let mut guard = sink.lock().await;
-                        if let Some(s) = guard.as_mut() {
-                            (**s).send_key(kev).await.ok();
-                        }
+                        let _ = tx.send(InputMsg::Key(kev));
                     }
                 }
                 crossterm::event::Event::Mouse(m) => {
-                    let mut guard = sink.lock().await;
-                    if let Some(s) = guard.as_mut() {
-                        forward_mouse(&mut **s, m, pane, output_px).await;
+                    for pev in mouse_to_pointer(m, pane, output_px) {
+                        let _ = tx.send(InputMsg::Pointer(pev));
                     }
                 }
                 _ => {}
@@ -398,6 +433,9 @@ async fn run_ui(
 
     crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
     crossterm::terminal::disable_raw_mode()?;
+    // Close the input channel so the writer task's recv() returns None and it
+    // exits; otherwise the runtime waits on it forever and the binary hangs.
+    drop(tx);
     if let Some(s) = session {
         s.shutdown().await.ok();
     }
@@ -459,16 +497,16 @@ fn char_to_evdev(c: char) -> Option<u32> {
     Some(code)
 }
 
-/// Dispatch a crossterm mouse event to the sink, converting cursor cell coords
-/// (relative to the pane) into virtual-frame pixels via the pane rect and the
-/// virtual output's pixel size.
-async fn forward_mouse(
-    sink: &mut dyn InputSink,
+/// Convert a crossterm mouse event into virtual-pointer events, mapping cursor
+/// cell coords (relative to the pane) into virtual-frame pixels via the pane
+/// rect and the virtual output's pixel size. Pure: returns the events to send.
+fn mouse_to_pointer(
     m: crossterm::event::MouseEvent,
     pane: Option<ratatui::layout::Rect>,
     output_px: (u32, u32),
-) {
+) -> Vec<PointerEvent> {
     use crossterm::event::{MouseButton as B, MouseEventKind as K};
+    let mut out = Vec::new();
     let (px, py, pw, ph) = pane
         .map(|r| (r.x, r.y, r.width, r.height))
         .unwrap_or((0, 0, 0, 0));
@@ -482,16 +520,11 @@ async fn forward_mouse(
     match m.kind {
         K::Moved => {
             let (x, y) = to_px(m.column, m.row);
-            sink.send_pointer(PointerEvent::Motion { x, y })
-                .await
-                .ok();
+            out.push(PointerEvent::Motion { x, y });
         }
         K::Drag(b) => {
             let (x, y) = to_px(m.column, m.row);
-            sink.send_pointer(PointerEvent::Motion { x, y })
-                .await
-                .ok();
-            // Keep the primary button held while dragging if it's a drag.
+            out.push(PointerEvent::Motion { x, y });
             let _ = b;
         }
         K::Down(b) => {
@@ -501,15 +534,11 @@ async fn forward_mouse(
                 B::Middle => 0x112,
             };
             let (x, y) = to_px(m.column, m.row);
-            sink.send_pointer(PointerEvent::Motion { x, y })
-                .await
-                .ok();
-            sink.send_pointer(PointerEvent::Button {
+            out.push(PointerEvent::Motion { x, y });
+            out.push(PointerEvent::Button {
                 code,
                 state: KeyState::Press,
-            })
-            .await
-            .ok();
+            });
         }
         K::Up(b) => {
             let code = match b {
@@ -517,25 +546,20 @@ async fn forward_mouse(
                 B::Right => 0x111,
                 B::Middle => 0x112,
             };
-            sink.send_pointer(PointerEvent::Button {
+            out.push(PointerEvent::Button {
                 code,
                 state: KeyState::Release,
-            })
-            .await
-            .ok();
+            });
         }
         K::ScrollDown => {
-            sink.send_pointer(PointerEvent::Axis { dx: 0.0, dy: -1.0 })
-                .await
-                .ok();
+            out.push(PointerEvent::Axis { dx: 0.0, dy: -1.0 });
         }
         K::ScrollUp => {
-            sink.send_pointer(PointerEvent::Axis { dx: 0.0, dy: 1.0 })
-                .await
-                .ok();
+            out.push(PointerEvent::Axis { dx: 0.0, dy: 1.0 });
         }
         _ => {}
     }
+    out
 }
 
 /// `--debug-capture`: spawn the caged session exactly like the real path, but
@@ -672,13 +696,14 @@ async fn run_pink_streaming() -> Result<()> {
     let mut tgp_stream = encoder.into_stream(src);
 
     let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    let (tx, _rx) = mpsc::unbounded_channel::<InputMsg>();
     run_ui(
         terminal,
         &mut tgp_stream,
         "debug-streaming: pink",
         None,
         (0, 0),
-        Arc::new(Mutex::new(None)),
+        tx,
     )
     .await
 }
