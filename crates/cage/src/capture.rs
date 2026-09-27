@@ -529,12 +529,18 @@ fn build_screenshot(req: &FrameRequest) -> Option<Screenshot> {
 /// Wrap the driver as a [`FrameSource`] for the TGP encoder.
 pub struct CageFrameSource {
     driver: ScreenDriver,
+    /// Minimum wall-clock gap between emitted frames (target frame period).
+    frame_interval: Duration,
+    /// When the previous frame was emitted, for pacing.
+    prev_emit: Option<std::time::Instant>,
 }
 
 impl CageFrameSource {
     pub fn connect(cfg: &CaptureConfig) -> Result<Self, CageError> {
         Ok(CageFrameSource {
             driver: ScreenDriver::connect(cfg)?,
+            frame_interval: cfg.poll_interval,
+            prev_emit: None,
         })
     }
 }
@@ -573,10 +579,22 @@ impl FrameSource for CageFrameSource {
     }
 
     async fn next(&mut self) -> Result<Option<FrameUpdate>, tuigui_streamer::SourceError> {
-        match self.driver.grab_once() {
-            Ok(shot) => Ok(Some(FrameUpdate::Frame(shot.to_frame()))),
-            Err(e) => Err(tuigui_streamer::SourceError::Transport(e.to_string())),
+        // Rate-limit the producer to the configured frame interval so it can't
+        // outrun the sink. Without this, a fast capture floods the encoder and
+        // the (unbounded) channel piles up faster than the terminal can drain,
+        // pushing FPS down and latency up as the backlog grows.
+        if let Some(prev) = self.prev_emit {
+            let elapsed = prev.elapsed();
+            if elapsed < self.frame_interval {
+                tokio::time::sleep(self.frame_interval - elapsed).await;
+            }
         }
+        let shot = self
+            .driver
+            .grab_once()
+            .map_err(|e| tuigui_streamer::SourceError::Transport(e.to_string()))?;
+        self.prev_emit = Some(std::time::Instant::now());
+        Ok(Some(FrameUpdate::Frame(shot.to_frame())))
     }
 }
 
