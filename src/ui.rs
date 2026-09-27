@@ -16,6 +16,8 @@ pub struct Stats {
     pub bandwidth: f64,
     /// Wall-clock cost to capture and emit one frame, in milliseconds.
     pub capture_ms: f64,
+    /// Wall-clock time the source spent sleeping to hit the target fps.
+    pub pacing_ms: f64,
     /// Virtual frame resolution in pixels.
     pub resolution: (u32, u32),
     /// Wall-clock cost of encoding a frame's pixels into TGP bytes (base64).
@@ -37,10 +39,11 @@ pub fn draw(f: &mut Frame, app: &str, status: &str, stats: &Stats) -> Rect {
 
     let (rw, rh) = stats.resolution;
     let line1 = format!(
-        " {status} · {app}  ·  FPS: {:.0}  ·  Bandwidth: {:.1} MiB/s  ·  Capture: {:.1} ms  ·  Encode: {:.1} ms  ·  Sink: {:.1} ms  ·  Resolution: {rw}x{rh}",
+        " {status} · {app}  ·  FPS: {:.0}  ·  Bw: {:.1} MiB/s  ·  Cap: {:.1} ms  ·  Pace: {:.1} ms  ·  Enc: {:.1} ms  ·  Sink: {:.1} ms  ·  {rw}x{rh}",
         stats.fps,
         stats.bandwidth / (1024.0 * 1024.0),
         stats.capture_ms,
+        stats.pacing_ms,
         stats.encode_ms,
         stats.sink_ms,
     );

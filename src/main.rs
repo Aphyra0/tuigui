@@ -62,6 +62,11 @@ struct Cli {
     #[arg(long)]
     no_png: bool,
 
+    /// Cap the PNG palette at N distinct colors (default 256, lossy). Lower
+    /// values shrink payload and speed up encoding for flat UI content.
+    #[arg(long, value_name = "N", default_value = "256")]
+    max_colors: usize,
+
     /// Maximum capture frame rate. Defaults to 30 fps; the capture source paces
     /// itself to stay at or below this so it doesn't outrun a slower sink.
     #[arg(long, default_value_t = 30)]
@@ -138,6 +143,7 @@ async fn main() -> Result<()> {
         placement_columns: pc,
         placement_rows: pr,
         png: !cli.no_png,
+        max_colors: Some(cli.max_colors),
     });
     let mut tgp_stream = encoder.into_stream(source);
 
@@ -357,6 +363,7 @@ async fn run_ui(
     let mut t_prev = std::time::Instant::now();
     let mut frame_bytes_accum = 0usize;
     let mut cap_ms_accum = 0f64;
+    let mut pacing_ms_accum = 0f64;
     let mut encode_ms_accum = 0f64;
     let mut sink_ms_accum = 0f64;
     let mut frame_count_accum = 0usize;
@@ -413,11 +420,12 @@ async fn run_ui(
                 // even when the encoder idles between frames. Spinning on
                 // empty chunks would busy-loop and starve input polling.
                 Ok(Some(Ok(EncoderEvent::Bytes(_)))) => break,
-                Ok(Some(Ok(EncoderEvent::Frame { width, height, capture_ms, encode_ms, timing }))) => {
+                Ok(Some(Ok(EncoderEvent::Frame { width, height, capture_ms, pacing_ms, encode_ms, timing }))) => {
                     // Record the frame's resolution and capture cost into the
                     // rolling window.
                     frame_count_accum += 1;
                     cap_ms_accum += capture_ms;
+                    pacing_ms_accum += pacing_ms;
                     encode_ms_accum += encode_ms;
                     stats.resolution = (width, height);
                     if let Some(t) = timing {
@@ -459,6 +467,7 @@ async fn run_ui(
             stats.fps = frame_count_accum as f64 / secs;
             stats.bandwidth = frame_bytes_accum as f64 / secs;
             stats.capture_ms = cap_ms_accum / n;
+            stats.pacing_ms = pacing_ms_accum / n;
             stats.encode_ms = encode_ms_accum / n;
             stats.sink_ms = sink_ms_accum / n;
             stats.announce_ms = announce_accum / n;
@@ -469,6 +478,7 @@ async fn run_ui(
             frame_count_accum = 0;
             frame_bytes_accum = 0;
             cap_ms_accum = 0.0;
+            pacing_ms_accum = 0.0;
             encode_ms_accum = 0.0;
             sink_ms_accum = 0.0;
             announce_accum = 0.0;

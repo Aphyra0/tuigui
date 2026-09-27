@@ -24,3 +24,4 @@ png = { workspace = true }
 
 # internal
 tuigui-streamer = { workspace = true }
+imagequant = "4"

@@ -22,8 +22,12 @@ pub enum EncoderEvent {
         width: u32,
         height: u32,
         /// Wall-clock time spent pulling this frame out of its source (the
-        /// capture cost), measured around `source.next()`.
+        /// capture cost). Excludes the source's pacing sleep when the source
+        /// reports real per-phase timings; otherwise it's the whole poll.
         capture_ms: f64,
+        /// Wall-clock time the source spent sleeping to pace itself (target
+        /// fps), when distinguishable from real capture time.
+        pacing_ms: f64,
         /// Wall-clock time spent turning the frame's pixels into TGP bytes
         /// (base64 + chunking), measured around `full_frame_commands`.
         encode_ms: f64,
@@ -57,8 +61,21 @@ pub struct EncoderConfig {
     pub placement_rows: u32,
     /// Transmit frames as PNG (`f=100`) instead of raw RGBA/RGB. PNG is decoded
     /// by the terminal (wuffs), and can shrink an uncompressed frame ~5-20x —
-    /// the dominant win when the terminal sink is the bottleneck.
+    /// the dominant win when the terminal sink is the bottleneck. When set, the
+    /// frame is palette-quantized to an indexed PNG, which for mostly-flat UI
+    /// content shrinks the payload far below the lossless RGBA path at the cost
+    /// of minor color fringing. Set [`max_colors`](/self#structfield-max_colors)
+    /// to trade quality against size.
     pub png: bool,
+    /// Maximum distinct colors kept when emitting a palette PNG. 256 is the
+    /// format ceiling; lower values shrink palettes and compress better, at the
+    /// cost of visible banding on gradients. Out-of-range colors snap to their
+    /// nearest palette entry. Unused when [`png`](/self#structfield-png) is
+    /// false.
+    ///
+    /// `Some` enables quantization; `None` emits a lossless truecolor PNG for
+    /// frames that genuinely need it.
+    pub max_colors: Option<usize>,
 }
 
 /// Converts a [`FrameSource`] into a stream of TGP bytes.
@@ -68,6 +85,9 @@ pub struct EncoderConfig {
 pub struct TgpEncoder {
     config: EncoderConfig,
     image_id: u32,
+    /// Last quantized palette, reused across frames so unchanged pixels keep
+    /// identical colors (avoids per-frame palette retraining flicker).
+    palette: Option<Palette>,
 }
 
 impl TgpEncoder {
@@ -77,6 +97,7 @@ impl TgpEncoder {
             // Image ids are a shared namespace with other TGP programs; start
             // from a nonzero pseudorandom base to make collisions unlikely.
             image_id: 1 + (std::process::id() % 1000) * 7,
+            palette: None,
         }
     }
 
@@ -101,20 +122,7 @@ impl TgpEncoder {
 
         // Control block for this frame's image. Placement rect (`c`,`r`) is
         // carried on the transmit+place so the image fills the pane on screen.
-        // The image id is captured from the frame's current id by closure.
-        let base_control = |m: &FrameMetadata, image_id: u32| {
-            let mut c = vec![
-                ('i', image_id.to_string()),
-                ('s', m.width.to_string()),
-                ('v', m.height.to_string()),
-            ];
-            if self.config.placement_columns > 0 && self.config.placement_rows > 0 {
-                c.push(('c', self.config.placement_columns.to_string()));
-                c.push(('r', self.config.placement_rows.to_string()));
-            }
-            c.push(('p', 1u32.to_string()));
-            c
-        };
+        let (placement_columns, placement_rows) = (self.config.placement_columns, self.config.placement_rows);
 
         loop {
             let t0 = Instant::now();
@@ -175,16 +183,35 @@ impl TgpEncoder {
                     let t_encode = Instant::now();
                     for bytes in full_frame_commands(
                         &frame,
-                        &base_control(&frame.metadata, cur_id),
+                        &base_control(&frame.metadata, cur_id, placement_columns, placement_rows),
                         self.config.png,
+                        self.config.max_colors,
+                        &mut self.palette,
                     ) {
                         on_event(EncoderEvent::Bytes(bytes))?;
                     }
                     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
+                    // capture_ms is the *real* capture cost. When the source
+                    // reports per-phase timings (live capture), its total is
+                    // the actual grab time; fall back to the whole poll for
+                    // sources without it. `poll_ms` includes any pacing sleep
+                    // the source does, which isn't capture time.
+                    let capture_ms = frame
+                        .timing
+                        .map(|t| t.total_ms())
+                        .unwrap_or(poll_ms);
+                    // When the source gives real per-phase timings, the residual
+                    // poll time is its pacing sleep (the `1000/fps` throttle).
+                    let pacing_ms = if frame.timing.is_some() {
+                        (poll_ms - capture_ms).max(0.0)
+                    } else {
+                        0.0
+                    };
                     on_event(EncoderEvent::Frame {
                         width: frame.metadata.width,
                         height: frame.metadata.height,
-                        capture_ms: poll_ms,
+                        capture_ms,
+                        pacing_ms,
                         encode_ms,
                         timing: frame.timing,
                     })?;
@@ -249,7 +276,13 @@ impl Stream for EncoderStream {
 }
 
 /// Transmit + place commands for a full frame.
-fn full_frame_commands(frame: &Frame, control: &[(char, String)], png: bool) -> Vec<Vec<u8>> {
+fn full_frame_commands(
+    frame: &Frame,
+    control: &[(char, String)],
+    png: bool,
+    max_colors: Option<usize>,
+    palette: &mut Option<Palette>,
+) -> Vec<Vec<u8>> {
     // TGP format id: 100 for PNG (terminal decodes), else raw pixel formats.
     let fmt = if png {
         100u32
@@ -264,7 +297,13 @@ fn full_frame_commands(frame: &Frame, control: &[(char, String)], png: bool) -> 
     // a=T places at the cursor; but we do not manage the cursor here, the
     // host TUI does. Placement keys live in `control` via base_control().
     let payload = if png {
-        encode_png(&frame.data, frame.metadata.width, frame.metadata.height)
+        encode_png(
+            &frame.data,
+            frame.metadata.width,
+            frame.metadata.height,
+            max_colors,
+            palette,
+        )
     } else {
         frame.data.clone()
     };
@@ -275,20 +314,141 @@ fn full_frame_commands(frame: &Frame, control: &[(char, String)], png: bool) -> 
     out
 }
 
+/// Palette resume helper: rebuilds the graphics-control block for a frame's
+/// image (with the cache-friendly id/placement/colors keys). Placement rect
+/// (`c`,`r`) carries the pane size in cells.
+fn base_control(
+    m: &FrameMetadata,
+    image_id: u32,
+    placement_columns: u32,
+    placement_rows: u32,
+) -> Vec<(char, String)> {
+    let mut c = vec![
+        ('i', image_id.to_string()),
+        ('s', m.width.to_string()),
+        ('v', m.height.to_string()),
+    ];
+    if placement_columns > 0 && placement_rows > 0 {
+        c.push(('c', placement_columns.to_string()));
+        c.push(('r', placement_rows.to_string()));
+    }
+    c.push(('p', 1u32.to_string()));
+    c
+}
+
+/// Cached imagequant palette, reused across frames so unchanged pixels keep
+/// identical colors (avoids per-frame palette retraining flicker).
+struct Palette {
+    /// RGBA palette entries, in imagequant's order.
+    colors: Vec<imagequant::RGBA>,
+    /// Number of colors actually used (imagequant may emit fewer than asked).
+    count: usize,
+}
+
 /// Compress raw RGBA/RGB pixel data into a PNG byte string (in-memory).
-fn encode_png(data: &[u8], width: u32, height: u32) -> bytes::Bytes {
+///
+/// When `max_colors` is `Some(n)` the RGBA frame is palette-quantized to an
+/// indexed PNG via libimagequant (pngquant): it builds an `n`-color palette and
+/// each pixel reduces to a single index byte, shrinking the payload far below
+/// the lossless path for mostly-flat UI content at the cost of minor color
+/// fringing. The `palette` cache is updated on first use and reused on
+/// subsequent frames so colors are stable frame-to-frame. `None` emits a
+/// lossless truecolor PNG.
+fn encode_png(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    max_colors: Option<usize>,
+    palette: &mut Option<Palette>,
+) -> bytes::Bytes {
     let mut buf = Vec::new();
     {
         let mut enc = png::Encoder::new(&mut buf, width, height);
-        enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
-        // Keep memory/CPU bounded for a live stream; terminal decodes PNG via
-        // wuffs, and a fast stream matters more than near-lossless size.
-        enc.set_compression(png::Compression::Fast);
-        let mut w = enc.write_header().expect("png header");
-        w.write_image_data(data).expect("png data");
+        // Terminal decodes PNG via wuffs; use Default (not Fast) deflate so
+        // fewer bytes go to the sink. herdr re-decodes every frame, so byte
+        // size is the dominant cost there. Best is marginal and slower.
+        enc.set_compression(png::Compression::Default);
+        match max_colors {
+            Some(n) => {
+                let colors = n.clamp(2, 256) as u32;
+
+                let mut attr = imagequant::Attributes::new();
+                attr.set_max_colors(colors).expect("valid color count");
+                // Speed 4 (default) is a good quality/runtime balance for live
+                // streaming. 10 is fastest but visibly noisier on gradients.
+                attr.set_speed(5).expect("valid speed");
+
+                // Build the imagequant image from the raw RGBA bytes. gamma 0
+                // means the source is expected to be sRGB (correct for capture).
+                let mut img = attr
+                    .new_image_borrowed(
+                        to_rgba_slice(data, width, height),
+                        width as usize,
+                        height as usize,
+                        0.0,
+                    )
+                    .expect("valid image");
+
+                // Quantize against the cached palette if we have one; else a
+                // fresh palette, cached for next frame.
+                let (palette_rgba, indices) = match palette.as_mut() {
+                    Some(cached) => {
+                        let mut res = imagequant::QuantizationResult::from_palette(
+                            &attr,
+                            &cached.colors[..cached.count],
+                            0.0,
+                        )
+                        .expect("valid cached palette");
+                        let (_colors, remap) = res.remapped(&mut img).expect("remap");
+                        (cached.colors.clone(), remap)
+                    }
+                    None => {
+                        let mut res = attr.quantize(&mut img).expect("quantize");
+                        let colors = res.palette_vec();
+                        let count = colors.len();
+                        let remap = res.remapped(&mut img).expect("remap").1;
+                        *palette = Some(Palette {
+                            colors: colors.clone(),
+                            count,
+                        });
+                        (colors, remap)
+                    }
+                };
+
+                // Split palette into PLTE (RGB) + tRNS (alpha) chunks.
+                let mut rgb = Vec::with_capacity(palette_rgba.len() * 3);
+                let mut trns = Vec::with_capacity(palette_rgba.len());
+                for c in &palette_rgba {
+                    rgb.extend_from_slice(&[c.r, c.g, c.b]);
+                    trns.push(c.a);
+                }
+
+                enc.set_color(png::ColorType::Indexed);
+                enc.set_palette(rgb);
+                if trns.iter().any(|&a| a != 255) {
+                    enc.set_trns(trns);
+                }
+                let mut w = enc.write_header().expect("png header");
+                w.write_image_data(&indices).expect("png data");
+            }
+            None => {
+                enc.set_color(png::ColorType::Rgba);
+                let mut w = enc.write_header().expect("png header");
+                w.write_image_data(data).expect("png data");
+            }
+        }
     }
     bytes::Bytes::from(buf)
+}
+
+/// Cast the RGBA byte buffer (as `&[Rgba<u8>]` pairs) into the `&[RGBA]` slice
+/// imagequant expects. Layout is identical (4 bytes/pixel, R,G,B,A), so no copy
+/// is needed.
+fn to_rgba_slice(data: &[u8], _w: u32, _h: u32) -> &[imagequant::RGBA] {
+    debug_assert_eq!(data.len() % 4, 0);
+    // SAFETY: RGBA is 4 u8s (repr(C)), same layout as the raw bytes.
+    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<imagequant::RGBA>(), data.len() / 4) }
 }
 
 fn delete_image(image_id: u32) -> Vec<u8> {
@@ -471,6 +631,44 @@ mod tests {
         assert!(
             base_bytes > 4_000_000,
             "full 1280x720 base should be multi-MB, got {base_bytes}"
+        );
+    }
+
+    #[test]
+    fn palette_quantization_smaller_than_lossless_for_flat_frames() {
+        // 64x64 frame of a few flat colors: quantization to a small palette
+        // (and the resulting indexed PNG) should beat the lossless RGBA path.
+        let w = 64u32;
+        let h = 64u32;
+        let colors = [
+            [255u8, 0, 0, 255],
+            [0u8, 255, 0, 255],
+            [0u8, 0, 255, 255],
+        ];
+        let mut data = Vec::with_capacity((w * h * 4) as usize);
+        for i in 0..(w * h) as usize {
+            data.extend_from_slice(&colors[i % colors.len()]);
+        }
+        let mut cache: Option<Palette> = None;
+        let lossless = encode_png(&data, w, h, None, &mut cache);
+        let indexed1 = encode_png(&data, w, h, Some(16), &mut cache);
+        // Same unchanged frame again: must reuse the palette so pixels keep
+        // their color (the flicker that appeared when each frame got a fresh
+        // palette).
+        let indexed2 = encode_png(&data, w, h, Some(16), &mut cache);
+        assert!(
+            indexed1.len() < lossless.len(),
+            "indexed ({}) should beat lossless ({}) for flat colors",
+            indexed1.len(),
+            lossless.len()
+        );
+        // Both must be valid enough that the encoder didn't error; index space
+        // is bounded by the palette (<=16), which fits in a byte.
+        assert!(lossless.starts_with(b"\x89PNG"));
+        assert!(indexed1.starts_with(b"\x89PNG"));
+        assert!(
+            indexed1 == indexed2,
+            "identical frames must encode to identical bytes (stable palette)"
         );
     }
 }

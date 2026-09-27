@@ -545,6 +545,14 @@ pub struct CageFrameSource {
     frame_interval: Duration,
     /// When the previous frame was emitted, for pacing.
     prev_emit: Option<std::time::Instant>,
+    /// True once a non-blank frame has been emitted. Until then the source
+    /// discards blank frames: at boot the app hasn't painted yet, and letting a
+    /// black frame through as the encoder's first frame poisons the quantized
+    /// palette (everything stays black). Falls back to emitting whatever is on
+    /// screen after a short budget so genuinely unlit apps still render.
+    seen_content: bool,
+    /// Birth time, for the blank-skip budget window.
+    boot_start: std::time::Instant,
 }
 
 impl CageFrameSource {
@@ -553,8 +561,33 @@ impl CageFrameSource {
             driver: ScreenDriver::connect(cfg)?,
             frame_interval: cfg.poll_interval,
             prev_emit: None,
+            seen_content: false,
+            boot_start: std::time::Instant::now(),
         })
     }
+}
+
+/// True when a frame is entirely (or almost entirely) black — the signature of
+/// a pre-paint capture frame.
+fn frame_blank(frame: &Frame) -> bool {
+    const SAMPLE: usize = 64;
+    let data = &frame.data;
+    let px = data.len() / 4;
+    if px == 0 {
+        return true;
+    }
+    let step = (px / SAMPLE).max(1);
+    for (i, px0) in data.as_chunks::<4>().0.iter().enumerate().step_by(step) {
+        if i >= SAMPLE {
+            break;
+        }
+        // Treat near-black as blank too: a fully black boot frame often has
+        // off-black gamma/alpha rounding in a few bytes.
+        if px0[0] > 8 || px0[1] > 8 || px0[2] > 8 {
+            return false;
+        }
+    }
+    true
 }
 
 /// A synchronous capture handle: connect once, then grab one screenshot at a
@@ -606,7 +639,27 @@ impl FrameSource for CageFrameSource {
             .grab_once()
             .map_err(|e| tuigui_streamer::SourceError::Transport(e.to_string()))?;
         self.prev_emit = Some(std::time::Instant::now());
-        Ok(Some(FrameUpdate::Frame(shot.to_frame())))
+        let frame = shot.to_frame();
+
+        // Root cause of the boot race: a capture grab often catches the app before
+        // its first paint, a fully black frame. Emitting that as the encoder's
+        // first frame trains the quantized palette to black and the whole live
+        // image stays black. Discard blank frames until real content appears
+        // (or a timeout budget elapses, so genuinely unlit apps still show).
+        let blank = frame_blank(&frame);
+        if !self.seen_content {
+            const BLANK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+            if blank {
+                if self.boot_start.elapsed() < BLANK_BUDGET {
+                    tracing::debug!("capture: boot frame blank, skipping until content");
+                    return Ok(Some(FrameUpdate::Idle));
+                }
+            } else {
+                tracing::debug!("capture: first content frame");
+            }
+        }
+        self.seen_content = true;
+        Ok(Some(FrameUpdate::Frame(frame)))
     }
 }
 
@@ -631,5 +684,22 @@ mod tests {
         let f = s.to_frame();
         assert_eq!(f.metadata.format, PixelFormat::Rgba32);
         assert_eq!(f.effective_damage().len(), 1);
+    }
+
+    #[test]
+    fn blank_detection_distinguishes_pre_paint_black_from_content() {
+        let meta = FrameMetadata {
+            width: 8,
+            height: 8,
+            format: PixelFormat::Rgba32,
+        };
+        // All black -> blank (the pre-paint signature).
+        let black = Frame::full(meta.clone(), vec![0u8; 8 * 8 * 4].into());
+        assert!(frame_blank(&black), "all-black frame must be blank");
+        // One bright pixel anywhere -> content.
+        let mut px = vec![0u8; 8 * 8 * 4];
+        px[0] = 255; // R channel of first pixel bright.
+        let content = Frame::full(meta.clone(), px.into());
+        assert!(!frame_blank(&content), "frame with a bright pixel is content");
     }
 }
