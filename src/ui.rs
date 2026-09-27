@@ -3,12 +3,12 @@
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
-/// Render the shell and return the pane's inner rect — the top-left cell of
-/// the bordered pane where the TGP image should be placed.
+/// Render the shell and return the area the TGP image should be placed into —
+/// the full body below the header / above the footer (no border).
 pub fn draw(f: &mut Frame, app: &str, status: &str, last_bytes: usize) -> Rect {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
@@ -26,16 +26,10 @@ pub fn draw(f: &mut Frame, app: &str, status: &str, last_bytes: usize) -> Rect {
         header,
     );
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" live capture ");
-    let inner = block.inner(body);
-    f.render_widget(block, body);
-
     f.render_widget(
         Paragraph::new(format!(" {status} · last chunk {last_bytes}B · q quit ")),
         footer,
     );
 
-    inner
+    body
 }
