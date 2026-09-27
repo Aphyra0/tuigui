@@ -436,7 +436,7 @@ async fn run_pink_streaming(cli: &Cli) -> Result<()> {
     tracing::info!(width = w, height = h, "pink streaming frame source");
 
     let encoder = TgpEncoder::new(EncoderConfig {
-        strategy: Strategy::FullRetransmit,
+        strategy: Strategy::DeltaFrames,
         ..EncoderConfig::default()
     });
     let mut tgp_stream = encoder.into_stream(src);

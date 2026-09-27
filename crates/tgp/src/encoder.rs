@@ -179,6 +179,11 @@ impl TgpEncoder {
                                         delta_frame_command(self.image_id, frame_no, &rect, &frame);
                                     on_event(EncoderEvent::Bytes(bytes))?;
                                 }
+                                // Make the just-uploaded frame the displayed one.
+                                on_event(EncoderEvent::Bytes(set_current_frame_command(
+                                    self.image_id,
+                                    frame_no,
+                                )))?;
                             }
                             frame_no += 1;
                         }
@@ -275,6 +280,20 @@ fn delta_frame_command(image_id: u32, frame_no: u32, rect: &Rect, frame: &Frame)
             ('z', "-1".into()),
         ],
         &payload,
+    )
+}
+
+/// Ask the terminal to make `frame_no` the current frame of the animation, so a
+/// placement showing this image renders that frame. Without this an `a=f`
+/// delta is stored but never displayed.
+fn set_current_frame_command(image_id: u32, frame_no: u32) -> Vec<u8> {
+    tgp::command(
+        &[
+            ('a', "a".into()),
+            ('i', image_id.to_string()),
+            ('c', frame_no.to_string()),
+        ],
+        &[],
     )
 }
 
