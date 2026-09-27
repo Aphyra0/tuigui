@@ -7,5 +7,5 @@
 pub mod encoder;
 pub mod proto;
 
-pub use encoder::{EncoderConfig, EncoderError, EncoderEvent, Strategy, TgpEncoder};
+pub use encoder::{EncoderConfig, EncoderError, EncoderEvent, TgpEncoder};
 pub use proto::Action;

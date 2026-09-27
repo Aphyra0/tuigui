@@ -1,8 +1,7 @@
 //! The stateful TGP session encoder.
 //!
 //! Consumes [`FrameSource`] updates and produces the byte stream a terminal
-//! should receive: transmit/place for the first frame, then animation-frame
-//! delta patches for damaged regions. The output is a
+//! should receive: a full transmit+place for every frame. The output is a
 //! [`futures_core::Stream`] of byte chunks — nothing is written to stdout;
 //! the caller owns the sink (PTY, SSH channel, file, ...).
 
@@ -10,20 +9,8 @@ use futures_core::Stream;
 use tokio::sync::mpsc;
 
 use crate::proto as tgp;
-use tuigui_streamer::frame::{Frame, FrameMetadata, PixelFormat, Rect};
+use tuigui_streamer::frame::{Frame, FrameMetadata, PixelFormat};
 use tuigui_streamer::source::{FrameSource, FrameUpdate, SourceError};
-
-/// Streaming strategy for the encoder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Strategy {
-    /// Full re-transmit per frame. Simple, correct, bandwidth-hungry. Fine for
-    /// small windows and as the correctness baseline.
-    FullRetransmit,
-    /// First frame transmitted + placed, then one `a=f` patch per damage rect
-    /// against the base image. Bandwidth-friendly for UI-class damage.
-    #[default]
-    DeltaFrames,
-}
 
 /// What the encoder tells its consumer.
 #[derive(Debug)]
@@ -44,12 +31,8 @@ pub enum EncoderError {
 }
 
 /// Configuration for [`TgpEncoder`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EncoderConfig {
-    pub strategy: Strategy,
-    /// Consecutive frame number the first delta is based on. The base image
-    /// itself is frame 1.
-    pub first_delta_base_frame: u32,
     /// On-screen placement size in terminal cells. When both are `>0` every
     /// placed image is scaled to fill exactly this `columns x rows` area;
     /// without these the image is shown at one screen cell per source pixel,
@@ -57,17 +40,6 @@ pub struct EncoderConfig {
     /// corner is visible. Set both from the TUI's pane size.
     pub placement_columns: u32,
     pub placement_rows: u32,
-}
-
-impl Default for EncoderConfig {
-    fn default() -> Self {
-        EncoderConfig {
-            strategy: Strategy::default(),
-            first_delta_base_frame: 1,
-            placement_columns: 0,
-            placement_rows: 0,
-        }
-    }
 }
 
 /// Converts a [`FrameSource`] into a stream of TGP bytes.
@@ -103,15 +75,17 @@ impl TgpEncoder {
         // The base image is established from the first real frame, not from
         // `source.metadata()` (which for a live capture is best-effort and may
         // differ from what the compositor actually announces).
-        let mut placed = false;
-        let mut frame_no = self.config.first_delta_base_frame.max(1);
         let mut last_meta: Option<FrameMetadata> = None;
+        // id of the image currently on screen, to delete after the next frame
+        // replaces it.
+        let mut prev_image_id: Option<u32> = None;
 
-        // Initial control block for this image. Placement rect (`c`,`r`) is
+        // Control block for this frame's image. Placement rect (`c`,`r`) is
         // carried on the transmit+place so the image fills the pane on screen.
-        let base_control = |m: &FrameMetadata, placed_| {
+        // The image id is captured from the frame's current id by closure.
+        let base_control = |m: &FrameMetadata, image_id: u32| {
             let mut c = vec![
-                ('i', self.image_id.to_string()),
+                ('i', image_id.to_string()),
                 ('s', m.width.to_string()),
                 ('v', m.height.to_string()),
             ];
@@ -119,28 +93,21 @@ impl TgpEncoder {
                 c.push(('c', self.config.placement_columns.to_string()));
                 c.push(('r', self.config.placement_rows.to_string()));
             }
-            if placed_ {
-                c.push(('p', 1u32.to_string()));
-            }
+            c.push(('p', 1u32.to_string()));
             c
         };
 
         while let Some(update) = source.next().await.map_err(EncoderError::Source)? {
             match update {
-                FrameUpdate::Resized(m) => {
-                    last_meta = Some(m.clone());
-                    // Re-transmit under the same id replaces data and wipes
-                    // placements, so the next frame re-places.
-                    placed = false;
-                    if self.config.strategy == Strategy::DeltaFrames {
-                        // The base is replaced by the next full frame.
-                        frame_no = 1;
-                    }
+                FrameUpdate::Resized(_m) => {
                     on_event(EncoderEvent::Bytes(quiet_probe_reposition()))?;
                 }
                 FrameUpdate::Idle => continue,
                 FrameUpdate::Ended => {
-                    on_event(EncoderEvent::Bytes(delete_image(self.image_id)))?;
+                    // Delete the image currently on screen (the last placed one).
+                    if let Some(prev) = prev_image_id {
+                        on_event(EncoderEvent::Bytes(delete_image(prev)))?;
+                    }
                     on_event(EncoderEvent::Ended)?;
                     return Ok(());
                 }
@@ -159,7 +126,6 @@ impl TgpEncoder {
                     let data_len = frame.data.len();
                     let chunk_estimate = base64_len(data_len).div_ceil(4096);
                     tracing::debug!(
-                        frame_no,
                         ?frame.metadata.format,
                         width = frame.metadata.width,
                         height = frame.metadata.height,
@@ -168,40 +134,20 @@ impl TgpEncoder {
                         damage = frame.damage.len(),
                         "encoder frame start"
                     );
-                    match self.config.strategy {
-                        Strategy::FullRetransmit => {
-                            for bytes in
-                                full_frame_commands(&frame, &base_control(&frame.metadata, placed))
-                            {
-                                on_event(EncoderEvent::Bytes(bytes))?;
-                            }
-                            placed = true;
-                        }
-                        Strategy::DeltaFrames => {
-                            if !placed {
-                                for bytes in full_frame_commands(
-                                    &frame,
-                                    &base_control(&frame.metadata, placed),
-                                ) {
-                                    tracing::trace!("encoder emit chunk len={}", bytes.len());
-                                    on_event(EncoderEvent::Bytes(bytes))?;
-                                }
-                                placed = true;
-                            } else {
-                                for rect in frame.effective_damage() {
-                                    let bytes =
-                                        delta_frame_command(self.image_id, frame_no, &rect, &frame);
-                                    on_event(EncoderEvent::Bytes(bytes))?;
-                                }
-                                // Make the just-uploaded frame the displayed one.
-                                on_event(EncoderEvent::Bytes(set_current_frame_command(
-                                    self.image_id,
-                                    frame_no,
-                                )))?;
-                            }
-                            frame_no += 1;
-                        }
+                    // Use a fresh image id every frame. Re-transmitting the
+                    // same id deletes the on-screen placement (spec), which
+                    // blanks the pane for the whole transmit -> flicker. A
+                    // new id transmits and places over the old image with no
+                    // delete gap; the prior image is deleted once it's covered.
+                    let cur_id = self.image_id;
+                    self.image_id = self.image_id.wrapping_add(1);
+                    for bytes in full_frame_commands(&frame, &base_control(&frame.metadata, cur_id)) {
+                        on_event(EncoderEvent::Bytes(bytes))?;
                     }
+                    if let Some(prev) = prev_image_id.take() {
+                        on_event(EncoderEvent::Bytes(delete_image(prev)))?;
+                    }
+                    prev_image_id = Some(cur_id);
                 }
             }
         }
@@ -273,60 +219,6 @@ fn full_frame_commands(frame: &Frame, control: &[(char, String)]) -> Vec<Vec<u8>
     out
 }
 
-/// One `a=f` patch for a damage rect, composed onto the base image (frame 1).
-fn delta_frame_command(image_id: u32, frame_no: u32, rect: &Rect, frame: &Frame) -> Vec<u8> {
-    let _fmt = match frame.metadata.format {
-        PixelFormat::Rgb24 => 24u32,
-        PixelFormat::Rgba32 => 32,
-    };
-    let payload = extract_rect(frame, rect);
-    tgp::command(
-        &[
-            ('a', "f".into()),
-            ('i', image_id.to_string()),
-            ('c', "1".into()),
-            ('r', frame_no.to_string()),
-            ('x', rect.x.to_string()),
-            ('y', rect.y.to_string()),
-            ('s', rect.width.to_string()),
-            ('v', rect.height.to_string()),
-            ('X', "1".into()),
-            ('z', "-1".into()),
-        ],
-        &payload,
-    )
-}
-
-/// Ask the terminal to make `frame_no` the current frame of the animation, so a
-/// placement showing this image renders that frame. Without this an `a=f`
-/// delta is stored but never displayed.
-fn set_current_frame_command(image_id: u32, frame_no: u32) -> Vec<u8> {
-    tgp::command(
-        &[
-            ('a', "a".into()),
-            ('i', image_id.to_string()),
-            ('c', frame_no.to_string()),
-        ],
-        &[],
-    )
-}
-
-/// Copy a pixel-space rect out of a frame's row-major buffer.
-fn extract_rect(frame: &Frame, rect: &Rect) -> Vec<u8> {
-    let bpp = frame.bytes_per_pixel();
-    let stride = frame.metadata.width as usize * bpp;
-    let x0 = rect.x as usize;
-    let y0 = rect.y as usize;
-    let w = rect.width as usize;
-    let h = rect.height as usize;
-    let mut out = Vec::with_capacity(w * h * bpp);
-    for row in y0..(y0 + h) {
-        let start = row * stride + x0 * bpp;
-        out.extend_from_slice(&frame.data[start..start + w * bpp]);
-    }
-    out
-}
-
 fn delete_image(image_id: u32) -> Vec<u8> {
     tgp::command(
         &[
@@ -372,20 +264,8 @@ mod tests {
             }
             self.n -= 1;
             let len = (self.meta.width * self.meta.height) as usize * 4;
-            let mut data = vec![0u8; len];
-            if self.n == 0 {
-                // second frame: mark a 1px region changed
-                data[0] = 0xff;
-            }
-            let mut f = Frame::full(self.meta.clone(), data.into());
-            if self.n == 0 {
-                f.damage = vec![Rect {
-                    x: 0,
-                    y: 0,
-                    width: 1,
-                    height: 1,
-                }];
-            }
+            let data = vec![0u8; len];
+            let f = Frame::full(self.meta.clone(), data.into());
             Ok(Some(FrameUpdate::Frame(f)))
         }
     }
@@ -400,34 +280,6 @@ mod tests {
 
     #[tokio::test]
     async fn full_retransmit_emits_transmit_place_then_delete() {
-        let mut enc = TgpEncoder::new(EncoderConfig {
-            strategy: Strategy::FullRetransmit,
-            ..Default::default()
-        });
-        let mut src = TwoFrameSource { meta: meta(), n: 2 };
-        let mut events = Vec::new();
-        enc.run(&mut src, |e| {
-            events.push(e);
-            Ok(())
-        })
-        .await
-        .unwrap();
-        let strings: Vec<String> = events
-            .into_iter()
-            .filter_map(|e| match e {
-                EncoderEvent::Bytes(b) => Some(String::from_utf8(b).unwrap()),
-                _ => None,
-            })
-            .collect();
-        // 2 frames × (transmit+place), then delete
-        assert_eq!(strings.len(), 3);
-        assert!(strings[0].starts_with("\x1b_Ga=T"));
-        assert!(strings[0].contains("a=T"));
-        assert!(strings[2].starts_with("\x1b_Ga=d"));
-    }
-
-    #[tokio::test]
-    async fn delta_frames_place_once_then_patch() {
         let mut enc = TgpEncoder::new(EncoderConfig::default());
         let mut src = TwoFrameSource { meta: meta(), n: 2 };
         let mut events = Vec::new();
@@ -444,13 +296,59 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // first frame: 1 command; second frame: 1 delta; then delete
-        assert_eq!(strings.len(), 3);
+        // 2 frames × (transmit+place), delete-of-previous after frame 2, then
+        // delete of the last image on Ended.
+        assert_eq!(strings.len(), 4);
         assert!(strings[0].starts_with("\x1b_Ga=T"));
-        assert!(strings[1].starts_with("\x1b_Ga=f"));
-        assert!(strings[1].contains("a=f"));
-        assert!(strings[1].contains("c=1"));
+        assert!(strings[0].contains("a=T"));
+        assert!(strings[3].starts_with("\x1b_Ga=d"));
+    }
+
+    /// Extract the `i=<id>` value from a TGP command's control block.
+    fn id_of(s: &str) -> &str {
+        for k in s.split(',') {
+            if let Some(v) = k.strip_prefix("i=") {
+                return v;
+            }
+        }
+        ""
+    }
+
+    #[tokio::test]
+    async fn every_frame_retransmits_and_places() {
+        let mut enc = TgpEncoder::new(EncoderConfig::default());
+        let mut src = TwoFrameSource { meta: meta(), n: 2 };
+        let mut events = Vec::new();
+        enc.run(&mut src, |e| {
+            events.push(e);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let strings: Vec<String> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                EncoderEvent::Bytes(b) => Some(String::from_utf8(b).unwrap()),
+                _ => None,
+            })
+            .collect();
+        // 2 frames: transmit+place each, then delete-of-previous after frame 2,
+        // then delete of the last image on Ended -> 4 events.
+        assert_eq!(strings.len(), 4);
+        assert!(strings[0].starts_with("\x1b_Ga=T"));
+        assert!(strings[0].contains("a=T"));
+        assert!(strings[1].starts_with("\x1b_Ga=T"), "frame 2 must retransmit");
+        assert!(strings[1].contains("a=T"));
+        // Each frame must use a distinct image id (no delete-gap flicker).
+        let id0 = id_of(&strings[0]);
+        let id1 = id_of(&strings[1]);
+        assert_ne!(id0, id1, "each frame must transmit under a fresh image id");
+        // frame 2's delete targets the previous first-frame id.
         assert!(strings[2].starts_with("\x1b_Ga=d"));
+        assert!(strings[2].contains(&format!("i={id0}")));
+        // final delete removes the last placed image on Ended.
+        assert!(strings[3].starts_with("\x1b_Ga=d"));
+        assert!(strings[3].contains(&format!("i={id1}")));
     }
 
     #[tokio::test]
@@ -470,42 +368,29 @@ mod tests {
             meta: meta.clone(),
             n: 2,
         };
-        let mut stream = TgpEncoder::new(EncoderConfig {
-            strategy: Strategy::DeltaFrames,
-            ..Default::default()
-        })
-        .into_stream(src);
-        // Frame 1 = the full-base transmit (chunked). Frame 2 patches one rect.
-        // The base transmit must begin and end correctly and NOT straddle the
-        // first delta.
-        let mut receive_base = true;
+        let mut stream = TgpEncoder::new(EncoderConfig::default()).into_stream(src);
         let mut base_bytes = 0usize;
         let mut saw_m0 = false;
-        let mut deltas = 0;
+        let mut full_transmits = 0;
         let mut ended = false;
         while let Some(item) = stream.next().await {
             match item.unwrap() {
                 EncoderEvent::Bytes(b) => {
                     let s = String::from_utf8_lossy(&b);
                     if s.contains("a=T") {
-                        receive_base = true;
-                    } else if s.contains("a=f") {
-                        receive_base = false;
-                        deltas += 1;
+                        full_transmits += 1;
                     }
-                    if receive_base {
-                        base_bytes += b.len();
-                        let is_m0 = s.trim_end().ends_with("m=0\x1b\\") || s.contains("m=0");
-                        if is_m0 {
-                            saw_m0 = true;
-                        }
+                    base_bytes += b.len();
+                    let is_m0 = s.trim_end().ends_with("m=0\x1b\\") || s.contains("m=0");
+                    if is_m0 {
+                        saw_m0 = true;
                     }
                 }
                 EncoderEvent::Ended => ended = true,
             }
         }
         assert!(ended, "stream must end with Ended");
-        assert!(deltas >= 1, "frame 2 must produce a delta");
+        assert!(full_transmits >= 2, "each frame must be a full transmit");
         assert!(
             saw_m0,
             "base transmit must terminate with an explicit m=0 chunk"
@@ -514,29 +399,5 @@ mod tests {
             base_bytes > 4_000_000,
             "full 1280x720 base should be multi-MB, got {base_bytes}"
         );
-    }
-
-    #[test]
-    fn extract_rect_rows() {
-        let f = Frame {
-            metadata: FrameMetadata {
-                width: 3,
-                height: 2,
-                format: PixelFormat::Rgb24,
-            },
-            data: (0u8..18).collect::<Vec<u8>>().into(),
-            presentation_timestamp: None,
-            damage: vec![],
-        };
-        let r = extract_rect(
-            &f,
-            &Rect {
-                x: 1,
-                y: 1,
-                width: 2,
-                height: 1,
-            },
-        );
-        assert_eq!(r, vec![12, 13, 14, 15, 16, 17]);
     }
 }

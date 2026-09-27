@@ -18,7 +18,7 @@ use tuigui_cage::{
 };
 use tuigui_streamer::{FrameSource, Mp4VideoSource, PinkFrameSource};
 use tuigui_tgp::proto as tgp;
-use tuigui_tgp::{EncoderConfig, EncoderEvent, EncoderError, Strategy, TgpEncoder};
+use tuigui_tgp::{EncoderConfig, EncoderEvent, EncoderError, TgpEncoder};
 
 /// Run a GUI app headlessly and stream it into this terminal via TGP.
 #[derive(Parser, Debug)]
@@ -123,11 +123,10 @@ async fn main() -> Result<()> {
         .context("connecting screencopy client")?;
 
     // 3. Encode to a TGP byte stream, scaled to fill the pane (in cells).
+    //    Every frame is fully transmitted and placed; no delta/damage logic.
     let encoder = TgpEncoder::new(EncoderConfig {
-        strategy: Strategy::DeltaFrames,
         placement_columns: pc,
         placement_rows: pr,
-        ..EncoderConfig::default()
     });
     let mut tgp_stream = encoder.into_stream(source);
 
@@ -148,7 +147,7 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<InputMsg>();
     let sock_path = session.wayland_socket().clone();
     let (tw, th) = (tcols, trows);
-    tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         // Connect with a timeout so a slow/refusing server just disables input.
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
             let mut ins = InputSock::connect(&sock_path)?;
@@ -183,7 +182,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    run_ui(
+    let res = run_ui(
         terminal,
         &mut tgp_stream,
         &app_path,
@@ -191,7 +190,14 @@ async fn main() -> Result<()> {
         (tcols, trows),
         tx,
     )
-    .await
+    .await;
+    // The writer task holds a clone of runtime resources (its rx channel). If
+    // it is parked inside a blocking Wayland flush it won't observe tx closing
+    // via rx.recv() returning None, so it would keep the tokio runtime alive
+    // and the process would hang after `q`. Abort it now that the UI loop is
+    // done.
+    writer.abort();
+    res
 }
 
 /// Stream a video file's decoded frames through the TGP encoder into a file.
@@ -210,10 +216,7 @@ async fn run_video_to_file(path: &str, out: &str, loop_forever: bool) -> Result<
     let meta = src.metadata();
     tracing::info!(width = meta.width, height = meta.height, "video opened");
 
-    let encoder = TgpEncoder::new(EncoderConfig {
-        strategy: Strategy::FullRetransmit,
-        ..EncoderConfig::default()
-    });
+    let encoder = TgpEncoder::new(EncoderConfig::default());
     let stream = encoder.into_stream(src);
     drain_to_file(stream, out).await
 }
@@ -293,10 +296,7 @@ async fn run_video_tui(path: &str) -> Result<()> {
     let meta = src.metadata();
     tracing::info!(width = meta.width, height = meta.height, "video opened in TUI (looping)");
 
-    let encoder = TgpEncoder::new(EncoderConfig {
-        strategy: Strategy::FullRetransmit, // every frame is a fresh transmit+place
-        ..EncoderConfig::default()
-    });
+    let encoder = TgpEncoder::new(EncoderConfig::default());
     let mut tgp_stream = encoder.into_stream(src);
 
     let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
@@ -374,7 +374,11 @@ async fn run_ui(
                     written_bytes += b.len();
                     out.write_all(&b)?;
                 }
-                Ok(Some(Ok(EncoderEvent::Bytes(_)))) => {}
+                // Empty batch means nothing more to drain right now; stop and
+                // return control to the UI loop so keys/mouse stay responsive
+                // even when the encoder idles between frames. Spinning on
+                // empty chunks would busy-loop and starve input polling.
+                Ok(Some(Ok(EncoderEvent::Bytes(_)))) => break,
                 Ok(Some(Ok(EncoderEvent::Ended))) => {
                     last_event = "capture ended".into();
                     quit = true;
@@ -505,16 +509,21 @@ fn mouse_to_pointer(
     pane: Option<ratatui::layout::Rect>,
     output_px: (u32, u32),
 ) -> Vec<PointerEvent> {
-    use crossterm::event::{MouseButton as B, MouseEventKind as K};
     let mut out = Vec::new();
-    let (px, py, pw, ph) = pane
-        .map(|r| (r.x, r.y, r.width, r.height))
-        .unwrap_or((0, 0, 0, 0));
+    use crossterm::event::{MouseButton as B, MouseEventKind as K};
+    // Require a real pane rect to map cells -> pixels. With no pane there is
+    // no drawing surface, so no pointer events to inject: return early rather
+    // than fabricate coordinates from silent defaults.
+    let pane = match pane {
+        Some(r) if r.width > 0 && r.height > 0 => r,
+        _ => return Vec::new(),
+    };
+    let (px, py, pw, ph) = (pane.x, pane.y, pane.width, pane.height);
     // cell (relative to pane) -> normalized [0,1] -> virtual-frame pixel.
-    let (fw, fh) = (output_px.0.max(1) as f64, output_px.1.max(1) as f64);
+    let (fw, fh) = (output_px.0 as f64, output_px.1 as f64);
     let to_px = |col: u16, row: u16| {
-        let nx = ((col as f64 - px as f64) / pw.max(1) as f64).clamp(0.0, 1.0);
-        let ny = ((row as f64 - py as f64) / ph.max(1) as f64).clamp(0.0, 1.0);
+        let nx = ((col as f64 - px as f64) / pw as f64).clamp(0.0, 1.0);
+        let ny = ((row as f64 - py as f64) / ph as f64).clamp(0.0, 1.0);
         (nx * fw, ny * fh)
     };
     match m.kind {
@@ -689,10 +698,7 @@ async fn run_pink_streaming() -> Result<()> {
     let src = PinkFrameSource::infinite(w, h);
     tracing::info!(width = w, height = h, "pink streaming frame source");
 
-    let encoder = TgpEncoder::new(EncoderConfig {
-        strategy: Strategy::DeltaFrames,
-        ..EncoderConfig::default()
-    });
+    let encoder = TgpEncoder::new(EncoderConfig::default());
     let mut tgp_stream = encoder.into_stream(src);
 
     let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
