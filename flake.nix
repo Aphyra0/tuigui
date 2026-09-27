@@ -106,9 +106,10 @@
               pkgs.weston
               # video decode for the `--video` streaming path (bypasses wayland)
               pkgs.ffmpeg
-              # X11 side: xeyes + a virtual X server and input driver for the
-              # Xvfb capture path
+              # X11 side: xeyes + glxgears, plus a virtual X server and input
+              # driver for the Xvfb capture path
               pkgs.xeyes
+              pkgs.mesa-demos         # glxgears — classic X11/GL gears test app
               pkgs.xvfb-run
               pkgs.xdotool
             ];
