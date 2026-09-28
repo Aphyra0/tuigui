@@ -135,6 +135,15 @@ struct Cli {
     /// diffing. Implies `--blocks 4` if not already set.
     #[arg(long, default_value_t = false)]
     debug_blocks: bool,
+
+    /// With --blocks, cap how many payload pixels each frame hands the terminal
+    /// decoder by routing changed blocks through a rendering queue drained up to
+    /// this budget per frame. `0` (default) disables the queue and retransmits
+    /// every changed block inline. Assess the natural budget as
+    /// `(pixels of one tile at the lowest resolution level) x (all on-screen
+    /// tiles)`; supply it here explicitly by that value (see spec/RENDER_QUEUE.md).
+    #[arg(long, value_name = "PIXELS", default_value_t = 0)]
+    render_pixel_budget: u64,
 }
 
 #[tokio::main]
@@ -221,6 +230,7 @@ async fn main() -> Result<()> {
         debug_lod: cli.debug_lod,
         debug_blocks: cli.debug_blocks,
         pane_origin: Some((0, 0)),
+        render_pixel_budget: cli.render_pixel_budget,
     });
     let mut tgp_stream = encoder.into_stream(source);
 

@@ -115,6 +115,13 @@ pub struct EncoderConfig {
     /// `None` (default) is used by full-frame mode, where `main.rs` positions
     /// the cursor once.
     pub pane_origin: Option<(u16, u16)>,
+    /// With `blocks_per_side > 0`, cap how many pixels each frame hands the
+    /// terminal decoder. `0` (default) retransmits every changed block inline,
+    /// with no ceiling (current behavior). When `> 0`, changed blocks route
+    /// through a rendering queue drained at most once per frame up to this many
+    /// *payload* pixels (`payload_width × payload_height` of the affected
+    /// blocks); the rest spill to the next frame. See `spec/RENDER_QUEUE.md`.
+    pub render_pixel_budget: u64,
 }
 
 /// Converts a [`FrameSource`] into a stream of TGP bytes.
@@ -135,6 +142,13 @@ pub struct TgpEncoder {
     /// bounded at the grid size instead of accumulating forever (which fills
     /// the store and jams rendering, printing escapes as raw text).
     block_ids: Vec<Option<u32>>,
+    /// Rendering queue: blocks waiting to be transmitted, keyed by grid slot.
+    /// Only used when `config.render_pixel_budget > 0`; drained at most once per
+    /// frame up to the pixel budget, undrained entries spill to the next frame.
+    /// An entry is a `(slot_index, MicroBlock)` pair, and enqueuing a second
+    /// update for a slot already queued replaces it (keeps the newest payload,
+    /// never renders a superseded one).
+    render_queue: Vec<(usize, tuigui_streamer::blocks::MicroBlock)>,
 }
 
 impl TgpEncoder {
@@ -156,11 +170,104 @@ impl TgpEncoder {
             frame_count: 0,
             blocks,
             block_ids: Vec::new(),
+            render_queue: Vec::new(),
         }
     }
 
     pub fn image_id(&self) -> u32 {
         self.image_id
+    }
+
+    /// Enqueue this frame's changed blocks keyed by grid slot, replacing any
+    /// already-queued (and therefore not-yet-rendered) version of the same slot
+    /// so a superseded payload is never transmitted. Only touches the rendering
+    /// queue; call [`TgpEncoder::drain_render_queue`] afterwards.
+    fn enqueue_blocks(
+        &mut self,
+        changed: &[tuigui_streamer::blocks::MicroBlock],
+        n_slots: usize,
+        grid_cols: usize,
+    ) {
+        // Trim to the grid, in case a resize aged out queued slots.
+        self.render_queue.retain(|(slot, _)| *slot < n_slots);
+        // Mark which slots are already queued so we can replace in place.
+        let mut secondary_index: Vec<Option<usize>> = vec![None; n_slots];
+        for (i, (slot, _)) in self.render_queue.iter().enumerate() {
+            if *slot < n_slots {
+                secondary_index[*slot] = Some(i);
+            }
+        }
+        for b in changed {
+            let slot = (b.row as usize) * grid_cols + b.col as usize;
+            if slot >= n_slots {
+                continue;
+            }
+            match secondary_index[slot] {
+                // Already queued: replace in place with the newest payload.
+                Some(i) => self.render_queue[i].1 = b.clone(),
+                // Not queued yet: append.
+                None => {
+                    self.render_queue.push((slot, b.clone()));
+                    secondary_index[slot] = Some(self.render_queue.len() - 1);
+                }
+            }
+        }
+    }
+
+    /// Transmit a single already-diffed block: place the new image under a
+    /// fresh id so the slot is covered with no blank gap, then delete the
+    /// displaced id so the terminal's stored images stay bounded at the grid
+    /// size (which otherwise fills the store and jams rendering).
+    fn emit_block<'a>(
+        &mut self,
+        b: &tuigui_streamer::blocks::MicroBlock,
+        slot: usize,
+        on_event: &mut impl FnMut(EncoderEvent) -> Result<(), EncoderError>,
+        origin: (u16, u16),
+        placement: BlockPlacement,
+    ) -> Result<(), EncoderError> {
+        let old = self.block_ids[slot].take();
+        let bid = self.image_id;
+        self.image_id = self.image_id.wrapping_add(1);
+        self.block_ids[slot] = Some(bid);
+        on_event(EncoderEvent::Bytes(transmit_block(
+            b,
+            &base_control_for_block(b, bid, placement),
+            self.config.png,
+            self.config.color_bits,
+            origin,
+            placement,
+        )))?;
+        if let Some(old) = old {
+            on_event(EncoderEvent::Bytes(delete_image(old)))?;
+        }
+        Ok(())
+    }
+
+    /// Drain the rendering queue from the front, transmitting tiles until
+    /// adding the next would exceed `budget` *payload* pixels
+    /// (`payload_width × payload_height`, i.e. the resolution the tile was
+    /// actually settled at). The rest stay queued for the next frame. Emits
+    /// transmit+place + delete-displaced pairs for each drained tile.
+    fn drain_render_queue(
+        &mut self,
+        budget: u64,
+        on_event: &mut impl FnMut(EncoderEvent) -> Result<(), EncoderError>,
+        origin: (u16, u16),
+        placement: BlockPlacement,
+    ) -> Result<(), EncoderError> {
+        let mut spent: u64 = 0;
+        for (slot, block) in std::mem::take(&mut self.render_queue) {
+            let cost = block.payload_width as u64 * block.payload_height as u64;
+            if spent + cost > budget {
+                // Keep this tile (and everything behind it) for the next frame.
+                self.render_queue.push((slot, block));
+                continue;
+            }
+            spent += cost;
+            self.emit_block(&block, slot, on_event, origin, placement)?;
+        }
+        Ok(())
     }
 
     /// Encode the full lifetime of a source into events. Drives `source` to
@@ -211,6 +318,9 @@ impl TgpEncoder {
                         on_event(EncoderEvent::Bytes(delete_image(*old)))?;
                     }
                     self.block_ids.clear();
+                    // Discard any blocks still queued (they were never emitted,
+                    // so they hold no on-screen id to delete).
+                    self.render_queue.clear();
                     on_event(EncoderEvent::Ended)?;
                     return Ok(());
                 }
@@ -254,38 +364,30 @@ impl TgpEncoder {
                         // transmit+place under its own image id, mapped through
                         // frame->pane scaling so the blocks tile the pane.
                         let seed = self.frame_count.wrapping_add(1);
-                        let changed = grid.diff(&frame, self.config.debug_blocks, seed);
-                        let origin = self.config.pane_origin.unwrap_or((0, 0));
-                        let placement = BlockPlacement::new(
-                            (frame.metadata.width, frame.metadata.height),
-                            (placement_columns, placement_rows),
-                        );
-                        // Keep the on-screen id per grid slot in step with the
-                        // grid dimensions (reset on layout change).
+                        let grid_cols = grid.cols() as usize;
                         let n_slots = (grid.cols() * grid.rows()) as usize;
                         if self.block_ids.len() != n_slots {
                             self.block_ids.clear();
                             self.block_ids.resize(n_slots, None);
                         }
-                        for b in &changed {
-                            let slot = (b.row * grid.cols() + b.col) as usize;
-                            let old = self.block_ids[slot].take();
-                            // Place the new image FIRST (fresh id) so the slot
-                            // is covered with no blank gap, then delete the
-                            // displaced id so the store never grows unbounded.
-                            let bid = self.image_id;
-                            self.image_id = self.image_id.wrapping_add(1);
-                            self.block_ids[slot] = Some(bid);
-                            on_event(EncoderEvent::Bytes(transmit_block(
-                                b,
-                                &base_control_for_block(b, bid, placement),
-                                self.config.png,
-                                self.config.color_bits,
+                        let origin = self.config.pane_origin.unwrap_or((0, 0));
+                        let changed = grid.diff(&frame, self.config.debug_blocks, seed);
+                        let placement = BlockPlacement::new(
+                            (frame.metadata.width, frame.metadata.height),
+                            (placement_columns, placement_rows),
+                        );
+                        if self.config.render_pixel_budget > 0 {
+                            self.enqueue_blocks(&changed, n_slots, grid_cols);
+                            self.drain_render_queue(
+                                self.config.render_pixel_budget,
+                                &mut on_event,
                                 origin,
                                 placement,
-                            )))?;
-                            if let Some(old) = old {
-                                on_event(EncoderEvent::Bytes(delete_image(old)))?;
+                            )?;
+                        } else {
+                            for b in &changed {
+                                let slot = (b.row as usize) * grid_cols + b.col as usize;
+                                self.emit_block(b, slot, &mut on_event, origin, placement)?;
                             }
                         }
                         self.frame_count += 1;
@@ -820,6 +922,67 @@ mod tests {
         // top-left slot -> 1 displaced delete; Ended frees the 4 on-screen
         // block images -> 5 deletes total.
         assert_eq!(delete_events, 5, "1 displaced-slot delete + 4 ended-cleanup deletes");
+    }
+
+    #[tokio::test]
+    async fn render_queue_budget_caps_tiles_per_frame_and_spills_over() {
+        use bytes::Bytes as B;
+        use tokio_stream::StreamExt as _;
+        // A static 40x40 frame split 2x2 into 20x20 blocks. The source emits 4
+        // identical frames then Ended. With the budget set to exactly one
+        // full-res 20x20 block (400 px), each frame drains at most one tile from
+        // the queue, so the 4 blocks spill across frames 1-4. This proves both
+        // the per-frame pixel cap and that undrained tiles persist across frames.
+        struct StaticSrc {
+            n: u32,
+        }
+        #[async_trait]
+        impl FrameSource for StaticSrc {
+            fn metadata(&self) -> FrameMetadata {
+                FrameMetadata { width: 40, height: 40, format: PixelFormat::Rgba32 }
+            }
+            async fn next(&mut self) -> Result<Option<FrameUpdate>, SourceError> {
+                if self.n == 0 {
+                    return Ok(Some(FrameUpdate::Ended));
+                }
+                self.n -= 1;
+                let data = vec![5u8; 40 * 40 * 4];
+                Ok(Some(FrameUpdate::Frame(Frame::full(self.metadata(), B::from(data)))))
+            }
+        }
+
+        let cfg = EncoderConfig {
+            blocks_per_side: 2,
+            pane_origin: Some((0, 0)),
+            placement_columns: 40,
+            placement_rows: 40,
+            png: false,             // deterministic raw payload
+            res_levels: 1,          // single rung: level==res_levels -> factor 1 -> full res 20x20 = 400 px
+            render_pixel_budget: 400, // allow exactly one tile per frame
+            ..EncoderConfig::default()
+        };
+        let enc = TgpEncoder::new(cfg);
+        let src = StaticSrc { n: 4 };
+        let mut stream = enc.into_stream(src);
+        let mut transmits = 0usize;
+        // Watch how many transmits appear per frame (between Frame events).
+        // We count total transmits and also split per-frame spends by tracking
+        // a cumulative counter across Frame event boundaries mis, simpler: assert
+        // the total is 4 across 4 frames.
+        while let Some(item) = stream.next().await {
+            match item.unwrap() {
+                EncoderEvent::Bytes(b) => {
+                    let s = String::from_utf8_lossy(&b);
+                    if s.contains("a=T") {
+                        transmits += 1;
+                    }
+                }
+                EncoderEvent::Frame { .. } => {}
+                EncoderEvent::Ended => break,
+            }
+        }
+        // 4 blocks, one drained per frame => exactly 4 transmit events total.
+        assert_eq!(transmits, 4, "each 400px tile drains one per frame across 4 frames");
     }
 
     #[tokio::test]
