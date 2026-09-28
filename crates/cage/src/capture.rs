@@ -265,9 +265,16 @@ impl ScreenDriver {
         self.state.start(None);
 
         // Phase 1: dispatch until the `buffer` (dimensions + format) event
-        // arrives; the elapsed time is the announce cost.
+        // arrives; the elapsed time is the announce cost. Bounded so a
+        // compositor that stalls (weston momentarily drops output on transient
+        // damage) can't hang the grab forever and freeze the whole session.
         let announce_ms = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
             while self.state.get_dims().is_none() || self.state.get_format().is_none() {
+                if std::time::Instant::now() >= deadline {
+                    self.state.pending = None;
+                    return Err(CageError::Capture("timed out waiting for screencopy buffer announce".into()));
+                }
                 self.queue
                     .blocking_dispatch(&mut self.state)
                     .map_err(|e| CageError::Capture(e.to_string()))?;
@@ -290,7 +297,27 @@ impl ScreenDriver {
             .get_format()
             .ok_or_else(|| CageError::Capture("screencopy frame ready before buffer format".into()))?;
         let stride = self.state.get_stride().unwrap_or(w * 4);
-        let size = (stride * h) as usize;
+        // `stride` and the pool size must be sane. wl_shm's create_pool takes a
+        // signed 32-bit `size`; if stride*height overflows i32 the value wraps
+        // negative and the server rejects it with "invalid arguments" (which,
+        // on a large or mis-reported output, recurs every frame). Guard the
+        // arithmetic and sanity-check the dims before handing them to the
+        // compositor.
+        if w == 0 || h == 0 || stride < w * 4 {
+            self.state.pending = None;
+            return Err(CageError::Capture(format!(
+                "implausible screencopy dims: {w}x{h}, stride {stride}"
+            )));
+        }
+        let size64 = stride as u64 * h as u64;
+        if size64 > i32::MAX as u64 {
+            self.state.pending = None;
+            return Err(CageError::Capture(format!(
+                "screencopy pool too large for wl_shm: {size64} bytes ({w}x{h}, stride {stride})"
+            )));
+        }
+        let size = size64 as usize;
+        tracing::debug!(w, h, stride, size, "screencopy shm pool");
         // Back the wl_shm pool with an anonymous memfd (RAM only) instead of a
         // disk tempfile, so the compositor's frame is never read off disk.
         let file = memfd_file()?;
@@ -306,8 +333,13 @@ impl ScreenDriver {
 
         // Phase 2: dispatch until ready / failed; the elapsed time is the
         // compositor's copy cost. The readout cost is measured inside
-        // `build_screenshot`.
+        // `build_screenshot`. Bounded for the same reason as phase 1: a stalled
+        // compositor must not pin the encoder task forever.
         let (monotonic_copy_ms, mut shot) = 'phase2: loop {
+            if std::time::Instant::now() >= t_phase + Duration::from_secs(2) {
+                self.state.pending = None;
+                return Err(CageError::Capture("timed out waiting for screencopy frame ready".into()));
+            }
             self.queue
                 .blocking_dispatch(&mut self.state)
                 .map_err(|e| CageError::Capture(e.to_string()))?;
@@ -563,6 +595,11 @@ fn build_screenshot(req: &FrameRequest) -> Option<Screenshot> {
 /// Wrap the driver as a [`FrameSource`] for the TGP encoder.
 pub struct CageFrameSource {
     driver: ScreenDriver,
+    /// The config used to (re)connect the driver. Kept so a poisoned Wayland
+    /// connection — a server-raised protocol error on `create_pool`, which
+    /// makes the connection unusable and would otherwise fail every subsequent
+    /// grab identically — can be torn down and rebuilt instead of retried.
+    cfg: CaptureConfig,
     /// Minimum wall-clock gap between emitted frames (target frame period).
     frame_interval: Duration,
     /// When the previous frame was emitted, for pacing.
@@ -587,6 +624,7 @@ impl CageFrameSource {
     pub fn connect(cfg: &CaptureConfig) -> Result<Self, CageError> {
         Ok(CageFrameSource {
             driver: ScreenDriver::connect(cfg)?,
+            cfg: cfg.clone(),
             frame_interval: cfg.poll_interval,
             prev_emit: None,
             seen_content: false,
@@ -704,16 +742,30 @@ impl FrameSource for CageFrameSource {
         let shot = match self.driver.grab_once() {
             Ok(shot) => shot,
             Err(e) => {
-                // A single failed grab (a transient race where the frame
-                // reached Ready before the buffer announced dims/format, or the
-                // compositor rejected the copy) must not kill the session. A
-                // panicked/errored grab currently ends the whole encoder
-                // stream, silently quitting the TUI after however long it takes
-                // to hit one bad frame. Skip this frame and let the next poll
-                // retry.
-                tracing::warn!(err = %e, "capture: skipping a failed grab");
-                self.prev_emit = Some(std::time::Instant::now());
-                return Ok(Some(FrameUpdate::Idle));
+                // A failed grab is usually a transient screencopy hiccup, but a
+                // wayland protocol error (e.g. invalid arguments on create_pool)
+                // poisons the whole connection: every subsequent request on it
+                // fails identically forever, freezing the stream. To recover we
+                // must drop the dead connection and reconnect a fresh driver,
+                // then retry the grab once, rather than keep poking a poisoned
+                // socket.
+                tracing::warn!(err = %e, "capture: grab failed, reconnecting");
+                match ScreenDriver::connect(&self.cfg) {
+                    Ok(driver) => self.driver = driver,
+                    Err(re) => {
+                        tracing::error!(err = %re, "capture: reconnect failed");
+                        self.prev_emit = Some(std::time::Instant::now());
+                        return Ok(Some(FrameUpdate::Idle));
+                    }
+                }
+                match self.driver.grab_once() {
+                    Ok(shot) => shot,
+                    Err(e2) => {
+                        tracing::warn!(err = %e2, "capture: grab failed after reconnect");
+                        self.prev_emit = Some(std::time::Instant::now());
+                        return Ok(Some(FrameUpdate::Idle));
+                    }
+                }
             }
         };
         self.prev_emit = Some(std::time::Instant::now());
