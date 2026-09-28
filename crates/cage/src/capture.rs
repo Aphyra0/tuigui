@@ -296,14 +296,27 @@ impl ScreenDriver {
             .state
             .get_format()
             .ok_or_else(|| CageError::Capture("screencopy frame ready before buffer format".into()))?;
-        let stride = self.state.get_stride().unwrap_or(w * 4);
+        // The compositor may hand us a packed 24-bit row (rgb888/bgr888) as
+        // well as the usual 32-bit formats; honor its bytes-per-pixel so a
+        // legitimate 3-byte row is not mistaken for a broken one.
+        let bpp = match format_bpp(fmt) {
+            b @ (3 | 4) => b,
+            other => {
+                self.state.pending = None;
+                return Err(CageError::Capture(format!(
+                    "unsupported screencopy bytes-per-pixel {other} (format {fmt:?})"
+                )));
+            }
+        };
+        let stride = self.state.get_stride().unwrap_or(w * bpp as u32);
         // `stride` and the pool size must be sane. wl_shm's create_pool takes a
         // signed 32-bit `size`; if stride*height overflows i32 the value wraps
         // negative and the server rejects it with "invalid arguments" (which,
         // on a large or mis-reported output, recurs every frame). Guard the
         // arithmetic and sanity-check the dims before handing them to the
-        // compositor.
-        if w == 0 || h == 0 || stride < w * 4 {
+        // compositor. A row is tightly at least `w * bpp` bytes; padding is
+        // allowed but a stride below that means broken dims.
+        if w == 0 || h == 0 || stride < w * bpp as u32 {
             self.state.pending = None;
             return Err(CageError::Capture(format!(
                 "implausible screencopy dims: {w}x{h}, stride {stride}"
@@ -471,11 +484,30 @@ fn memfd_file() -> Result<File, CageError> {
     tempfile::tempfile().map_err(CageError::Io)
 }
 
+/// Bytes per pixel for the wl_shm formats this capture path can decode. Only
+/// the 24-bit (3) and 32-bit (4) RGBA-compatible family (with either byte order
+/// and with or without alpha) are supported.
+fn format_bpp(fmt: Format) -> u8 {
+    use Format::*;
+    match fmt {
+        // 24-bit packed RGB, no alpha slot.
+        Rgb888 | Bgr888 => 3,
+        // 32-bit RGB(A).
+        Xrgb8888 | Xbgr8888 | Argb8888 | Abgr8888 => 4,
+        // Anything else (e.g. 16-bit formats, XR2101010 10-bit, planar/_a8) is
+        // not handled by the hardcoded byte layouts below; report 0 and let the
+        // caller reject gracefully rather than misdecoding pixels.
+        _ => 0,
+    }
+}
+
 /// Build an RGBA Screenshot by reading the mapped shm pool.
 fn build_screenshot(req: &FrameRequest) -> Option<Screenshot> {
     let w = req.width.max(1);
     let h = req.height.max(1);
-    let stride = req.stride.max(w * 4);
+    let pixel_fmt = req.format.unwrap_or(Format::Argb8888);
+    let bpp = format_bpp(pixel_fmt).max(1);
+    let stride = req.stride.max(w * bpp as u32);
     let size = (stride as usize) * (h as usize);
 
     // The pool is backed by the temp file; map it and read the pixels the
@@ -501,27 +533,27 @@ fn build_screenshot(req: &FrameRequest) -> Option<Screenshot> {
         return None;
     }
 
-    // wl_shm 32-bit formats use little-endian memory layout, so the colour byte
-    // order matches the fourcc letters left-to-right:
+    // wl_shm formats use little-endian memory layout, so the colour byte order
+    // matches the fourcc letters left-to-right:
     //   XBGR8888 / ABGR8888 : word 0x00BBGGRR -> [R, G, B, X|A]  (== RGBA)
     //   XRGB8888 / ARGB8888 : word 0x00RRGGBB -> [B, G, R, X|A]  (R/B swapped)
+    //   BGR888 (24-bit)     : [R, G, B] tightly packed            (== RGBA)
+    //   RGB888 (24-bit)     : [B, G, R] tightly packed            (R/B swapped)
     // The X (opaque) formats have no alpha; force it to opaque.
-    let pixel_fmt = req.format.unwrap_or(Format::Argb8888);
-    let native_rgba_order = matches!(pixel_fmt, Format::Xbgr8888 | Format::Abgr8888);
+    let native_rgba_order =
+        matches!(pixel_fmt, Format::Xbgr8888 | Format::Abgr8888 | Format::Bgr888);
     let has_alpha = matches!(pixel_fmt, Format::Argb8888 | Format::Abgr8888);
     let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
     let t_read = std::time::Instant::now();
 
     // Fast path: pixel byte order already matches RGBA and rows are tightly
-    // packed (stride == w*4) with no y-flip. Then the frame is literally the
-    // first `size` bytes of the mmap — a single bulk copy, no per-pixel work.
-    // For opaque formats the only fix-up is writing alpha=0xff (the 4th byte
-    // of every pixel), done with a word-wise fill that skips the 4th byte.
-    if !req.y_invert && stride == w * 4 && native_rgba_order {
-        if has_alpha {
+    // packed (stride == w * bpp) with no y-flip. Then each row is a bulk
+    // copy and the only fix-up is setting alpha per pixel.
+    if !req.y_invert && stride == w * bpp as u32 && native_rgba_order {
+        if bpp == 4 && has_alpha {
             // ABGR8888: stored R,G,B,A already — plain memcpy.
             rgba.copy_from_slice(&mmap[..size]);
-        } else {
+        } else if bpp == 4 {
             // XBGR8888: stored R,G,B,X — copy then force the X byte to 0xff.
             rgba.copy_from_slice(&mmap[..size]);
             let words = unsafe {
@@ -531,6 +563,26 @@ fn build_screenshot(req: &FrameRequest) -> Option<Screenshot> {
             for w_ in words {
                 *w_ = (*w_ & 0x00ff_ffff) | fill;
             }
+        } else {
+            // 24-bit packed (bgr888): tightly [R,G,B] per pixel, no alpha.
+            // Splice alpha=0xff after every 3 bytes to expand to RGBA.
+            let mut rgba2 = Vec::with_capacity((w as usize) * (h as usize) * 4);
+            let need = (w as usize) * (h as usize) * 3;
+            for px in mmap[..need].chunks_exact(3) {
+                rgba2.extend_from_slice(&[px[0], px[1], px[2], 0xff]);
+            }
+            let readout_ms = t_read.elapsed().as_secs_f64() * 1000.0;
+            tracing::debug!(readout_ms, "screencopy pixels read out (bulk 24-bit)");
+            return Some(Screenshot {
+                width: w,
+                height: h,
+                rgba: rgba2,
+                timing: Some(CaptureTiming {
+                    readout_ms,
+                    ..CaptureTiming::default()
+                }),
+                damage: req.damage.clone(),
+            });
         }
         let readout_ms = t_read.elapsed().as_secs_f64() * 1000.0;
         tracing::debug!(readout_ms, "screencopy pixels read out (bulk)");
@@ -547,7 +599,7 @@ fn build_screenshot(req: &FrameRequest) -> Option<Screenshot> {
     }
 
     // Slow path: handle y-flip, non-tight stride, and R/B-swapped formats by
-    // processing each pixel, one 4-byte pixel per step.
+    // processing each pixel, one `bpp`-byte source pixel into 4 RGBA bytes.
     for row in 0..h as usize {
         // The server may report y-inverted contents; read bottom-up if so.
         let src_row = if req.y_invert {
@@ -557,24 +609,38 @@ fn build_screenshot(req: &FrameRequest) -> Option<Screenshot> {
         };
         let src_off = src_row * stride as usize;
         let dst_off = row * w as usize * 4;
-        // Open-code the hot row loop instead of iterating over every pixel
-        // individually: copy or transform one full 4-byte pixel per step.
-        let n = w as usize;
-        for col in 0..n {
-            let p = src_off + col * 4;
+        for col in 0..w as usize {
+            let p = src_off + col * bpp as usize;
             let d = dst_off + col * 4;
-            if native_rgba_order {
-                // No byte reorder, only an alpha fill to apply.
-                rgba[d] = mmap[p];
-                rgba[d + 1] = mmap[p + 1];
-                rgba[d + 2] = mmap[p + 2];
-                rgba[d + 3] = if has_alpha { mmap[p + 3] } else { 0xff };
-            } else {
-                // R/B swapped: XRGB stored as B,G,R,A.
-                rgba[d] = mmap[p + 2];
-                rgba[d + 1] = mmap[p + 1];
-                rgba[d + 2] = mmap[p];
-                rgba[d + 3] = if has_alpha { mmap[p + 3] } else { 0xff };
+            match bpp {
+                3 => {
+                    if native_rgba_order {
+                        // bgr888: [R,G,B].
+                        rgba[d] = mmap[p];
+                        rgba[d + 1] = mmap[p + 1];
+                        rgba[d + 2] = mmap[p + 2];
+                    } else {
+                        // rgb888: [B,G,R] -> write R,G,B.
+                        rgba[d] = mmap[p + 2];
+                        rgba[d + 1] = mmap[p + 1];
+                        rgba[d + 2] = mmap[p];
+                    }
+                    rgba[d + 3] = 0xff;
+                }
+                _ => {
+                    if native_rgba_order {
+                        rgba[d] = mmap[p];
+                        rgba[d + 1] = mmap[p + 1];
+                        rgba[d + 2] = mmap[p + 2];
+                        rgba[d + 3] = if has_alpha { mmap[p + 3] } else { 0xff };
+                    } else {
+                        // R/B swapped: XRGB stored as B,G,R,A.
+                        rgba[d] = mmap[p + 2];
+                        rgba[d + 1] = mmap[p + 1];
+                        rgba[d + 2] = mmap[p];
+                        rgba[d + 3] = if has_alpha { mmap[p + 3] } else { 0xff };
+                    }
+                }
             }
         }
     }
@@ -836,5 +902,23 @@ mod tests {
         px[0] = 255; // R channel of first pixel bright.
         let content = Frame::full(meta.clone(), px.into());
         assert!(!frame_blank(&content), "frame with a bright pixel is content");
+    }
+
+    #[test]
+    fn format_bpp_classifies_supported_shm_formats() {
+        use Format::*;
+        // 24-bit packed, no alpha slot -> 3 bytes/pixel.
+        assert_eq!(format_bpp(Rgb888), 3);
+        assert_eq!(format_bpp(Bgr888), 3);
+        // 32-bit RGBA family, either byte order or with/without alpha -> 4.
+        assert_eq!(format_bpp(Xrgb8888), 4);
+        assert_eq!(format_bpp(Xbgr8888), 4);
+        assert_eq!(format_bpp(Argb8888), 4);
+        assert_eq!(format_bpp(Abgr8888), 4);
+        // Unsupported formats must report 0 so grab_once rejects them cleanly
+        // instead of misdecoding pixels (a packed 24-bit row was once miscounted
+        // as 4 bpp and rejected as "implausible screencopy dims").
+        assert_eq!(format_bpp(Xrgb4444), 0);
+        assert_eq!(format_bpp(Xrgb2101010), 0);
     }
 }
