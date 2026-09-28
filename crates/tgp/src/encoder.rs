@@ -62,20 +62,19 @@ pub struct EncoderConfig {
     /// Transmit frames as PNG (`f=100`) instead of raw RGBA/RGB. PNG is decoded
     /// by the terminal (wuffs), and can shrink an uncompressed frame ~5-20x —
     /// the dominant win when the terminal sink is the bottleneck. When set, the
-    /// frame is palette-quantized to an indexed PNG, which for mostly-flat UI
-    /// content shrinks the payload far below the lossless RGBA path at the cost
-    /// of minor color fringing. Set [`max_colors`](/self#structfield-max_colors)
-    /// to trade quality against size.
+    /// frame's colors are pre-rounded to [`color_bits`](/self#structfield-color_bits)
+    /// per channel before lossless truecolor PNG encoding, which lets the
+    /// deflate filter collapse the mostly-flat UI palette into far fewer bytes
+    /// than a true 24-bit image.
     pub png: bool,
-    /// Maximum distinct colors kept when emitting a palette PNG. 256 is the
-    /// format ceiling; lower values shrink palettes and compress better, at the
-    /// cost of visible banding on gradients. Out-of-range colors snap to their
-    /// nearest palette entry. Unused when [`png`](/self#structfield-png) is
-    /// false.
-    ///
-    /// `Some` enables quantization; `None` emits a lossless truecolor PNG for
-    /// frames that genuinely need it.
-    pub max_colors: Option<usize>,
+    /// Bits of color depth to keep per channel (1-8) when rounding the frame
+    /// before PNG encoding. Kept bits are the most significant; dropped low
+    /// bits snap the pixel to the nearest representable shade. This is a cheap,
+    /// deterministic way to shrink the effective color resolution (and thus the
+    /// compressed payload) for flat UI content without the cost or palette
+    /// retraining of a per-frame quantizer. 8 disables rounding (24-bit true
+    /// color). Unused when [`png`](/self#structfield-png) is false.
+    pub color_bits: u8,
 }
 
 /// Converts a [`FrameSource`] into a stream of TGP bytes.
@@ -85,9 +84,6 @@ pub struct EncoderConfig {
 pub struct TgpEncoder {
     config: EncoderConfig,
     image_id: u32,
-    /// Last quantized palette, reused across frames so unchanged pixels keep
-    /// identical colors (avoids per-frame palette retraining flicker).
-    palette: Option<Palette>,
 }
 
 impl TgpEncoder {
@@ -97,7 +93,6 @@ impl TgpEncoder {
             // Image ids are a shared namespace with other TGP programs; start
             // from a nonzero pseudorandom base to make collisions unlikely.
             image_id: 1 + (std::process::id() % 1000) * 7,
-            palette: None,
         }
     }
 
@@ -185,8 +180,7 @@ impl TgpEncoder {
                         &frame,
                         &base_control(&frame.metadata, cur_id, placement_columns, placement_rows),
                         self.config.png,
-                        self.config.max_colors,
-                        &mut self.palette,
+                        self.config.color_bits,
                     ) {
                         on_event(EncoderEvent::Bytes(bytes))?;
                     }
@@ -280,8 +274,7 @@ fn full_frame_commands(
     frame: &Frame,
     control: &[(char, String)],
     png: bool,
-    max_colors: Option<usize>,
-    palette: &mut Option<Palette>,
+    color_bits: u8,
 ) -> Vec<Vec<u8>> {
     // TGP format id: 100 for PNG (terminal decodes), else raw pixel formats.
     let fmt = if png {
@@ -301,8 +294,7 @@ fn full_frame_commands(
             &frame.data,
             frame.metadata.width,
             frame.metadata.height,
-            max_colors,
-            palette,
+            color_bits,
         )
     } else {
         frame.data.clone()
@@ -336,32 +328,25 @@ fn base_control(
     c
 }
 
-/// Cached imagequant palette, reused across frames so unchanged pixels keep
-/// identical colors (avoids per-frame palette retraining flicker).
-struct Palette {
-    /// RGBA palette entries, in imagequant's order.
-    colors: Vec<imagequant::RGBA>,
-    /// Number of colors actually used (imagequant may emit fewer than asked).
-    count: usize,
-}
-
 /// Compress raw RGBA/RGB pixel data into a PNG byte string (in-memory).
 ///
-/// When `max_colors` is `Some(n)` the RGBA frame is palette-quantized to an
-/// indexed PNG via libimagequant (pngquant): it builds an `n`-color palette and
-/// each pixel reduces to a single index byte, shrinking the payload far below
-/// the lossless path for mostly-flat UI content at the cost of minor color
-/// fringing. The `palette` cache is updated on first use and reused on
-/// subsequent frames so colors are stable frame-to-frame. `None` emits a
-/// lossless truecolor PNG.
+/// When `color_bits < 8` each channel is rounded to the nearest representable
+/// shade at that bit depth by masking the low bits (`& (0xff << (8-bits))`).
+/// This deterministically collapses the effective color resolution so flat UI
+/// content compresses far better, with no per-frame quantizer cost and no
+/// cross-frame palette state to flicker. `8` keeps the true 24-bit color.
 fn encode_png(
     data: &[u8],
     width: u32,
     height: u32,
-    max_colors: Option<usize>,
-    palette: &mut Option<Palette>,
+    color_bits: u8,
 ) -> bytes::Bytes {
     let mut buf = Vec::new();
+    let encoded = if color_bits >= 8 {
+        data.to_vec()
+    } else {
+        round_channels(data, color_bits)
+    };
     {
         let mut enc = png::Encoder::new(&mut buf, width, height);
         enc.set_depth(png::BitDepth::Eight);
@@ -369,86 +354,43 @@ fn encode_png(
         // fewer bytes go to the sink. herdr re-decodes every frame, so byte
         // size is the dominant cost there. Best is marginal and slower.
         enc.set_compression(png::Compression::Default);
-        match max_colors {
-            Some(n) => {
-                let colors = n.clamp(2, 256) as u32;
-
-                let mut attr = imagequant::Attributes::new();
-                attr.set_max_colors(colors).expect("valid color count");
-                // Speed 4 (default) is a good quality/runtime balance for live
-                // streaming. 10 is fastest but visibly noisier on gradients.
-                attr.set_speed(5).expect("valid speed");
-
-                // Build the imagequant image from the raw RGBA bytes. gamma 0
-                // means the source is expected to be sRGB (correct for capture).
-                let mut img = attr
-                    .new_image_borrowed(
-                        to_rgba_slice(data, width, height),
-                        width as usize,
-                        height as usize,
-                        0.0,
-                    )
-                    .expect("valid image");
-
-                // Quantize against the cached palette if we have one; else a
-                // fresh palette, cached for next frame.
-                let (palette_rgba, indices) = match palette.as_mut() {
-                    Some(cached) => {
-                        let mut res = imagequant::QuantizationResult::from_palette(
-                            &attr,
-                            &cached.colors[..cached.count],
-                            0.0,
-                        )
-                        .expect("valid cached palette");
-                        let (_colors, remap) = res.remapped(&mut img).expect("remap");
-                        (cached.colors.clone(), remap)
-                    }
-                    None => {
-                        let mut res = attr.quantize(&mut img).expect("quantize");
-                        let colors = res.palette_vec();
-                        let count = colors.len();
-                        let remap = res.remapped(&mut img).expect("remap").1;
-                        *palette = Some(Palette {
-                            colors: colors.clone(),
-                            count,
-                        });
-                        (colors, remap)
-                    }
-                };
-
-                // Split palette into PLTE (RGB) + tRNS (alpha) chunks.
-                let mut rgb = Vec::with_capacity(palette_rgba.len() * 3);
-                let mut trns = Vec::with_capacity(palette_rgba.len());
-                for c in &palette_rgba {
-                    rgb.extend_from_slice(&[c.r, c.g, c.b]);
-                    trns.push(c.a);
-                }
-
-                enc.set_color(png::ColorType::Indexed);
-                enc.set_palette(rgb);
-                if trns.iter().any(|&a| a != 255) {
-                    enc.set_trns(trns);
-                }
-                let mut w = enc.write_header().expect("png header");
-                w.write_image_data(&indices).expect("png data");
-            }
-            None => {
-                enc.set_color(png::ColorType::Rgba);
-                let mut w = enc.write_header().expect("png header");
-                w.write_image_data(data).expect("png data");
-            }
-        }
+        // Always truecolor. Rounding (rather than a palette-INDEXED png) keeps
+        // the lossless format bits true so consecutive frames stay stateless:
+        // the same source pixels always map to the same output bytes, which is
+        // what kills per-frame color flicker without any cached palette.
+        enc.set_color(png::ColorType::Rgba);
+        let mut w = enc.write_header().expect("png header");
+        w.write_image_data(&encoded).expect("png data");
     }
     bytes::Bytes::from(buf)
 }
 
-/// Cast the RGBA byte buffer (as `&[Rgba<u8>]` pairs) into the `&[RGBA]` slice
-/// imagequant expects. Layout is identical (4 bytes/pixel, R,G,B,A), so no copy
-/// is needed.
-fn to_rgba_slice(data: &[u8], _w: u32, _h: u32) -> &[imagequant::RGBA] {
+/// Round each RGBA channel to `bits` significant bits (1-8), snapping the pixel
+/// to the nearest representable level rather than the nearest lower one. The
+/// alpha channel is always kept fully intact. `bits >= 8` returns the data
+/// unchanged.
+fn round_channels(data: &[u8], bits: u8) -> Vec<u8> {
     debug_assert_eq!(data.len() % 4, 0);
-    // SAFETY: RGBA is 4 u8s (repr(C)), same layout as the raw bytes.
-    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<imagequant::RGBA>(), data.len() / 4) }
+    let bits = bits.clamp(1, 8);
+    if bits == 8 {
+        return data.to_vec();
+    }
+    let mut out = data.to_vec();
+    // Mask keeps the top `bits` channels; rounding adds half a dropped step so
+    // values snap to the nearest representable level (0x80 >> bits).
+    let keep_mask = 0xffu8.wrapping_shl(8 - bits as u32);
+    let round_amt = (0x80u8) >> bits;
+    // Clamp so rounding can't overflow a byte: values already at the top
+    // representable level must saturate there, not wrap to 0.
+    let max_in = 0xff - round_amt;
+    let (pxs, _rest) = out.as_chunks_mut::<4>();
+    for px in pxs {
+        px[0] = px[0].min(max_in).wrapping_add(round_amt) & keep_mask;
+        px[1] = px[1].min(max_in).wrapping_add(round_amt) & keep_mask;
+        px[2] = px[2].min(max_in).wrapping_add(round_amt) & keep_mask;
+        // alpha untouched
+    }
+    out
 }
 
 fn delete_image(image_id: u32) -> Vec<u8> {
@@ -635,40 +577,43 @@ mod tests {
     }
 
     #[test]
-    fn palette_quantization_smaller_than_lossless_for_flat_frames() {
-        // 64x64 frame of a few flat colors: quantization to a small palette
-        // (and the resulting indexed PNG) should beat the lossless RGBA path.
+    fn color_rounding_shrinks_gradients_and_is_stateless() {
+        // 64x128 smooth horizontal gradient: every pixel is a distinct shade,
+        // so the lossless PNG is large. Rounding each channel to 4 bits
+        // collapses each row to ~16 columns, shrinking the payload far below
+        // the 24-bit path, deterministically and without a quantizer.
         let w = 64u32;
-        let h = 64u32;
-        let colors = [
-            [255u8, 0, 0, 255],
-            [0u8, 255, 0, 255],
-            [0u8, 0, 255, 255],
-        ];
+        let h = 128u32;
         let mut data = Vec::with_capacity((w * h * 4) as usize);
-        for i in 0..(w * h) as usize {
-            data.extend_from_slice(&colors[i % colors.len()]);
+        for y in 0..h {
+            for x in 0..w {
+                data.extend_from_slice(&[x as u8, (x as u8).wrapping_mul(2), y as u8, 255]);
+            }
         }
-        let mut cache: Option<Palette> = None;
-        let lossless = encode_png(&data, w, h, None, &mut cache);
-        let indexed1 = encode_png(&data, w, h, Some(16), &mut cache);
-        // Same unchanged frame again: must reuse the palette so pixels keep
-        // their color (the flicker that appeared when each frame got a fresh
-        // palette).
-        let indexed2 = encode_png(&data, w, h, Some(16), &mut cache);
+        let lossless = encode_png(&data, w, h, 8);
+        let rounded4 = encode_png(&data, w, h, 4);
+        // Same unchanged frame again: rounding is stateless, so repeated
+        // encodes must be byte-identical (the flicker that appeared when each
+        // frame trained a fresh quantized palette).
+        let rounded4_b = encode_png(&data, w, h, 4);
         assert!(
-            indexed1.len() < lossless.len(),
-            "indexed ({}) should beat lossless ({}) for flat colors",
-            indexed1.len(),
+            rounded4.len() < lossless.len(),
+            "rounded ({}) should beat lossless ({}) for a gradient",
+            rounded4.len(),
             lossless.len()
         );
-        // Both must be valid enough that the encoder didn't error; index space
-        // is bounded by the palette (<=16), which fits in a byte.
         assert!(lossless.starts_with(b"\x89PNG"));
-        assert!(indexed1.starts_with(b"\x89PNG"));
+        assert!(rounded4.starts_with(b"\x89PNG"));
         assert!(
-            indexed1 == indexed2,
-            "identical frames must encode to identical bytes (stable palette)"
+            rounded4 == rounded4_b,
+            "identical frames must encode to identical bytes (stateless rounding)"
         );
+        // Rounding must strip the dropped low bits and preserve alpha.
+        // 0x7F -> nearest representable 16-level is 0x80 (not 0x70).
+        let r = round_channels(&[0xFFu8, 0x7F, 0x33, 0xFF], 4);
+        assert_eq!(r[0], 0xF0);
+        assert_eq!(r[1], 0x80);
+        assert_eq!(r[2], 0x30);
+        assert_eq!(r[3], 0xFF, "alpha must be preserved");
     }
 }

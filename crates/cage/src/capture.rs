@@ -705,9 +705,9 @@ impl FrameSource for CageFrameSource {
 
         // Root cause of the boot race: a capture grab often catches the app before
         // its first paint, a fully black frame. Emitting that as the encoder's
-        // first frame trains the quantized palette to black and the whole live
-        // image stays black. Discard blank frames until real content appears
-        // (or a timeout budget elapses, so genuinely unlit apps still show).
+        // first frame would show a blank screen. Discard blank frames until real
+        // content appears (or a timeout budget elapses, so genuinely unlit apps
+        // still show).
         let blank = frame_blank(&frame);
         if !self.seen_content {
             const BLANK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

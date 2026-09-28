@@ -62,16 +62,11 @@ struct Cli {
     #[arg(long)]
     no_png: bool,
 
-    /// Cap the PNG palette at N distinct colors (default 256, lossy). Lower
-    /// values shrink payload and speed up encoding for flat UI content.
-    #[arg(long, value_name = "N", default_value = "256")]
-    max_colors: usize,
-
-    /// Disable palette quantization and emit lossless truecolor PNG instead.
-    /// Quantization shrinks payload but adds encode CPU cost; turn it off to
-    /// shave that overhead when bandwidth is not the bottleneck.
-    #[arg(long)]
-    no_quantize: bool,
+    /// Bits of color depth to keep per channel when encoding PNG (1-8, default
+    /// 8 = lossless truecolor). Lower values drop low bits before encoding so
+    /// flat UI content compresses into fewer bytes with no quantizer overhead.
+    #[arg(long, value_name = "BITS", default_value = "8")]
+    color_bits: u8,
 
     /// Maximum capture frame rate. Defaults to 30 fps; the capture source paces
     /// itself to stay at or below this so it doesn't outrun a slower sink.
@@ -159,11 +154,7 @@ async fn main() -> Result<()> {
         placement_columns: pc,
         placement_rows: pr,
         png: !cli.no_png,
-        max_colors: if cli.no_quantize {
-            None
-        } else {
-            Some(cli.max_colors)
-        },
+        color_bits: cli.color_bits,
     });
     let mut tgp_stream = encoder.into_stream(source);
 
