@@ -476,11 +476,21 @@ fn colorize(data: &[u8], bpp: usize, seed: u64, salt: u64) -> Bytes {
 
 /// Add a red tint to every pixel of an `bpp`-byte RGBA/RGB payload: the red
 /// channel is pushed up by `amount` (saturating). Green/blue (and alpha) are
-/// left untouched, so degraded (more downscaled) blocks read visibly redder.
+/// Shift every pixel's RGB toward red by `amount`: red channel pushed up and
+/// green/blue pulled down by the same amount (all saturating/clamping). This
+/// works on white too — pure white becomes pink — which a red-only boost could
+/// not express. Alpha is left untouched, and RGB are handled separately so
+/// either `Rgb24` or `Rgba32` payloads are fine.
 fn tint_red(data: &[u8], bpp: usize, amount: u8) -> Bytes {
     let mut out = data.to_vec();
+    let amt = amount as i16;
     for px in out.chunks_exact_mut(bpp) {
-        px[0] = px[0].saturating_add(amount);
+        let r = (px[0] as i16 + amt).clamp(0, 255) as u8;
+        let g = (px[1] as i16 - amt).clamp(0, 255) as u8;
+        let b = (px[2] as i16 - amt).clamp(0, 255) as u8;
+        px[0] = r;
+        px[1] = g;
+        px[2] = b;
     }
     Bytes::from(out)
 }
@@ -693,14 +703,29 @@ mod tests {
         assert_eq!(blocks[0].data[1], brightness);
         assert_eq!(blocks[0].data[2], brightness);
 
-        // Coarsest emit (level 1): most red. amt = (4-1)*255/3 = 255.
+        // Coarsest emit (level 1): most red. below = 4-1 = 3, amt = 3*255/3 = 255.
+        // Brightness 100 -> R saturates to 255, G and B clamp to 0.
         let mut g2 = BlockGrid::new(1, 1, 4, DetailConfig::enabled(), true);
         let s2 = g2.diff(&solid(16, 16, [brightness, brightness, brightness, 255]), false, 0);
         assert_eq!(s2.len(), 1);
         assert_eq!(s2[0].level, 1, "solid block under adaptive ceilings at level 1");
-        assert_eq!(s2[0].data[0], 255, "level 1 is most red (amt 255)");
-        assert_eq!(s2[0].data[1], brightness, "green untouched");
-        assert_eq!(s2[0].data[2], brightness, "blue untouched");
+        assert_eq!(s2[0].data[0], 255, "red pushed to max");
+        assert_eq!(s2[0].data[1], 0, "green pulled to 0");
+        assert_eq!(s2[0].data[2], 0, "blue pulled to 0");
+    }
+
+    #[test]
+    fn debug_lod_tints_white_pink_instead_of_staying_white() {
+        // Regression: pure white (all 255) must tint to pink, not stay white.
+        // A red-only boost was a no-op on white; shifting G/B down fixes it.
+        let mut g = BlockGrid::new(1, 1, 4, DetailConfig::enabled(), true);
+        let blk = g.diff(&solid(16, 16, [255, 255, 255, 255]), false, 0);
+        assert_eq!(blk.len(), 1);
+        assert_eq!(blk[0].level, 1, "solid white caps at level 1");
+        // amt = 255; R stays 255, G/B drop to 0 (pure red).
+        assert_eq!(blk[0].data[0], 255);
+        assert_eq!(blk[0].data[1], 0);
+        assert_eq!(blk[0].data[2], 0);
     }
 
     #[test]
