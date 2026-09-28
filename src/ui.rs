@@ -22,8 +22,10 @@ pub struct Stats {
     pub resolution: (u32, u32),
     /// Wall-clock cost of encoding a frame's pixels into TGP bytes (base64).
     pub encode_ms: f64,
-    /// Wall-clock cost of writing a frame's bytes to the terminal (pty write).
+    /// Wall-clock cost of writing a frame's bytes into the (buffered) output.
     pub sink_ms: f64,
+    /// Wall-clock cost of flushing those bytes to the terminal (pty/pipe write).
+    pub flush_ms: f64,
     /// Per-phase capture breakdown (averages), when the source reports it.
     pub announce_ms: f64,
     pub setup_ms: f64,
@@ -47,13 +49,14 @@ pub fn draw(f: &mut Frame, app: &str, status: &str, stats: &Stats) -> Rect {
         String::new()
     };
     let line1 = format!(
-        " {status} · {app}  ·  FPS: {:.0}  ·  Bw: {:.1} MiB/s  ·  Cap: {:.1} ms  ·  Pace: {:.1} ms  ·  Enc: {:.1} ms  ·  Sink: {:.1} ms  ·  {rw}x{rh}{phases}  ·  q to quit",
+        " {status} · {app}  ·  FPS: {:.0}  ·  Bw: {:.1} MiB/s  ·  Cap: {:.1} ms  ·  Pace: {:.1} ms  ·  Enc: {:.1} ms  ·  Sink: {:.1} ms  ·  Flush: {:.1} ms  ·  {rw}x{rh}{phases}  ·  q to quit",
         stats.fps,
         stats.bandwidth / (1024.0 * 1024.0),
         stats.capture_ms,
         stats.pacing_ms,
         stats.encode_ms,
         stats.sink_ms,
+        stats.flush_ms,
     );
 
     f.render_widget(
