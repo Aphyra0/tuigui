@@ -84,6 +84,13 @@ pub struct EncoderConfig {
     /// as nothing: the terminal keeps rendering the block from the last frame,
     /// so a static scene costs almost nothing.
     pub blocks_per_side: u32,
+    /// With `blocks_per_side > 0`, the number of resolution levels on each
+    /// block's ladder. `0` (default) uses the streamer default (4). Level 1 is
+    /// the coarsest downscale, and level `res_levels` is the block's full
+    /// source resolution. A changed block resets to the lowest level and climbs
+    /// back up one rung per static frame; an unchanged block already shown at
+    /// max resolution costs nothing.
+    pub res_levels: u32,
     /// With `blocks_per_side > 0`, colorize every other block (linear grid
     /// index odd) with a per-block pseudo-random color that changes each frame,
     /// and leave even blocks as the real pixels. Visually proves the block grid
@@ -118,6 +125,7 @@ impl TgpEncoder {
             tuigui_streamer::blocks::BlockGrid::new(
                 config.blocks_per_side,
                 config.blocks_per_side,
+                config.res_levels,
             )
         });
         TgpEncoder {
@@ -450,8 +458,9 @@ fn transmit_block(
     } else {
         32
     };
+    // Payload is the block's content at its (possibly downscaled) resolution.
     let payload = if png {
-        encode_png(&b.data, b.width, b.height, color_bits)
+        encode_png(&b.data, b.payload_width, b.payload_height, color_bits)
     } else {
         b.data.clone()
     };
@@ -462,9 +471,12 @@ fn transmit_block(
 }
 
 /// Control block for a changed micro-block: a fresh id, source dims = the
-/// block's pixel size, and a placement rect (`c`/`r` in cells) sized to the
-/// block's on-screen cell extent after frame->pane scaling. The terminal
-/// stretches the block's pixels to fill that rect, tiling with adjacent blocks.
+/// *full-resolution* source pixel size of the block (the terminal scales this
+/// intrinsic size to fill the on-screen rect), and a placement rect (`c`/`r`
+/// in cells) sized to the block's on-screen cell extent after frame->pane
+/// scaling. Because `s`/`v` always describe the full-res rect and `c`/`r` the
+/// same rect's cell span, the terminal upscales a downscaled payload to fill
+/// the block, tiling with adjacent blocks and matching full-frame mode.
 fn base_control_for_block(
     b: &tuigui_streamer::blocks::MicroBlock,
     image_id: u32,

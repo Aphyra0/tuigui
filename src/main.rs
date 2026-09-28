@@ -98,6 +98,13 @@ struct Cli {
     #[arg(long, value_name = "N", default_value_t = 0)]
     blocks: u32,
 
+    /// With --blocks, the number of resolution levels on each block's ladder
+    /// (default 4). A changed block repaints at the coarsest level and sharpens
+    /// one rung per static frame up to the full block resolution; 1 disables
+    /// the ladder (always full res).
+    #[arg(long, value_name = "LEVELS", default_value_t = 0)]
+    res_levels: u32,
+
     /// Debuggy block grid: every other block (linear odd index) is filled with
     /// a per-block pseudo-random color that changes each frame; even blocks
     /// carry the real pixels. Visually proves the block grid and per-block
@@ -175,6 +182,7 @@ async fn main() -> Result<()> {
         png: !cli.no_png,
         color_bits: cli.color_bits,
         blocks_per_side,
+        res_levels: cli.res_levels,
         debug_blocks: cli.debug_blocks,
         pane_origin: Some((0, 0)),
     });
