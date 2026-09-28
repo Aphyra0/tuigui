@@ -75,6 +75,28 @@ pub struct EncoderConfig {
     /// retraining of a per-frame quantizer. 8 disables rounding (24-bit true
     /// color). Unused when [`png`](/self#structfield-png) is false.
     pub color_bits: u8,
+    /// Stream as an `N x N` grid of micro-blocks instead of a single full-frame
+    /// image. `0` (default) disables block streaming: every frame is one
+    /// transmit+place. When `> 0`, the encoder splits each frame into `N`
+    /// columns × `N` rows of rectangular blocks, diffs each against the previous
+    /// frame's content, and retransmits only the blocks that changed (each as
+    /// its own transmit+place at its grid offset). Unchanged blocks are emitted
+    /// as nothing: the terminal keeps rendering the block from the last frame,
+    /// so a static scene costs almost nothing.
+    pub blocks_per_side: u32,
+    /// With `blocks_per_side > 0`, colorize every other block (linear grid
+    /// index odd) with a per-block pseudo-random color that changes each frame,
+    /// and leave even blocks as the real pixels. Visually proves the block grid
+    /// and the per-block diffing: even blocks on a static frame stay silent,
+    /// odd blocks keep streaming. `false` (default) transmits true pixels.
+    pub debug_blocks: bool,
+    /// With `blocks_per_side > 0`, the pane's top-left cell in terminal
+    /// coordinates (0-based, as ratatui reports). The encoder individually
+    /// positions each block's transmit+place by moving the cursor to the
+    /// block's top-left cell, so it needs to know where the pane starts.
+    /// `None` (default) is used by full-frame mode, where `main.rs` positions
+    /// the cursor once.
+    pub pane_origin: Option<(u16, u16)>,
 }
 
 /// Converts a [`FrameSource`] into a stream of TGP bytes.
@@ -84,15 +106,27 @@ pub struct EncoderConfig {
 pub struct TgpEncoder {
     config: EncoderConfig,
     image_id: u32,
+    /// Running frame count, used as a seed for `--debug-blocks` colorization.
+    frame_count: u64,
+    /// Block differ, only used when `config.blocks_per_side > 0`.
+    blocks: Option<tuigui_streamer::blocks::BlockGrid>,
 }
 
 impl TgpEncoder {
     pub fn new(config: EncoderConfig) -> Self {
+        let blocks = (config.blocks_per_side > 0).then(|| {
+            tuigui_streamer::blocks::BlockGrid::new(
+                config.blocks_per_side,
+                config.blocks_per_side,
+            )
+        });
         TgpEncoder {
             config,
             // Image ids are a shared namespace with other TGP programs; start
             // from a nonzero pseudorandom base to make collisions unlikely.
             image_id: 1 + (std::process::id() % 1000) * 7,
+            frame_count: 0,
+            blocks,
         }
     }
 
@@ -176,13 +210,44 @@ impl TgpEncoder {
                     // timestamp it for capture/latency telemetry. The bytes are
                     // produced inline, so time the encoding here.
                     let t_encode = Instant::now();
-                    for bytes in full_frame_commands(
-                        &frame,
-                        &base_control(&frame.metadata, cur_id, placement_columns, placement_rows),
-                        self.config.png,
-                        self.config.color_bits,
-                    ) {
-                        on_event(EncoderEvent::Bytes(bytes))?;
+                    if let Some(grid) = self.blocks.as_mut() {
+                        // Block mode: diff against the previous frame and
+                        // retransmit only changed blocks. Each block is a
+                        // transmit+place under its own image id, mapped through
+                        // frame->pane scaling so the blocks tile the pane.
+                        let seed = self.frame_count.wrapping_add(1);
+                        let changed = grid.diff(&frame, self.config.debug_blocks, seed);
+                        let origin = self.config.pane_origin.unwrap_or((0, 0));
+                        let placement = BlockPlacement::new(
+                            (frame.metadata.width, frame.metadata.height),
+                            (placement_columns, placement_rows),
+                        );
+                        for b in &changed {
+                            let bid = self.image_id;
+                            self.image_id = self.image_id.wrapping_add(1);
+                            on_event(EncoderEvent::Bytes(transmit_block(
+                                b,
+                                &base_control_for_block(b, bid, placement),
+                                self.config.png,
+                                self.config.color_bits,
+                                origin,
+                                placement,
+                            )))?;
+                        }
+                        self.frame_count += 1;
+                    } else {
+                        for bytes in full_frame_commands(
+                            &frame,
+                            &base_control(&frame.metadata, cur_id, placement_columns, placement_rows),
+                            self.config.png,
+                            self.config.color_bits,
+                        ) {
+                            on_event(EncoderEvent::Bytes(bytes))?;
+                        }
+                        if let Some(prev) = prev_image_id.take() {
+                            on_event(EncoderEvent::Bytes(delete_image(prev)))?;
+                        }
+                        prev_image_id = Some(cur_id);
                     }
                     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
                     // capture_ms is the *real* capture cost. When the source
@@ -209,10 +274,6 @@ impl TgpEncoder {
                         encode_ms,
                         timing: frame.timing,
                     })?;
-                    if let Some(prev) = prev_image_id.take() {
-                        on_event(EncoderEvent::Bytes(delete_image(prev)))?;
-                    }
-                    prev_image_id = Some(cur_id);
                 }
             }
         }
@@ -326,6 +387,98 @@ fn base_control(
     }
     c.push(('p', 1u32.to_string()));
     c
+}
+
+/// Maps a block's source-pixel rect through the frame->pane scale onto the
+/// on-screen cell grid, so changed blocks tile the pane exactly like full-frame
+/// mode (which scales the whole frame to fill `placement_columns x rows`).
+#[derive(Debug, Clone, Copy)]
+struct BlockPlacement {
+    /// Source frame pixel dimensions.
+    frame_w: u32,
+    frame_h: u32,
+    /// On-screen pane size in cells.
+    pane_cells: (u32, u32),
+}
+
+impl BlockPlacement {
+    fn new(frame: (u32, u32), pane_cells: (u32, u32)) -> Self {
+        BlockPlacement { frame_w: frame.0, frame_h: frame.1, pane_cells }
+    }
+
+    /// Block's top-left cell within the pane.
+    fn cell_origin(&self, x: u32, y: u32) -> (u32, u32) {
+        let (fw, fh) = (self.frame_w.max(1), self.frame_h.max(1));
+        let (pc, pr) = (self.pane_cells.0.max(1), self.pane_cells.1.max(1));
+        let cx = (x as u64 * pc as u64 / fw as u64) as u32;
+        let cy = (y as u64 * pr as u64 / fh as u64) as u32;
+        (cx, cy)
+    }
+
+    /// Cell width/height the block spans on screen.
+    fn cell_size(&self, b: &tuigui_streamer::blocks::MicroBlock) -> (u32, u32) {
+        let (cx0, cy0) = self.cell_origin(b.x, b.y);
+        let (cx1, cy1) = self.cell_origin(b.x + b.width, b.y + b.height);
+        ((cx1 - cx0).max(1), (cy1 - cy0).max(1))
+    }
+}
+
+/// Transmit + place for a single changed micro-block. The block's source rect
+/// (pixels) is mapped through the frame->pane scale into an on-screen cell
+/// rect that tiles the pane: the cursor is moved to the block's top-left cell
+/// and the block's pixels are scaled to fill exactly that cell extent (so
+/// adjacent blocks tile the pane, matching full-frame mode).
+fn transmit_block(
+    b: &tuigui_streamer::blocks::MicroBlock,
+    control: &[(char, String)],
+    png: bool,
+    color_bits: u8,
+    pane_origin: (u16, u16),
+    placement: BlockPlacement,
+) -> Vec<u8> {
+    let (cs, rs) = placement.cell_origin(b.x, b.y);
+    let cur_col = pane_origin.0 as u32 + cs;
+    let cur_row = pane_origin.1 as u32 + rs;
+
+    let mut out = Vec::new();
+    // Move the cursor to the block's top-left cell (CSI r;c H).
+    out.extend_from_slice(format!("\x1b[{};{}H", cur_row + 1, cur_col + 1).as_bytes());
+    let mut ctrl: Vec<(char, String)> = vec![('a', "T".into()), ('C', "1".into())];
+    ctrl.extend(control.iter().cloned());
+    let fmt = if png {
+        100u32
+    } else {
+        32
+    };
+    let payload = if png {
+        encode_png(&b.data, b.width, b.height, color_bits)
+    } else {
+        b.data.clone()
+    };
+    for c in tgp::chunked_transmit(fmt, ctrl, &payload) {
+        out.extend_from_slice(&c);
+    }
+    out
+}
+
+/// Control block for a changed micro-block: a fresh id, source dims = the
+/// block's pixel size, and a placement rect (`c`/`r` in cells) sized to the
+/// block's on-screen cell extent after frame->pane scaling. The terminal
+/// stretches the block's pixels to fill that rect, tiling with adjacent blocks.
+fn base_control_for_block(
+    b: &tuigui_streamer::blocks::MicroBlock,
+    image_id: u32,
+    placement: BlockPlacement,
+) -> Vec<(char, String)> {
+    let (c, r) = placement.cell_size(b);
+    vec![
+        ('i', image_id.to_string()),
+        ('s', b.width.to_string()),
+        ('v', b.height.to_string()),
+        ('c', c.to_string()),
+        ('r', r.to_string()),
+        ('p', 1u32.to_string()),
+    ]
 }
 
 /// Compress raw RGBA/RGB pixel data into a PNG byte string (in-memory).
@@ -526,6 +679,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_mode_emits_only_changed_blocks_then_quiet() {
+        use bytes::Bytes as B;
+        // A 40x40 RGBA frame split 2x2 (blocks_per_side=2) gives 4 blocks of
+        // 20x20. Frame 1 transmits all 4; frame 2 changes nothing so emits no
+        // block bytes; frame 3 paints the top-left block differently and only
+        // that block is retransmitted.
+        struct BlkSrc {
+            n: u32,
+            // frame_index -> which block is painted a distinct color.
+        }
+        #[async_trait]
+        impl FrameSource for BlkSrc {
+            fn metadata(&self) -> FrameMetadata {
+                FrameMetadata { width: 40, height: 40, format: PixelFormat::Rgba32 }
+            }
+            async fn next(&mut self) -> Result<Option<FrameUpdate>, SourceError> {
+                if self.n == 0 {
+                    return Ok(Some(FrameUpdate::Ended));
+                }
+                self.n -= 1;
+                let gen = self.n; // 2, 1, 0 => three frames then Ended
+                // Frames 1, 2, 3 all use the same solid gray base; only the
+                // last frame differs in its top-left block (painted white).
+                let mut data = vec![0u8; 40 * 40 * 4];
+                for b in 0..(40 * 40) {
+                    data[b * 4..b * 4 + 4].copy_from_slice(&[5, 5, 5, 255]);
+                }
+                if gen == 0 {
+                    // Repaint top-left 20x20 to a different color.
+                    for y in 0..20 {
+                        for x in 0..20 {
+                            let i = (y * 40 + x) as usize * 4;
+                            data[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+                        }
+                    }
+                }
+                Ok(Some(FrameUpdate::Frame(Frame::full(self.metadata(), B::from(data)))))
+            }
+        }
+
+        let cfg = EncoderConfig {
+            blocks_per_side: 2,
+            pane_origin: Some((0, 0)),
+            placement_columns: 40,
+            placement_rows: 40,
+            png: false, // deterministic raw payload
+            ..EncoderConfig::default()
+        };
+        let mut enc = TgpEncoder::new(cfg);
+        let mut src = BlkSrc { n: 3 };
+        let mut events = Vec::new();
+        enc.run(&mut src, |e| { events.push(e); Ok(()) }).await.unwrap();
+        let blocks: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                EncoderEvent::Bytes(b) => Some(String::from_utf8(b.clone()).unwrap()),
+                _ => None,
+            })
+            .collect();
+        // Every placed block's transmit event(*) carries a cursor move then a
+        // `a=T` transmit. Frame 1 -> 4 blocks; frame 2 (unchanged) -> 0;
+        // frame 3 -> 1 changed (top-left).
+        let mut transmit_events = 0;
+        for s in &blocks {
+            if s.contains("a=T") && s.contains("\x1b[") {
+                transmit_events += 1;
+            }
+        }
+        assert_eq!(transmit_events, 5, "4 blocks (first frame) + 1 changed top-left");
+    }
+
+    #[tokio::test]
     async fn delta_stream_terminates_with_last_chunk() {
         use tokio_stream::StreamExt as _;
         // A large frame forces chunking: 1280x720 RGBA -> ~3.68 MB -> ~900
@@ -617,3 +842,4 @@ mod tests {
         assert_eq!(r[3], 0xFF, "alpha must be preserved");
     }
 }
+

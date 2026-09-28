@@ -8,11 +8,13 @@
 //!
 //! Wire encoding lives in the separate `tuigui-tgp` crate.
 
+pub mod blocks;
 pub mod frame;
 pub mod mp4;
 pub mod pink;
 pub mod source;
 
+pub use blocks::{BlockGrid, BlockGridDim, MicroBlock, DEFAULT_BLOCKS_PER_SIDE};
 pub use frame::{Frame, FrameMetadata, PixelFormat, Rect};
 pub use mp4::Mp4VideoSource;
 pub use pink::PinkFrameSource;

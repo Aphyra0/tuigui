@@ -91,6 +91,19 @@ struct Cli {
     /// With --debug-capture, seconds between screenshots.
     #[arg(long, default_value_t = 1.0)]
     capture_interval: f64,
+
+    /// Stream as NxN-pixel micro-blocks instead of one full-frame image.
+    /// `0` (default) disables block streaming. When set, the encoder diffs each
+    /// block against the previous frame and retransmits only the changed ones.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    blocks: u32,
+
+    /// Debuggy block grid: every other block (linear odd index) is filled with
+    /// a per-block pseudo-random color that changes each frame; even blocks
+    /// carry the real pixels. Visually proves the block grid and per-block
+    /// diffing. Implies `--blocks 4` if not already set.
+    #[arg(long, default_value_t = false)]
+    debug_blocks: bool,
 }
 
 #[tokio::main]
@@ -150,11 +163,20 @@ async fn main() -> Result<()> {
 
     // 3. Encode to a TGP byte stream, scaled to fill the pane (in cells).
     //    Every frame is fully transmitted and placed; no delta/damage logic.
+    let blocks_per_side =
+        if cli.debug_blocks {
+            cli.blocks.max(4)
+        } else {
+            cli.blocks
+        };
     let encoder = TgpEncoder::new(EncoderConfig {
         placement_columns: pc,
         placement_rows: pr,
         png: !cli.no_png,
         color_bits: cli.color_bits,
+        blocks_per_side,
+        debug_blocks: cli.debug_blocks,
+        pane_origin: Some((0, 0)),
     });
     let mut tgp_stream = encoder.into_stream(source);
 
