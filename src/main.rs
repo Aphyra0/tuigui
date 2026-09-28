@@ -121,6 +121,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    install_terminal_panic_hook();
+
     let cli = Cli::parse();
 
     if cli.debug_streaming {
@@ -277,6 +279,31 @@ async fn run_video_to_file(path: &str, out: &str, loop_forever: bool) -> Result<
     let encoder = TgpEncoder::new(EncoderConfig::default());
     let stream = encoder.into_stream(src);
     drain_to_file(stream, out).await
+}
+
+/// Restore the terminal (leave alternate screen, disable raw mode, release the
+/// mouse, show the cursor) on panic, so a crash anywhere — including inside the
+/// spawned encoder task — never leaves the shell in raw mode with mouse capture
+/// on, which would print mouse-report / escape garbage (e.g. `24M35`) instead
+/// of a working prompt. Pure `crossterm` calls: the panic path must be
+/// infallible.
+fn install_terminal_panic_hook() {
+    use std::panic;
+    use std::sync::Once;
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let prev = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::event::DisableMouseCapture,
+                crossterm::cursor::Show
+            );
+            prev(info);
+        }));
+    });
 }
 
 /// Query the terminal's current size and report it in pixels, suitable for
@@ -458,6 +485,24 @@ async fn run_ui(
         crossterm::event::EnableMouseCapture
     )?;
     terminal.clear()?;
+
+    // Restore the terminal on every exit path (including early `?` returns and
+    // panics) so raw mode and mouse capture are never left on — otherwise after
+    // a mid-loop error the shell prints mouse-report escapes (e.g. `24M35`)
+    // instead of a working prompt.
+    struct TermGuard;
+    impl Drop for TermGuard {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::event::DisableMouseCapture,
+                crossterm::cursor::Show
+            );
+        }
+    }
+    let _termon = TermGuard;
 
     let mut last_event = "starting".to_string();
     let mut pane: Option<ratatui::layout::Rect> = None;

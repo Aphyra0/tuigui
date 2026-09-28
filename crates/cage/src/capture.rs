@@ -276,9 +276,19 @@ impl ScreenDriver {
         };
         t_phase = std::time::Instant::now();
 
-        // The compositor dictates the pixel format and layout; honor it.
-        let (w, h) = self.state.get_dims().unwrap();
-        let fmt = self.state.get_format().unwrap();
+        // The compositor dictates the pixel format and layout; honor it. These
+        // can be absent if a frame races to Ready/Failed before the `buffer`
+        // event announced dims; treat that as a capture error rather than
+        // panicking, since a panicking encoder task silently ends the whole
+        // stream.
+        let (w, h) = self
+            .state
+            .get_dims()
+            .ok_or_else(|| CageError::Capture("screencopy frame ready before buffer dims".into()))?;
+        let fmt = self
+            .state
+            .get_format()
+            .ok_or_else(|| CageError::Capture("screencopy frame ready before buffer format".into()))?;
         let stride = self.state.get_stride().unwrap_or(w * 4);
         let size = (stride * h) as usize;
         // Back the wl_shm pool with an anonymous memfd (RAM only) instead of a
@@ -691,10 +701,21 @@ impl FrameSource for CageFrameSource {
                 tokio::time::sleep(self.frame_interval - elapsed).await;
             }
         }
-        let shot = self
-            .driver
-            .grab_once()
-            .map_err(|e| tuigui_streamer::SourceError::Transport(e.to_string()))?;
+        let shot = match self.driver.grab_once() {
+            Ok(shot) => shot,
+            Err(e) => {
+                // A single failed grab (a transient race where the frame
+                // reached Ready before the buffer announced dims/format, or the
+                // compositor rejected the copy) must not kill the session. A
+                // panicked/errored grab currently ends the whole encoder
+                // stream, silently quitting the TUI after however long it takes
+                // to hit one bad frame. Skip this frame and let the next poll
+                // retry.
+                tracing::warn!(err = %e, "capture: skipping a failed grab");
+                self.prev_emit = Some(std::time::Instant::now());
+                return Ok(Some(FrameUpdate::Idle));
+            }
+        };
         self.prev_emit = Some(std::time::Instant::now());
         let frame = if self.scale > 1.0 {
             downscale_frame(&shot, self.scale)
