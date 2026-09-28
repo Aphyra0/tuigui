@@ -675,9 +675,9 @@ mod tests {
         // 2 frames × (transmit+place), delete-of-previous after frame 2, then
         // delete of the last image on Ended.
         assert_eq!(strings.len(), 4);
-        assert!(strings[0].starts_with("\x1b_Ga=T"));
+        assert!(strings[0].starts_with("\x1b_Gq=2,a=T"));
         assert!(strings[0].contains("a=T"));
-        assert!(strings[3].starts_with("\x1b_Ga=d"));
+        assert!(strings[3].starts_with("\x1b_Gq=2,a=d"));
     }
 
     /// Extract the `i=<id>` value from a TGP command's control block.
@@ -711,19 +711,19 @@ mod tests {
         // 2 frames: transmit+place each, then delete-of-previous after frame 2,
         // then delete of the last image on Ended -> 4 events.
         assert_eq!(strings.len(), 4);
-        assert!(strings[0].starts_with("\x1b_Ga=T"));
+        assert!(strings[0].starts_with("\x1b_Gq=2,a=T"));
         assert!(strings[0].contains("a=T"));
-        assert!(strings[1].starts_with("\x1b_Ga=T"), "frame 2 must retransmit");
+        assert!(strings[1].starts_with("\x1b_Gq=2,a=T"), "frame 2 must retransmit");
         assert!(strings[1].contains("a=T"));
         // Each frame must use a distinct image id (no delete-gap flicker).
         let id0 = id_of(&strings[0]);
         let id1 = id_of(&strings[1]);
         assert_ne!(id0, id1, "each frame must transmit under a fresh image id");
         // frame 2's delete targets the previous first-frame id.
-        assert!(strings[2].starts_with("\x1b_Ga=d"));
+        assert!(strings[2].starts_with("\x1b_Gq=2,a=d"));
         assert!(strings[2].contains(&format!("i={id0}")));
         // final delete removes the last placed image on Ended.
-        assert!(strings[3].starts_with("\x1b_Ga=d"));
+        assert!(strings[3].starts_with("\x1b_Gq=2,a=d"));
         assert!(strings[3].contains(&format!("i={id1}")));
     }
 

@@ -49,10 +49,13 @@ impl Action {
 pub fn command(control: &[(char, String)], payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + payload.len() / 3 * 4);
     out.extend_from_slice(b"\x1b_G");
-    for (i, (k, v)) in control.iter().enumerate() {
-        if i > 0 {
-            out.push(b',');
-        }
+    // q=2 quiet mode: suppress responses/replies from the terminal to this
+    // command. We never read graphics replies (the terminal would otherwise
+    // echo `Gi=<id>;OK\x1b\` back onto the stream for any command carrying an
+    // id, which shows up as garbage text and gets misread as input).
+    out.extend_from_slice(b"q=2");
+    for (k, v) in control.iter() {
+        out.push(b',');
         out.push(*k as u8);
         out.push(b'=');
         out.extend_from_slice(v.as_bytes());
@@ -137,7 +140,19 @@ mod tests {
             &[0xff, 0x00, 0x00, 0x00, 0xff, 0x00],
         );
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(s, "\x1b_Ga=T,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+        // q=2 quiet mode is prepended so the terminal sends no replies.
+        assert_eq!(s, "\x1b_Gq=2,a=T,f=24,s=2,v=1;/wAAAP8A\x1b\\");
+    }
+
+    #[test]
+    fn command_is_quiet_so_terminal_does_not_reply() {
+        // Any command carrying an id (transmit/place/delete) would make the
+        // terminal emit `Gi=<id>;OK\x1b\` unless quiet mode is set. We never
+        // read replies, so every command must be q=2.
+        let out = command(&[('i', "7".into()), ('a', "d".into()), ('d', "i".into())], &[]);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("\x1b_Gq=2,"), "must request quiet mode, got: {s}");
+        assert!(s.contains("i=7"));
     }
 
     #[test]
