@@ -117,6 +117,13 @@ pub struct TgpEncoder {
     frame_count: u64,
     /// Block differ, only used when `config.blocks_per_side > 0`.
     blocks: Option<tuigui_streamer::blocks::BlockGrid>,
+    /// Image id currently on screen for each block grid slot (indexed
+    /// `row * cols + col`). When a slot is retransmitted we first place the new
+    /// image under a fresh id (so the slot is covered with no blank gap) and
+    /// *then* delete this displaced id, keeping the terminal's stored images
+    /// bounded at the grid size instead of accumulating forever (which fills
+    /// the store and jams rendering, printing escapes as raw text).
+    block_ids: Vec<Option<u32>>,
 }
 
 impl TgpEncoder {
@@ -135,6 +142,7 @@ impl TgpEncoder {
             image_id: 1 + (std::process::id() % 1000) * 7,
             frame_count: 0,
             blocks,
+            block_ids: Vec::new(),
         }
     }
 
@@ -163,12 +171,16 @@ impl TgpEncoder {
 
         loop {
             let t0 = Instant::now();
-            let update = source.next().await.map_err(EncoderError::Source)?;
-            let Some(update) = update else {
-                // Preserve the old `while let` behavior: Ok(None) ends the
-                // stream without an Ended update, surfacing as a transport
-                // error below.
-                break;
+            let update = match source.next().await {
+                Ok(Some(update)) => update,
+                Ok(None) => {
+                    tracing::error!("encoder: source returned None (live capture should never end)");
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!(err = %e, "encoder: source.next() errored");
+                    return Err(EncoderError::Source(e));
+                }
             };
             let poll_ms = t0.elapsed().as_secs_f64() * 1000.0;
             match update {
@@ -181,6 +193,11 @@ impl TgpEncoder {
                     if let Some(prev) = prev_image_id {
                         on_event(EncoderEvent::Bytes(delete_image(prev)))?;
                     }
+                    // In block mode, delete every block image still on screen.
+                    for old in self.block_ids.iter().flatten() {
+                        on_event(EncoderEvent::Bytes(delete_image(*old)))?;
+                    }
+                    self.block_ids.clear();
                     on_event(EncoderEvent::Ended)?;
                     return Ok(());
                 }
@@ -230,9 +247,22 @@ impl TgpEncoder {
                             (frame.metadata.width, frame.metadata.height),
                             (placement_columns, placement_rows),
                         );
+                        // Keep the on-screen id per grid slot in step with the
+                        // grid dimensions (reset on layout change).
+                        let n_slots = (grid.cols() * grid.rows()) as usize;
+                        if self.block_ids.len() != n_slots {
+                            self.block_ids.clear();
+                            self.block_ids.resize(n_slots, None);
+                        }
                         for b in &changed {
+                            let slot = (b.row * grid.cols() + b.col) as usize;
+                            let old = self.block_ids[slot].take();
+                            // Place the new image FIRST (fresh id) so the slot
+                            // is covered with no blank gap, then delete the
+                            // displaced id so the store never grows unbounded.
                             let bid = self.image_id;
                             self.image_id = self.image_id.wrapping_add(1);
+                            self.block_ids[slot] = Some(bid);
                             on_event(EncoderEvent::Bytes(transmit_block(
                                 b,
                                 &base_control_for_block(b, bid, placement),
@@ -241,6 +271,9 @@ impl TgpEncoder {
                                 origin,
                                 placement,
                             )))?;
+                            if let Some(old) = old {
+                                on_event(EncoderEvent::Bytes(delete_image(old)))?;
+                            }
                         }
                         self.frame_count += 1;
                     } else {
@@ -312,6 +345,10 @@ impl TgpEncoder {
                     })
                 })
                 .await;
+            match &result {
+                Ok(()) => tracing::debug!("encoder task finished cleanly"),
+                Err(e) => tracing::error!(err = %e, "encoder task ended with error"),
+            }
             if let Err(e) = result {
                 let _ = tx.send(Err(e));
             }
@@ -754,12 +791,22 @@ mod tests {
         // `a=T` transmit. Frame 1 -> 4 blocks; frame 2 (unchanged) -> 0;
         // frame 3 -> 1 changed (top-left).
         let mut transmit_events = 0;
+        let mut delete_events = 0;
         for s in &blocks {
             if s.contains("a=T") && s.contains("\x1b[") {
                 transmit_events += 1;
             }
+            if s.contains("a=d") {
+                delete_events += 1;
+            }
         }
         assert_eq!(transmit_events, 5, "4 blocks (first frame) + 1 changed top-left");
+        // Each changed slot places a fresh id (covered, no flicker) and then
+        // deletes the displaced id so the terminal image store stays bounded at
+        // the grid size instead of filling up forever. Frame 3 retransmits the
+        // top-left slot -> 1 displaced delete; Ended frees the 4 on-screen
+        // block images -> 5 deletes total.
+        assert_eq!(delete_events, 5, "1 displaced-slot delete + 4 ended-cleanup deletes");
     }
 
     #[tokio::test]
