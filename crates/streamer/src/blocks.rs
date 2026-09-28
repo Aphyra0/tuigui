@@ -41,6 +41,75 @@ pub const DEFAULT_BLOCKS_PER_SIDE: u32 = 4;
 /// level `DEFAULT_RES_LEVELS` is the block's full source resolution.
 pub const DEFAULT_RES_LEVELS: u32 = 4;
 
+/// Detail-adaptive resolution targeting.
+///
+/// A low-cost pass over each block measures the largest difference between any
+/// neighboring pixel pair and uses it to pick how far up the resolution ladder
+/// the block may climb. On by default; see [`DetailConfig::disabled`].
+///
+/// The model is a linear ladder over difference magnitude (see `spec/LOD.md`):
+///
+/// - **`diff == 0`** (a solid fill) → level 1, the coarsest rung. A uniform
+///   region is fully represented by a tiny payload the terminal scales up,
+///   which is the whole win — terminal decode is the bottleneck.
+/// - **`diff > color_space − dead_zone`** → full resolution (`res_levels`). A
+///   jump that large is guaranteed real detail, never downscaled.
+/// - **in between** → graded linearly. The dead-zone reserves the top of the
+///   color space so that a high-but-not-quite-max diff (delicate detail) is
+///   preserved at full res rather than clipped short.
+///
+/// `color_space = 255` (8-bit channel); `diff = max(|ΔR|, |ΔG|, |ΔB|)`.
+#[derive(Debug, Clone, Copy)]
+pub struct DetailConfig {
+    /// Run adaptive ceilings. `false` (classic) has every block target the full
+    /// source resolution. Defaults to `true`.
+    pub enabled: bool,
+    /// The flat band at the top of the color space (`0..255`) that is reserved
+    /// so fine differences (a jump that is "high, but not quite high enough")
+    /// are preserved at full resolution. Neighbor differences inside this band
+    /// (i.e. `diff > color_space − dead_zone`) force the block to full res;
+    /// differences below it are graded linearly down to the coarsest level at
+    /// `diff == 0`.
+    pub dead_zone: u8,
+}
+
+impl DetailConfig {
+    /// Classic behavior: no adaptive classification; every block targets the
+    /// full source resolution.
+    pub const fn disabled() -> Self {
+        DetailConfig {
+            enabled: false,
+            dead_zone: 32,
+        }
+    }
+
+    /// Adaptive classification (on by default) with the default tuning knobs.
+    pub const fn enabled() -> Self {
+        DetailConfig {
+            enabled: true,
+            ..DetailConfig::disabled()
+        }
+    }
+}
+
+impl Default for DetailConfig {
+    fn default() -> Self {
+        // Adaptive by default: solid/rough classification is the whole point.
+        DetailConfig::enabled()
+    }
+}
+
+/// How much detail a block's content carries, driving its resolution ceiling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BlockDetail {
+    /// True when every pixel is identical (a solid fill) — the `diff == 0`
+    /// case that caps at the coarsest rung.
+    solid: bool,
+    /// The largest difference (per the channel metric) between any neighboring
+    /// pixel pair in the block.
+    max_diff: u8,
+}
+
 /// Size of the block grid (blocks per side).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockGridDim {
@@ -97,10 +166,19 @@ pub struct BlockGrid {
     bh: u32,
     /// Number of resolution levels (1 = full-res only, up to a real ladder).
     res_levels: u32,
+    /// Detail-adaptive resolution targeting (ceilings and classification).
+    detail: DetailConfig,
+    /// Debug: tint each transmitted block's payload red in proportion to how
+    /// far below the original resolution it is. Full res (the original) is
+    /// untouched; lower resolution levels are redder, the coarsest most. Visually
+    /// proves which blocks were degraded, not the crisp ones.
+    debug_lod: bool,
     /// Last transmitted full-resolution content of each block, `None` before
     /// first sight of the block. Comparing this against the current full-res
     /// content is the change signal; it doubles as the stored "hash".
     prev_full: Vec<Option<Bytes>>,
+    /// Per-block content class, used to pick each block's resolution ceiling.
+    block_class: Vec<BlockDetail>,
     /// Resolution level currently shown on screen for each block (1..=res_levels).
     shown_level: Vec<u8>,
     /// Frame dims the grid was built from.
@@ -112,7 +190,11 @@ impl BlockGrid {
     /// covering `ceil(w/cols) x ceil(h/rows)` pixels, with `res_levels`
     /// resolution levels per block. `res_levels == 0` falls back to
     /// [`DEFAULT_RES_LEVELS`]; `1` disables the ladder (always full res).
-    pub fn new(cols: u32, rows: u32, res_levels: u32) -> Self {
+    /// `detail` governs adaptive resolution ceilings (see [`DetailConfig`]);
+    /// [`DetailConfig::disabled`] keeps the classic always-full ladder.
+    /// `debug_lod` tints block payloads by their resolution level (see the
+    /// field doc).
+    pub fn new(cols: u32, rows: u32, res_levels: u32, detail: DetailConfig, debug_lod: bool) -> Self {
         let res_levels = if res_levels == 0 { DEFAULT_RES_LEVELS } else { res_levels.max(1) };
         BlockGrid {
             cols: cols.max(1),
@@ -120,7 +202,10 @@ impl BlockGrid {
             bw: 0,
             bh: 0,
             res_levels,
+            detail,
+            debug_lod,
             prev_full: Vec::new(),
+            block_class: Vec::new(),
             shown_level: Vec::new(),
             dims: BlockGridDim { cols, rows },
         }
@@ -166,6 +251,8 @@ impl BlockGrid {
         if self.prev_full.len() != n {
             self.prev_full.clear();
             self.prev_full.resize(n, None);
+            self.block_class.clear();
+            self.block_class.resize(n, BlockDetail { solid: false, max_diff: 0 });
             self.shown_level.resize(n, 1);
         }
 
@@ -193,19 +280,56 @@ impl BlockGrid {
                     content
                 };
 
+                // Measure the block's detail to pick its resolution ceiling. When
+                // adaptive is disabled, force the full-res case (max_diff pinned
+                // to the top of the space) so every block targets full res.
+                let detail = if self.detail.enabled {
+                    classify_block(&cur, bw, bh, bpp)
+                } else {
+                    BlockDetail { solid: false, max_diff: 255 }
+                };
+                self.block_class[idx] = detail;
+                // Ceiling: the highest ladder rung this block may climb to,
+                // computed from its largest neighbor difference.
+                //
+                //   diff == 0 (solid)          -> level 1
+                //   0 < diff <= S - dead_zone   -> round(diff / ((S - dead_zone) / res_levels))
+                //   diff > S - dead_zone        -> res_levels  (delicate detail preserved)
+                //   (S = 255, an 8-bit channel)
+                let space = 255u32;
+                let dz = u32::from(self.detail.dead_zone).min(space);
+                let ladder = space.saturating_sub(dz); // color space below the dead-zone
+                let max_level: u8 = if detail.solid {
+                    1
+                } else {
+                    let d = detail.max_diff as u32;
+                    if d > ladder {
+                        self.res_levels.min(255) as u8
+                    } else if ladder == 0 {
+                        self.res_levels.min(255) as u8
+                    } else {
+                        let steps = self.res_levels.max(1);
+                        // d / ladder in [0,1], scaled to steps, clamp 1..steps.
+                        let lvl = 1 + (d.saturating_mul(steps - 1)) / ladder;
+                        lvl.min(steps).max(1) as u8
+                    }
+                };
+
                 // Pick the resolution level to transmit, updating per-block
-                // state (baseline content + shown level).
+                // state (baseline content + shown level + class).
                 let level: u8 = match &self.prev_full[idx] {
-                    // First sight of this block: full resolution, become the baseline.
+                    // First sight of this block: become the baseline and transmit
+                    // at the ceiling (full res for detailed, coarsest for solid,
+                    // the smooth cap for smooth).
                     None => {
                         self.prev_full[idx] = Some(cur.clone());
-                        self.shown_level[idx] = self.res_levels as u8;
-                        self.res_levels as u8
+                        self.shown_level[idx] = max_level;
+                        max_level
                     }
-                    // Same content as baseline. If already shown at max res,
-                    // nothing to do; otherwise climb one rung toward full res.
+                    // Same content as baseline. If already shown at the ceiling,
+                    // nothing to do; otherwise climb one rung toward the ceiling.
                     Some(p) if p.as_ref() == cur.as_ref() => {
-                        if self.shown_level[idx] as u32 >= self.res_levels {
+                        if self.shown_level[idx] >= max_level {
                             continue;
                         }
                         self.shown_level[idx] += 1;
@@ -222,6 +346,22 @@ impl BlockGrid {
                 // Downscale to the chosen level's payload. factor 1 = full res.
                 let factor = (self.res_levels + 1 - level as u32).max(1);
                 let (data, pw, ph) = downscale_block(&cur, bw, bh, bpp, factor);
+                // Debug LOD tint: push red into the payload in proportion to how
+                // far below the original resolution this block is. Full res
+                // (level == res_levels) is untouched; the coarsest level
+                // (level 1, most downscaled) is most red. This flags the blocks
+                // that were degraded, not the crisp ones.
+                let data = if self.debug_lod {
+                    let below = self.res_levels.saturating_sub(level as u32);
+                    let amt = if self.res_levels > 1 {
+                        (below * 255 / (self.res_levels - 1)) as u8
+                    } else {
+                        0
+                    };
+                    tint_red(&data, bpp, amt)
+                } else {
+                    data
+                };
 
                 changed.push(MicroBlock {
                     col: bx,
@@ -273,6 +413,51 @@ fn downscale_block(data: &[u8], w: u32, h: u32, bpp: usize, factor: u32) -> (Byt
     (Bytes::from(out), pw, ph)
 }
 
+/// Measure `data` (an `w x h` image of `bpp`-byte pixels) for resolution
+/// targeting:
+///
+/// - Sets [`BlockDetail::solid`] when every pixel is identical and
+///   [`BlockDetail::max_diff`] to 0.
+/// - Else scans east + south neighbors and sets [`BlockDetail::max_diff`] to
+///   the largest single-channel difference (`max(|ΔR|,|ΔG|,|ΔB|)`) found.
+///   O(pixels) — `W*(H-1) + (W-1)*H` pairs.
+fn classify_block(data: &[u8], w: u32, h: u32, bpp: usize) -> BlockDetail {
+    // Solid check: compare every pixel to the first.
+    let first = &data[..bpp];
+    let solid = data.chunks_exact(bpp).all(|px| px == first);
+    if solid {
+        return BlockDetail { solid: true, max_diff: 0 };
+    }
+    // Edge sweep over east + south neighbours, tracking the largest jump.
+    let at = |x: u32, y: u32| -> &[u8] {
+        &data[((y * w + x) as usize) * bpp..((y * w + x) as usize) * bpp + bpp]
+    };
+    // Max single-channel difference between two pixels.
+    let diff = |a: &[u8], b: &[u8]| -> u8 {
+        let mut m = 0u8;
+        for i in 0..bpp {
+            let d = a[i].abs_diff(b[i]);
+            if d > m {
+                m = d;
+            }
+        }
+        m
+    };
+    let mut max_diff = 0u8;
+    for y in 0..h {
+        for x in 0..w {
+            let p = at(x, y);
+            if x + 1 < w {
+                max_diff = max_diff.max(diff(p, at(x + 1, y)));
+            }
+            if y + 1 < h {
+                max_diff = max_diff.max(diff(p, at(x, y + 1)));
+            }
+        }
+    }
+    BlockDetail { solid: false, max_diff }
+}
+
 /// Replace a block's pixels with a solid pseudo-random color deterministic in
 /// `(seed, salt)`. Compatible with both `Rgb24` and `Rgba32` payloads.
 fn colorize(data: &[u8], bpp: usize, seed: u64, salt: u64) -> Bytes {
@@ -285,6 +470,17 @@ fn colorize(data: &[u8], bpp: usize, seed: u64, salt: u64) -> Bytes {
     };
     for chunk in out.chunks_exact_mut(bpp) {
         chunk.copy_from_slice(&px[..bpp.min(px.len())]);
+    }
+    Bytes::from(out)
+}
+
+/// Add a red tint to every pixel of an `bpp`-byte RGBA/RGB payload: the red
+/// channel is pushed up by `amount` (saturating). Green/blue (and alpha) are
+/// left untouched, so degraded (more downscaled) blocks read visibly redder.
+fn tint_red(data: &[u8], bpp: usize, amount: u8) -> Bytes {
+    let mut out = data.to_vec();
+    for px in out.chunks_exact_mut(bpp) {
+        px[0] = px[0].saturating_add(amount);
     }
     Bytes::from(out)
 }
@@ -324,7 +520,7 @@ mod tests {
 
     #[test]
     fn first_frame_emits_every_block_at_full_resolution() {
-        let mut g = BlockGrid::new(4, 4, 4); // 4x4 = 16 blocks, 4 res levels
+        let mut g = BlockGrid::new(4, 4, 4, DetailConfig::disabled(), false); // 4x4 = 16 blocks, 4 res levels
         let f = solid(100, 100, [1, 2, 3, 255]);
         let blocks = g.diff(&f, false, 0);
         assert_eq!(blocks.len(), 16);
@@ -345,7 +541,7 @@ mod tests {
 
     #[test]
     fn identical_frame_at_max_level_emits_nothing() {
-        let mut g = BlockGrid::new(4, 4, 4);
+        let mut g = BlockGrid::new(4, 4, 4, DetailConfig::disabled(), false);
         let f = solid(80, 60, [9, 9, 9, 255]);
         g.diff(&f, false, 0);
         let again = g.diff(&f, false, 1);
@@ -354,7 +550,7 @@ mod tests {
 
     #[test]
     fn changing_one_block_emits_only_it_at_lowest_level() {
-        let mut g = BlockGrid::new(4, 4, 4);
+        let mut g = BlockGrid::new(4, 4, 4, DetailConfig::disabled(), false);
         let f0 = solid(80, 80, [5, 5, 5, 255]);
         g.diff(&f0, false, 0);
         // Paint only the top-left block (col 0, row 0) a different color. Its
@@ -383,7 +579,7 @@ mod tests {
 
     #[test]
     fn static_block_climbs_one_rung_per_frame_then_quiets() {
-        let mut g = BlockGrid::new(1, 1, 4); // single block over the whole frame
+        let mut g = BlockGrid::new(1, 1, 4, DetailConfig::disabled(), false); // single block over the whole frame
         let f = solid(40, 40, [7, 7, 7, 255]);
         // First sight: full res.
         let first = g.diff(&f, false, 0);
@@ -412,7 +608,7 @@ mod tests {
 
     #[test]
     fn debug_odd_colorizes_odd_blocks_and_forces_retransmit() {
-        let mut g = BlockGrid::new(4, 4, 4);
+        let mut g = BlockGrid::new(4, 4, 4, DetailConfig::disabled(), false);
         let f = solid(80, 80, [0, 0, 0, 255]); // 16 blocks
         let blocks = g.diff(&f, true, 0);
         assert_eq!(blocks.len(), 16);
@@ -435,5 +631,132 @@ mod tests {
         for b in next.iter().filter(|b| (b.row * 4 + b.col) % 2 == 1) {
             assert_eq!(b.level, 1);
         }
+    }
+
+    #[test]
+    fn solid_tile_targets_lowest_resolution_under_adaptive() {
+        // Correctness of the adaptive classifier: a uniform block has no detail
+        // to sharpen, so it must land at the coarsest rung (level 1, the
+        // smallest payload), not the full resolution.
+        let mut g = BlockGrid::new(1, 1, 4, DetailConfig::enabled(), false);
+        let f = solid(40, 40, [7, 7, 7, 255]);
+        let first = g.diff(&f, false, 0);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].level, 1, "solid block must ceiling at the coarsest level");
+        assert_eq!(first[0].payload_width, 10); // 40 / factor(4)
+        assert_eq!(first[0].payload_height, 10);
+        // Same solid content: already at ceiling, stays quiet.
+        assert!(g.diff(&f, false, 1).is_empty());
+    }
+
+    #[test]
+    fn detailed_tile_still_targets_full_resolution() {
+        // A block with rough edges (an edge on every sampled pair) is classified
+        // Detailed and must still climb to the full source resolution.
+        let mut g = BlockGrid::new(1, 1, 4, DetailConfig::enabled(), false);
+        // Build a checkerboard: alternating black/white pixels -> max edges.
+        let w = 16u32;
+        let mut px = vec![0u8; (w * w) as usize * 4];
+        for r in 0..w {
+            for c in 0..w {
+                let v = if (r + c) % 2 == 0 { 255u8 } else { 0u8 };
+                let b = (r * w + c) as usize * 4;
+                px[b..b + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let f = Frame::full(meta(w, w), Bytes::from(px));
+        let first = g.diff(&f, false, 0);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].level, 4, "detailed block must ceiling at full resolution");
+        assert_eq!(first[0].payload_width, 16);
+        assert_eq!(first[0].payload_height, 16);
+    }
+
+    #[test]
+    fn debug_lod_tints_degraded_blocks_red_but_leaves_full_res_untinted() {
+        // debug_lod must push red into payloads in proportion to how far below
+        // the original resolution the block is: full res (level==res_levels)
+        // untouched, coarsest (level 1) most red.
+        let w = 16u32;
+        let brightness = 100u8;
+
+        // Full-res emit (level 4): must be completely untinted.
+        let mut g = BlockGrid::new(1, 1, 4, DetailConfig::disabled(), true);
+        let mut px = vec![0u8; (w * w) as usize * 4];
+        for p in px.chunks_exact_mut(4) {
+            p.copy_from_slice(&[brightness, brightness, brightness, 255]);
+        }
+        let blocks = g.diff(&Frame::full(meta(w, w), Bytes::from(px)), false, 0);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].level, 4, "disabled detail -> full res on first sight");
+        assert_eq!(blocks[0].data[0], brightness, "full res must be untinted");
+        assert_eq!(blocks[0].data[1], brightness);
+        assert_eq!(blocks[0].data[2], brightness);
+
+        // Coarsest emit (level 1): most red. amt = (4-1)*255/3 = 255.
+        let mut g2 = BlockGrid::new(1, 1, 4, DetailConfig::enabled(), true);
+        let s2 = g2.diff(&solid(16, 16, [brightness, brightness, brightness, 255]), false, 0);
+        assert_eq!(s2.len(), 1);
+        assert_eq!(s2[0].level, 1, "solid block under adaptive ceilings at level 1");
+        assert_eq!(s2[0].data[0], 255, "level 1 is most red (amt 255)");
+        assert_eq!(s2[0].data[1], brightness, "green untouched");
+        assert_eq!(s2[0].data[2], brightness, "blue untouched");
+    }
+
+    #[test]
+    fn lod_ladder_grades_ceiling_by_max_diff_and_dead_zone() {
+        // Dead-zone model (spec/LOD.md): the ceiling is a linear ladder over
+        // the largest neighbor diff, using the grid's res_levels.
+        // S = 255, but the model grades over ladder = S - dead_zone with all 4
+        // steps. diff = S (full jump) "> dead_zone"? We use strict: d > ladder
+        // means d in the top dead_zone band -> full res. With dead_zone 0 the
+        // top band is empty, so full res only at d == ladder.
+        let w = 16u32;
+        let make = |val| -> Bytes {
+            let mut px = vec![0u8; (w * w) as usize * 4];
+            for p in px.chunks_exact_mut(4) {
+                p.copy_from_slice(&[val, val, val, 255]);
+            }
+            Bytes::from(px)
+        };
+
+        // dead_zone 0, res_levels 4, ladder = 255. d == 255 -> NOT > 255, so
+        // level = 1 + 255*3/255 = 4. Full res for a max contrast split.
+        let d0 = DetailConfig { enabled: true, dead_zone: 0 };
+        let mut g = BlockGrid::new(1, 1, 4, d0, false);
+        // Half black/half white: max neighbor diff is 255 at the seam.
+        let mut split = vec![0u8; (w * w) as usize * 4];
+        for r in 0..w {
+            for c in 0..w {
+                let v = if c < 8 { 0u8 } else { 255u8 };
+                let b = (r * w + c) as usize * 4;
+                split[b..b + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let blk = g.diff(&Frame::full(meta(w, w), Bytes::from(split)), false, 0);
+        assert_eq!(blk.len(), 1);
+        assert_eq!(blk[0].level, 4, "max diff must grade to full res");
+
+        // A small fixed diff (say 64) with dead_zone 0 grades to
+        // 1 + 64*3/255 = 1 (64*3=192, /255 = 0) -> level 1. So subtle diff at
+        // res_levels 4 stays lowest. With dead_zone small this is still 1.
+        let mut g2 = BlockGrid::new(1, 1, 4, d0, false);
+        // Two-tone block: 0 and 64 are the only colors => max_diff 64.
+        let mut subtle = vec![0u8; (w * w) as usize * 4];
+        for r in 0..w {
+            for c in 0..w {
+                let v = if c < 8 { 0u8 } else { 64u8 };
+                let b = (r * w + c) as usize * 4;
+                subtle[b..b + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let blk2 = g2.diff(&Frame::full(meta(w, w), Bytes::from(subtle)), false, 0);
+        assert_eq!(blk2.len(), 1);
+        assert!(blk2[0].level <= 2, "a low diff should grade low, got level {}", blk2[0].level);
+
+        // Solid -> level 1 always.
+        let mut g3 = BlockGrid::new(1, 1, 4, d0, false);
+        let s = g3.diff(&Frame::full(meta(w, w), make(200)), false, 0);
+        assert_eq!(s[0].level, 1, "solid always level 1");
     }
 }

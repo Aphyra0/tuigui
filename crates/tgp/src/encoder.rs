@@ -91,6 +91,17 @@ pub struct EncoderConfig {
     /// back up one rung per static frame; an unchanged block already shown at
     /// max resolution costs nothing.
     pub res_levels: u32,
+    /// With `blocks_per_side > 0`, detail-adaptive resolution ceilings: each block's
+    /// largest neighbor color difference picks its ceiling on a linear ladder
+    /// (see `spec/LOD.md`). Solid fills cap at the coarsest, differences inside
+    /// the [`DetailConfig::dead_zone`] top band resolve at full res, and
+    /// differences below grade linearly across `res_levels`. Disabled keeps the
+    /// classic always-full ladder.
+    pub detail: tuigui_streamer::blocks::DetailConfig,
+    /// With `blocks_per_side > 0`, tint each transmitted block's payload red in
+    /// proportion to its resolution level (level 1 untouched, higher = more
+    /// red). Visually proves what resolution each block settles at.
+    pub debug_lod: bool,
     /// With `blocks_per_side > 0`, colorize every other block (linear grid
     /// index odd) with a per-block pseudo-random color that changes each frame,
     /// and leave even blocks as the real pixels. Visually proves the block grid
@@ -133,6 +144,8 @@ impl TgpEncoder {
                 config.blocks_per_side,
                 config.blocks_per_side,
                 config.res_levels,
+                config.detail,
+                config.debug_lod,
             )
         });
         TgpEncoder {

@@ -100,10 +100,34 @@ struct Cli {
 
     /// With --blocks, the number of resolution levels on each block's ladder
     /// (default 4). A changed block repaints at the coarsest level and sharpens
-    /// one rung per static frame up to the full block resolution; 1 disables
-    /// the ladder (always full res).
+    /// one rung per static frame up to the block's ceiling; 1 disables the
+    /// ladder (always full res).
     #[arg(long, value_name = "LEVELS", default_value_t = 0)]
     res_levels: u32,
+
+    /// With --blocks, enable detail-adaptive resolution ceilings (on by default).
+    /// Each block's largest neighbor color difference picks its ceiling on a
+    /// linear ladder: a solid fill settles at the lowest resolution, a jump
+    /// beyond the color-space-minus-dead-zone resolves at full resolution, and
+    /// differences in between grade linearly across `--res-levels`. Pass
+    /// --no-adaptive for the classic always-full ladder.
+    #[arg(long, default_value_t = true)]
+    detail_adaptive: bool,
+
+    /// With --blocks --detail-adaptive, the flat band reserved at the top of
+    /// the color space (0..255). A neighbor difference inside this band
+    /// (diff > 255 - lod-dead-zone) is "delicate" and forces the block to full
+    /// resolution; differences below it are graded linearly toward the lowest
+    /// resolution (a solid block, diff == 0, sits at level 1).
+    #[arg(long, value_name = "V", default_value_t = 32)]
+    lod_dead_zone: u8,
+
+    /// With --blocks, tint each transmitted block's payload red in proportion to
+    /// how far below the original resolution it is: full-res blocks are
+    /// untouched, lower-resolution (more downscaled) blocks are redder, the
+    /// coarsest most. Visually flags which blocks were degraded.
+    #[arg(long, default_value_t = false)]
+    debug_lod: bool,
 
     /// Debuggy block grid: every other block (linear odd index) is filled with
     /// a per-block pseudo-random color that changes each frame; even blocks
@@ -178,6 +202,14 @@ async fn main() -> Result<()> {
         } else {
             cli.blocks
         };
+    let detail = if cli.detail_adaptive {
+        tuigui_streamer::blocks::DetailConfig {
+            enabled: true,
+            dead_zone: cli.lod_dead_zone,
+        }
+    } else {
+        tuigui_streamer::blocks::DetailConfig::disabled()
+    };
     let encoder = TgpEncoder::new(EncoderConfig {
         placement_columns: pc,
         placement_rows: pr,
@@ -185,6 +217,8 @@ async fn main() -> Result<()> {
         color_bits: cli.color_bits,
         blocks_per_side,
         res_levels: cli.res_levels,
+        detail,
+        debug_lod: cli.debug_lod,
         debug_blocks: cli.debug_blocks,
         pane_origin: Some((0, 0)),
     });
