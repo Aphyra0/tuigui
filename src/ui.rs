@@ -31,13 +31,20 @@ pub struct Stats {
     pub setup_ms: f64,
     pub copy_ms: f64,
     pub readout_ms: f64,
+    /// Cumulative tiles reusing an already-uploaded id (no transmit), block mode.
+    pub tile_reused: u64,
+    /// Cumulative tiles that transmitted a fresh payload, block mode.
+    pub tile_transmitted: u64,
+    /// Percent of on-screen tiles that are distinct content (unique/ all tiles),
+    /// from the last frame's block grid.
+    pub tile_unique_pct: u32,
 }
 
 /// Render the shell and return the area the TGP image should be placed into —
-/// the full body above two status footer rows (no header, no border).
+/// the full body above three status footer rows (no header, no border).
 pub fn draw(f: &mut Frame, app: &str, status: &str, stats: &Stats) -> Rect {
     let [body, footer] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(f.area());
+        Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(f.area());
 
     let (rw, rh) = stats.resolution;
     let phases = if stats.announce_ms > 0.0 {
@@ -48,8 +55,18 @@ pub fn draw(f: &mut Frame, app: &str, status: &str, stats: &Stats) -> Rect {
     } else {
         String::new()
     };
+    let tile_hr = stats.tile_reused + stats.tile_transmitted;
+    let tiles = if tile_hr > 0 {
+        let pct = stats.tile_reused as f64 * 100.0 / tile_hr as f64;
+        format!(
+            " · Tiles: {} re-used · {} sent · {:.0}% hit · {}% unique",
+            stats.tile_reused, stats.tile_transmitted, pct, stats.tile_unique_pct
+        )
+    } else {
+        String::new()
+    };
     let line1 = format!(
-        " {status} · {app}  ·  FPS: {:.0}  ·  Bw: {:.1} MiB/s  ·  Cap: {:.1} ms  ·  Pace: {:.1} ms  ·  Enc: {:.1} ms  ·  Sink: {:.1} ms  ·  Flush: {:.1} ms  ·  {rw}x{rh}{phases}  ·  q to quit",
+        " {status} · {app}  ·  FPS: {:.0}  ·  Bw: {:.1} MiB/s  ·  Cap: {:.1} ms  ·  Pace: {:.1} ms  ·  Enc: {:.1} ms  ·  Sink: {:.1} ms  ·  Flush: {:.1} ms  ·  {rw}x{rh}{phases}{tiles}  ·  q to quit",
         stats.fps,
         stats.bandwidth / (1024.0 * 1024.0),
         stats.capture_ms,

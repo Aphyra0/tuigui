@@ -129,6 +129,28 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     debug_lod: bool,
 
+    /// With --blocks, disable content-addressable tile reuse (on by default).
+    /// When enabled, a changed block whose exact payload bytes are already
+    /// stored on the terminal is placed (not re-transmitted), deduping repeated
+    /// content. Pass --no-tile-reuse to always re-transmit changed blocks.
+    #[arg(long, action = clap::ArgAction::SetFalse, default_value_t = true)]
+    no_tile_reuse: bool,
+
+    /// Opt-in zlib compression of transmitted payloads via the Kitty `o=z`
+    /// key (RFC 1950), which the terminal inflates before rendering. Off by
+    /// default; `--no-zlib` is provided for symmetry / to force it off. When
+    /// set it compresses both raw and PNG frames (PNG already deflates, so raw
+    /// is where the win lives).
+    #[arg(long, action = clap::ArgAction::SetTrue, default_value_t = false)]
+    zlib: bool,
+
+    /// With tile reuse, tint would-be-reused tiles a deterministic color derived
+    /// from their content hash and re-transmit them, so every tile sharing the
+    /// same deduped content shows the same color. Visually proves which tiles
+    /// are reused.
+    #[arg(long, default_value_t = false)]
+    debug_reused_tiles: bool,
+
     /// Debuggy block grid: every other block (linear odd index) is filled with
     /// a per-block pseudo-random color that changes each frame; even blocks
     /// carry the real pixels. Visually proves the block grid and per-block
@@ -231,6 +253,9 @@ async fn main() -> Result<()> {
         debug_blocks: cli.debug_blocks,
         pane_origin: Some((0, 0)),
         render_pixel_budget: cli.render_pixel_budget,
+        tile_reuse: cli.no_tile_reuse,
+        zlib: cli.zlib,
+        debug_reused_tiles: cli.debug_reused_tiles,
     });
     let mut tgp_stream = encoder.into_stream(source);
 
@@ -440,14 +465,14 @@ fn query_cell_size() -> Result<(u32, u32)> {
 }
 
 /// The streamed image's area in terminal cells — the rectangle the TGP image
-/// is placed into. Must match the layout in `ui::draw`: no header, two status
-/// footers, and no border around the body.
+/// is placed into. Must match the layout in `ui::draw`: no header, three status
+/// footer rows, and no border around the body.
 fn pane_placement() -> Result<(u32, u32)> {
     let (cols, rows) = crossterm::terminal::size().context("querying terminal size")?;
-    if rows <= 2 {
+    if rows <= 3 {
         return Ok((cols as u32, rows as u32));
     }
-    Ok((cols as u32, (rows - 2) as u32))
+    Ok((cols as u32, (rows - 3) as u32))
 }
 
 /// Drain any TGP stream writing raw bytes to `out` until Ended.
@@ -625,7 +650,7 @@ async fn run_ui(
                 // even when the encoder idles between frames. Spinning on
                 // empty chunks would busy-loop and starve input polling.
                 Ok(Some(Ok(EncoderEvent::Bytes(_)))) => break,
-                Ok(Some(Ok(EncoderEvent::Frame { width, height, capture_ms, pacing_ms, encode_ms, timing }))) => {
+                Ok(Some(Ok(EncoderEvent::Frame { width, height, capture_ms, pacing_ms, encode_ms, timing, tile_reused, tile_transmitted, tile_unique_pct }))) => {
                     // Record the frame's resolution and capture cost into the
                     // rolling window.
                     frame_count_accum += 1;
@@ -633,6 +658,9 @@ async fn run_ui(
                     pacing_ms_accum += pacing_ms;
                     encode_ms_accum += encode_ms;
                     stats.resolution = (width, height);
+                    stats.tile_reused = tile_reused;
+                    stats.tile_transmitted = tile_transmitted;
+                    stats.tile_unique_pct = tile_unique_pct;
                     if let Some(t) = timing {
                         announce_accum += t.announce_ms;
                         setup_accum += t.setup_ms;
@@ -965,6 +993,7 @@ async fn run_debug_fill() -> Result<()> {
             ('v', h.to_string()),
         ],
         &data,
+        false,
     );
     for c in chunks {
         out.write_all(&c)?;

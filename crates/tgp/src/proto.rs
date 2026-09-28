@@ -74,14 +74,25 @@ pub fn command(control: &[(char, String)], payload: &[u8]) -> Vec<u8> {
 /// continuation chunks carry `m=1`, the last `m=0`. The raw payload bytes are
 /// sliced here and passed to [`command`], which performs the single base64
 /// encoding (do NOT pre-encode here, or you'd double-encode).
+///
+/// When `compress` is true the whole payload is deflated (RFC 1950 zlib) before
+/// chunking and `o=z` is added to the first chunk's control block, so the
+/// terminal inflates it before interpreting the pixels.
 pub fn chunked_transmit(
     fmt: u32,
     mut extra_control: Vec<(char, String)>,
     payload: &[u8],
+    compress: bool,
 ) -> Vec<Vec<u8>> {
     const MAX_B64: usize = 4096;
     // Bytes that fit in 4096 base64 chars (4 b64 chars per 3 bytes).
     let bytes_per_chunk = MAX_B64 / 4 * 3;
+    let (deflated, compressed_payload): (Vec<u8>, bool) = if compress && !payload.is_empty() {
+        (deflate(payload), true)
+    } else {
+        (Vec::new(), false)
+    };
+    let payload: &[u8] = if compressed_payload { &deflated } else { payload };
     let mut out = Vec::new();
     let mut offset = 0usize;
     let mut first = true;
@@ -89,9 +100,12 @@ pub fn chunked_transmit(
         let end = (offset + bytes_per_chunk).min(payload.len());
         let chunk = &payload[offset..end];
         let is_last = end == payload.len();
-        let mut control: Vec<(char, String)> = Vec::with_capacity(extra_control.len() + 2);
+        let mut control: Vec<(char, String)> = Vec::with_capacity(extra_control.len() + 3);
         if first {
             control.append(&mut extra_control);
+            if compressed_payload {
+                control.push(('o', "z".into()));
+            }
             control.push(('f', fmt.to_string()));
         }
         control.push(('m', if is_last { "0" } else { "1" }.to_string()));
@@ -103,6 +117,15 @@ pub fn chunked_transmit(
         }
     }
     out
+}
+
+/// RFC 1950 zlib-compress `data` (deflate + zlib wrapper), used for `o=z`
+/// payloads the terminal inflates before rendering.
+fn deflate(data: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(data).ok();
+    enc.finish().unwrap_or_default()
 }
 
 /// RFC 4648 base64 (standard alphabet, padded). Delegates to the fast SIMD
@@ -159,7 +182,7 @@ mod tests {
     fn chunking_first_and_last_flags() {
         // 12288 bytes -> 16384 base64 chars -> 4 chunks
         let payload = vec![7u8; 12288];
-        let chunks = chunked_transmit(32, vec![('i', "1".into())], &payload);
+        let chunks = chunked_transmit(32, vec![('i', "1".into())], &payload, false);
         assert_eq!(chunks.len(), 4);
         let first = String::from_utf8(chunks[0].clone()).unwrap();
         assert!(first.contains("f=32"));
@@ -168,5 +191,29 @@ mod tests {
         let last = String::from_utf8(chunks.last().unwrap().clone()).unwrap();
         assert!(last.contains("m=0"));
         assert!(!last.contains("f=32"));
+    }
+
+    #[test]
+    fn zlib_compression_adds_o_z_and_inflates_back_to_original() {
+        // A compressible payload: zlib shrinks it and the first chunk carries
+        // `o=z` so the terminal knows to inflate before rendering.
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 7) as u8).collect();
+        let compressed = chunked_transmit(24, vec![('i', "5".into())], &payload, true);
+        assert_eq!(compressed.len(), 1, "compressed 4096 bytes fits one chunk");
+        let s = String::from_utf8(compressed[0].clone()).unwrap();
+        assert!(s.contains("o=z"), "first chunk must request zlib, got: {s}");
+        assert!(s.contains("f=24"));
+        // The payload position starts after the `;` separator in the escape.
+        let b64 = s.split(';').nth(1).unwrap().trim_end_matches("\x1b\\");
+        let bytes = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.decode(b64).unwrap()
+        };
+        // Inflate it back and compare with the original.
+        use std::io::Read as _;
+        let mut dec = flate2::read::ZlibDecoder::new(&bytes[..]);
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).ok();
+        assert_eq!(out, payload, "zlib round-trip must reproduce the payload");
     }
 }

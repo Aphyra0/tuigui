@@ -22,5 +22,10 @@ base64 = { version = "0.22" }
 # (the terminal decodes f=100). Only used when EncoderConfig.png is set.
 png = { workspace = true }
 
+# flate2: opt-in zlib (RFC 1950) compression of TGP payloads via `o=z`. Works
+# with either PNG (pre-deflated here redundantly) or raw payloads; off unless
+# EncoderConfig.zlib is set.
+flate2 = { workspace = true }
+
 # internal
 tuigui-streamer = { workspace = true }

@@ -20,6 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 bytemuck = { version = "1", features = ["derive"] }
 png = "0.17"
+flate2 = "1.0"
 
 # tui
 ratatui = "0.29"
@@ -49,6 +50,10 @@ description = "GUI app in the terminal"
 [[bin]]
 name = "tuigui"
 path = "src/main.rs"
+
+[[bin]]
+name = "tuigui-stress"
+path = "src/stress.rs"
 
 [dependencies]
 tuigui-streamer = { workspace = true }
