@@ -33,17 +33,12 @@ pub enum EncoderEvent {
         encode_ms: f64,
         /// Per-phase capture breakdown, when the source reported it.
         timing: Option<tuigui_streamer::frame::CaptureTiming>,
-        /// Running total of tile renders reusing an already-stored id (no
-        /// transmit), accumulated over the session (block mode + `tile_reuse`).
-        /// Lets the UI show an accumulated tile-reuse hit-rate.
-        tile_reused: u64,
-        /// Running total of tile renders that transmitted a fresh payload.
-        tile_transmitted: u64,
-        /// Percent of the block grid currently occupied by distinct tile
-        /// contents (unique content hashes / on-screen slots, 0..=100).
-        /// Includes the whole screen (all on-screen tiles), independent of
-        /// whether tile reuse is on.
-        tile_unique_pct: u32,
+        /// Number of blocks edited (transmitted as `a=f`) in the last frame.
+        /// `0` when not in block mode.
+        tiles_edited: u32,
+        /// Total block grid slots (blocks per side squared). `0` when not in
+        /// block mode.
+        tiles_total: u32,
     },
     /// Bytes to write to the terminal, in order.
     Bytes(Vec<u8>),
@@ -126,31 +121,11 @@ pub struct EncoderConfig {
     /// `None` (default) is used by full-frame mode, where `main.rs` positions
     /// the cursor once.
     pub pane_origin: Option<(u16, u16)>,
-    /// With `blocks_per_side > 0`, cap how many pixels each frame hands the
-    /// terminal decoder. `0` (default) retransmits every changed block inline,
-    /// with no ceiling (current behavior). When `> 0`, changed blocks route
-    /// through a rendering queue drained at most once per frame up to this many
-    /// *payload* pixels (`payload_width × payload_height` of the affected
-    /// blocks); the rest spill to the next frame. See `spec/RENDER_QUEUE.md`.
-    pub render_pixel_budget: u64,
-    /// With `blocks_per_side > 0`, dedupe tiles by content: keep a hash->id map
-    /// of what the terminal already stores and, for a changed tile whose exact
-    /// payload bytes are already cached (e.g. a repeated solid background),
-    /// just place the cached id instead of re-transmitting. On by default; see
-    /// `spec/TILE_REUSE.md`. `false` re-transmits every changed tile.
-    pub tile_reuse: bool,
     /// Opt-in zlib (RFC 1950) compression of transmitted payloads via `o=z`.
     /// Off by default. When set, the payload is deflated before base64 for any
     /// format — raw (`f=24/32`, the big win since it's currently shipped
     /// uncompressed) or PNG (redundant as PNG already deflates, but harmless).
     pub zlib: bool,
-    /// With `tile_reuse`, tint reused tiles debug-style. A tile whose content is
-    /// already cached (would be placed, not re-transmitted) is instead tinted a
-    /// deterministic color derived from its content hash and re-transmitted, so
-    /// every tile sharing the same content shows the same tinted color. Visually
-    /// proves which tiles dedupe. `false` (default) keeps the real place-only
-    /// reuse.
-    pub debug_reused_tiles: bool,
 }
 
 impl Default for EncoderConfig {
@@ -166,47 +141,13 @@ impl Default for EncoderConfig {
             debug_lod: false,
             debug_blocks: false,
             pane_origin: None,
-            render_pixel_budget: 0,
-            // Tile reuse is on by default: the whole point is deduping repeated
-            // content on the terminal. Pass `--no-tile-reuse` / set false to opt
-            // out.
-            tile_reuse: true,
             // zlib compression is opt-in: it trades encoder CPU for bandwidth,
             // which is only worth it when the link is the bottleneck.
             zlib: false,
-            debug_reused_tiles: false,
         }
     }
 }
 
-/// Per-session counters for tile-reuse dedupe (`config.tile_reuse`), carried on
-/// each [`EncoderEvent::Frame`] so the UI can show an accumulated hit-rate.
-pub struct TileStats {
-    /// Number of tile renders satisfied by an already-uploaded cached id
-    /// (placed, no transmit). Accumulated over the session.
-    pub reused: u64,
-    /// Number of tile renders that had to transmit a fresh payload.
-    /// Accumulated over the session.
-    pub transmitted: u64,
-}
-
-impl Default for TileStats {
-    fn default() -> Self {
-        TileStats { reused: 0, transmitted: 0 }
-    }
-}
-
-impl TileStats {
-    /// Fraction of tile renders that reused a cached id, in `0..=1`.
-    pub fn hit_rate(&self) -> f64 {
-        let total = self.reused + self.transmitted;
-        if total == 0 {
-            0.0
-        } else {
-            self.reused as f64 / total as f64
-        }
-    }
-}
 
 /// Converts a [`FrameSource`] into a stream of TGP bytes.
 ///
@@ -219,49 +160,30 @@ pub struct TgpEncoder {
     frame_count: u64,
     /// Block differ, only used when `config.blocks_per_side > 0`.
     blocks: Option<tuigui_streamer::blocks::BlockGrid>,
-    /// Image id currently on screen for each block grid slot (indexed
-    /// `row * cols + col`). When a slot is retransmitted we first place the new
-    /// image under a fresh id (so the slot is covered with no blank gap) and
-    /// *then* delete this displaced id, keeping the terminal's stored images
-    /// bounded at the grid size instead of accumulating forever (which fills
-    /// the store and jams rendering, printing escapes as raw text).
-    block_ids: Vec<Option<u32>>,
-    /// Content hash currently placed in each block grid slot (parallel to
-    /// `block_ids`), used to report the % of unique tiles on screen.
-    slot_hash: Vec<Option<u64>>,
-    /// Rendering queue: blocks waiting to be transmitted, keyed by grid slot.
-    /// Only used when `config.render_pixel_budget > 0`; drained at most once per
-    /// frame up to the pixel budget, undrained entries spill to the next frame.
-    /// An entry is a `(slot_index, MicroBlock)` pair, and enqueuing a second
-    /// update for a slot already queued replaces it (keeps the newest payload,
-    /// never renders a superseded one).
-    render_queue: Vec<(usize, tuigui_streamer::blocks::MicroBlock)>,
-    /// Content-addressed tile cache (`config.tile_reuse`): maps a hash of the
-    /// exact bytes the terminal stores for a tile to the image id that holds
-    /// them. A changed tile whose hash is a hit is placed (not re-transmitted).
-    /// Eviction bounds the terminal's stored-image count; see `spec/TILE_REUSE.md`.
-    tile_cache: std::collections::HashMap<u64, u32>,
-    /// LRU recency + lifetime, parallel to `tile_cache` (keyed by the same hash).
-    tile_recency: std::collections::HashMap<u64, u64>,
-    /// Bytes the terminal would hold for a cached hash (to know transmit cost on
-    /// a miss / store size).
-    tile_size: std::collections::HashMap<u64, usize>,
-    /// Monotonic recency clock for LRU eviction.
-    tile_clock: u64,
-    /// How many placements currently reference each cached image id. Lets us
-    /// evict ids that no on-screen placement needs without deleting a live one.
-    tile_refs: std::collections::HashMap<u32, usize>,
-    /// Aggregated tile-reuse telemetry.
-    tile_stats: TileStats,
+    /// The single image id holding the whole canvas as its animation root frame
+    /// (block mode). The first frame transmits+places it; every later changed
+    /// block is an `a=f` edit composed into this image in place.
+    anim_image_id: Option<u32>,
+    /// Whether the root-frame canvas has been transmitted+placed yet. Guarded so
+    /// the very first frame uploads the whole canvas (creating the image and its
+    /// root frame) rather than trying to edit a not-yet-existing image.
+    anim_root_placed: bool,
 }
 
 impl TgpEncoder {
     pub fn new(config: EncoderConfig) -> Self {
         let blocks = (config.blocks_per_side > 0).then(|| {
+            // The block backend now streams via the kitty animation channel:
+            // the whole canvas is one animation image (root frame) and changed
+            // blocks are `a=f` edits composed 1:1 into it. Because the terminal
+            // compositor never upscales an edited rect, the LOD ladder is
+            // disabled here (res_levels=1): every transmitted block is full
+            // resolution so the rect it edits matches the root-frame pixels
+            // exactly.
             tuigui_streamer::blocks::BlockGrid::new(
                 config.blocks_per_side,
                 config.blocks_per_side,
-                config.res_levels,
+                1,
                 config.detail,
                 config.debug_lod,
             )
@@ -273,298 +195,13 @@ impl TgpEncoder {
             image_id: 1 + (std::process::id() % 1000) * 7,
             frame_count: 0,
             blocks,
-            block_ids: Vec::new(),
-            slot_hash: Vec::new(),
-            render_queue: Vec::new(),
-            tile_cache: std::collections::HashMap::new(),
-            tile_recency: std::collections::HashMap::new(),
-            tile_size: std::collections::HashMap::new(),
-            tile_clock: 0,
-            tile_refs: std::collections::HashMap::new(),
-            tile_stats: TileStats::default(),
+            anim_image_id: None,
+            anim_root_placed: false,
         }
     }
 
     pub fn image_id(&self) -> u32 {
         self.image_id
-    }
-
-    /// Enqueue this frame's changed blocks keyed by grid slot, replacing any
-    /// already-queued (and therefore not-yet-rendered) version of the same slot
-    /// so a superseded payload is never transmitted. Only touches the rendering
-    /// queue; call [`TgpEncoder::drain_render_queue`] afterwards.
-    fn enqueue_blocks(
-        &mut self,
-        changed: &[tuigui_streamer::blocks::MicroBlock],
-        n_slots: usize,
-        grid_cols: usize,
-    ) {
-        // Trim to the grid, in case a resize aged out queued slots.
-        self.render_queue.retain(|(slot, _)| *slot < n_slots);
-        // Mark which slots are already queued so we can replace in place.
-        let mut secondary_index: Vec<Option<usize>> = vec![None; n_slots];
-        for (i, (slot, _)) in self.render_queue.iter().enumerate() {
-            if *slot < n_slots {
-                secondary_index[*slot] = Some(i);
-            }
-        }
-        for b in changed {
-            let slot = (b.row as usize) * grid_cols + b.col as usize;
-            if slot >= n_slots {
-                continue;
-            }
-            match secondary_index[slot] {
-                // Already queued: replace in place with the newest payload.
-                Some(i) => self.render_queue[i].1 = b.clone(),
-                // Not queued yet: append.
-                None => {
-                    self.render_queue.push((slot, b.clone()));
-                    secondary_index[slot] = Some(self.render_queue.len() - 1);
-                }
-            }
-        }
-    }
-
-    /// The exact bytes this block would transmit to the terminal (the payload
-    /// after PNG encoding / color-bit rounding). When `tile_reuse` is on, the
-    /// content hash is taken over these bytes, so two tiles collide, and reuse,
-    /// only when what the terminal stores is byte-identical.
-    fn tile_payload(&self, b: &tuigui_streamer::blocks::MicroBlock) -> bytes::Bytes {
-        if self.config.png {
-            encode_png(&b.data, b.payload_width, b.payload_height, self.config.color_bits)
-        } else {
-            b.data.clone()
-        }
-    }
-
-    /// Render a changed block at its grid slot. With `tile_reuse` enabled this
-    /// is content-addressed:
-    ///
-    /// - **cache hit** — the terminal already stores a tile with these exact
-    ///   payload bytes, so we place the existing id (`a=p`, no payload) instead
-    ///   of re-transmitting. Counted as a reuse.
-    /// - **cache miss** — transmit the block as usual under a fresh id, then
-    ///   record `hash -> id`.
-    ///
-    /// Either way the slot is covered with no blank gap, and the displaced id
-    /// (the block's previous content) is deleted so the terminal store stays
-    /// bounded. When `tile_reuse` is off this just retransmits (classic path).
-    fn emit_block<'a>(
-        &mut self,
-        b: &tuigui_streamer::blocks::MicroBlock,
-        slot: usize,
-        on_event: &mut impl FnMut(EncoderEvent) -> Result<(), EncoderError>,
-        origin: (u16, u16),
-        placement: BlockPlacement,
-    ) -> Result<(), EncoderError> {
-        let old = self.block_ids[slot].take();
-        if self.config.tile_reuse {
-            let payload = self.tile_payload(b);
-            let hash = self.content_hash(&payload) ^ ((b.payload_width as u64) << 32 | b.payload_height as u64);
-            let hit = self.tile_cache.get(&hash).copied();
-            if let Some(site_id) = hit {
-                // Cache hit: place the existing id, no transmit.
-                self.tile_stats.reused += 1;
-                let tick = self.touch_clock();
-                self.tile_recency.insert(hash, tick);
-                *self.tile_refs.entry(site_id).or_insert(0) += 1;
-                self.block_ids[slot] = Some(site_id);
-                self.slot_hash[slot] = Some(hash);
-                if self.config.debug_reused_tiles {
-                    // Debug: instead of placing the cached id, re-transmit the
-                    // block tinted a deterministic color derived from its content
-                    // hash, so every tile that would dedupe shows the same color.
-                    // Tint the *raw pixels* (`b.data`) and let the normal encode
-                    // path compress them, so PNG stays a valid PNG (tinting the
-                    // already-encoded payload would corrupt a PNG header, which
-                    // is what made these tiles render transparent).
-                    let tinted_block = tuigui_streamer::blocks::MicroBlock {
-                        data: tint_raw(&b.data, hash),
-                        ..b.clone()
-                    };
-                    let bid = self.image_id;
-                    self.image_id = self.image_id.wrapping_add(1);
-                    self.block_ids[slot] = Some(bid);
-                    on_event(EncoderEvent::Bytes(transmit_block(
-                        &tinted_block,
-                        &base_control_for_block(&tinted_block, bid, placement),
-                        self.config.png,
-                        self.config.color_bits,
-                        origin,
-                        placement,
-                        self.config.zlib,
-                    )))?;
-                } else {
-                    on_event(EncoderEvent::Bytes(place_block(
-                        b,
-                        site_id,
-                        placement,
-                        origin,
-                    )))?;
-                }
-            } else {
-                // Cache miss: transmit under a fresh id and record it.
-                self.tile_stats.transmitted += 1;
-                let bid = self.image_id;
-                self.image_id = self.image_id.wrapping_add(1);
-                self.block_ids[slot] = Some(bid);
-                self.slot_hash[slot] = Some(hash);
-                self.record_tile(hash, bid, &payload)?;
-                on_event(EncoderEvent::Bytes(transmit_block_payload(
-                    b,
-                    &base_control_for_block(b, bid, placement),
-                    origin,
-                    placement,
-                    &payload,
-                    if self.config.png { 100 } else { 32 },
-                    self.config.zlib,
-                )))?;
-            }
-            if let Some(old) = old {
-                self.drop_tile_ref(old);
-            }
-            self.evict_if_over_capacity(on_event)?;
-        } else {
-            let bid = self.image_id;
-            self.image_id = self.image_id.wrapping_add(1);
-            self.block_ids[slot] = Some(bid);
-            self.slot_hash[slot] = Some(0u64.wrapping_add(self.image_id as u64));
-            on_event(EncoderEvent::Bytes(transmit_block(
-                b,
-                &base_control_for_block(b, bid, placement),
-                self.config.png,
-                self.config.color_bits,
-                origin,
-                placement,
-                self.config.zlib,
-            )))?;
-            if let Some(old) = old {
-                on_event(EncoderEvent::Bytes(delete_image(old)))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Advance the LRU recency clock and return its new tick.
-    fn touch_clock(&mut self) -> u64 {
-        self.tile_clock = self.tile_clock.wrapping_add(1);
-        self.tile_clock
-    }
-
-    /// Fast, stable 64-bit hash of the payload (FxHash-style folding is fine;
-    /// we only need collision resistance against identical-content caching).
-    fn content_hash(&self, payload: &[u8]) -> u64 {
-        const SEED: u64 = 0x9E_3779_B9_7F_4A_7C15;
-        let mut h = SEED;
-        for &b in payload {
-            h = h ^ (b as u64);
-            h = h.wrapping_mul(0x100_0000_01B3);
-        }
-        h
-    }
-
-    /// Record a freshly-transmitted tile in the content cache under `hash`.
-    fn record_tile<'a>(
-        &mut self,
-        hash: u64,
-        bid: u32,
-        payload: &[u8],
-    ) -> Result<(), EncoderError> {
-        self.tile_cache.insert(hash, bid);
-        let tick = self.touch_clock();
-        self.tile_recency.insert(hash, tick);
-        self.tile_size.insert(hash, payload.len());
-        *self.tile_refs.entry(bid).or_insert(0) += 1;
-        Ok(())
-    }
-
-    /// A block slot has moved off `site_id` (either to different content or the
-    /// slot was covered). Drop its placement reference; if it reaches zero and
-    /// the terminal still holds it, it is left in place for future reuse (it
-    /// only gets a delete when evicted from the bounded cache).
-    fn drop_tile_ref(&mut self, site_id: u32) {
-        if let Some(count) = self.tile_refs.get_mut(&site_id) {
-            *count = count.saturating_sub(1);
-        }
-    }
-
-    /// Bound the tile cache to the grid's worth of stored images: when a
-    /// column/row count changes in flight the cap is `n_slots × 2`; we evict
-    /// least-recently-used ids that no on-screen placement references (delete
-    /// them from the terminal) until under the cap. Refcounted (live) entries
-    /// below the cap are kept; a live id that crosses the cap is deleted only
-    /// once, when its last placement moves off.
-    fn evict_if_over_capacity<'a>(
-        &mut self,
-        on_event: &mut impl FnMut(EncoderEvent) -> Result<(), EncoderError>,
-    ) -> Result<(), EncoderError> {
-        // The terminal store bound is not measured here; each slot holds at
-        // most 2 ids (current + displaced), so the natural cap is grid size.
-        const CAP: usize = 64;
-        if self.tile_cache.len() <= CAP {
-            return Ok(());
-        }
-        // Collect evictable hashes: zero refcount, oldest recency.
-        let mut candidates: Vec<(u64, u64)> = self
-            .tile_cache
-            .iter()
-            .filter(|(_, id)| self.tile_refs.get(id).map(|c| *c == 0).unwrap_or(true))
-            .map(|(h, _)| (*h, self.tile_recency.get(h).copied().unwrap_or(0)))
-            .collect();
-        candidates.sort_by_key(|(_, r)| *r);
-        for (hash, _) in candidates {
-            if self.tile_cache.len() <= CAP {
-                break;
-            }
-            if let Some(id) = self.tile_cache.remove(&hash) {
-                self.tile_recency.remove(&hash);
-                self.tile_size.remove(&hash);
-                self.tile_refs.remove(&id);
-                on_event(EncoderEvent::Bytes(delete_image(id)))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Share of the block grid currently occupied by *distinct* tile contents,
-    /// as a percent 0..=100. Unique = number of distinct content hashes across
-    /// all on-screen slots, over the total slots. Independent of whether tile
-    /// reuse is enabled (it reflects what's on screen, not what we transmitted).
-    fn unique_tile_pct(&self) -> u32 {
-        let total = self.slot_hash.len().max(1);
-        let distinct = self
-            .slot_hash
-            .iter()
-            .filter_map(|h| *h)
-            .collect::<std::collections::HashSet<_>>()
-            .len();
-        (distinct * 100 / total) as u32
-    }
-
-    /// Drain the rendering queue from the front, transmitting tiles until
-    /// adding the next would exceed `budget` *payload* pixels
-    /// (`payload_width × payload_height`, i.e. the resolution the tile was
-    /// actually settled at). The rest stay queued for the next frame. Emits
-    /// transmit+place + delete-displaced pairs for each drained tile.
-    fn drain_render_queue(
-        &mut self,
-        budget: u64,
-        on_event: &mut impl FnMut(EncoderEvent) -> Result<(), EncoderError>,
-        origin: (u16, u16),
-        placement: BlockPlacement,
-    ) -> Result<(), EncoderError> {
-        let mut spent: u64 = 0;
-        for (slot, block) in std::mem::take(&mut self.render_queue) {
-            let cost = block.payload_width as u64 * block.payload_height as u64;
-            if spent + cost > budget {
-                // Keep this tile (and everything behind it) for the next frame.
-                self.render_queue.push((slot, block));
-                continue;
-            }
-            spent += cost;
-            self.emit_block(&block, slot, on_event, origin, placement)?;
-        }
-        Ok(())
     }
 
     /// Encode the full lifetime of a source into events. Drives `source` to
@@ -578,8 +215,8 @@ impl TgpEncoder {
         // `source.metadata()` (which for a live capture is best-effort and may
         // differ from what the compositor actually announces).
         let mut last_meta: Option<FrameMetadata> = None;
-        // id of the image currently on screen, to delete after the next frame
-        // replaces it.
+        // id of the image currently on screen in full-frame mode, to delete
+        // after the next frame replaces it.
         let mut prev_image_id: Option<u32> = None;
 
         // Control block for this frame's image. Placement rect (`c`,`r`) is
@@ -606,18 +243,6 @@ impl TgpEncoder {
                 }
                 FrameUpdate::Idle => continue,
                 FrameUpdate::Ended => {
-                    // Delete the image currently on screen (the last placed one).
-                    if let Some(prev) = prev_image_id {
-                        on_event(EncoderEvent::Bytes(delete_image(prev)))?;
-                    }
-                    // In block mode, delete every block image still on screen.
-                    for old in self.block_ids.iter().flatten() {
-                        on_event(EncoderEvent::Bytes(delete_image(*old)))?;
-                    }
-                    self.block_ids.clear();
-                    // Discard any blocks still queued (they were never emitted,
-                    // so they hold no on-screen id to delete).
-                    self.render_queue.clear();
                     on_event(EncoderEvent::Ended)?;
                     return Ok(());
                 }
@@ -644,49 +269,63 @@ impl TgpEncoder {
                         damage = frame.damage.len(),
                         "encoder frame start"
                     );
-                    // Use a fresh image id every frame. Re-transmitting the
-                    // same id deletes the on-screen placement (spec), which
-                    // blanks the pane for the whole transmit -> flicker. A
-                    // new id transmits and places over the old image with no
-                    // delete gap; the prior image is deleted once it's covered.
+                    // Use a fresh image id every frame (full-frame mode).
+                    // Re-transmitting the same id deletes the on-screen
+                    // placement (spec), which blanks the pane for the whole
+                    // transmit -> flicker. A new id transmits and places over
+                    // the old image with no delete gap; the prior image is
+                    // deleted once it's covered.
                     let cur_id = self.image_id;
                     self.image_id = self.image_id.wrapping_add(1);
                     // Announce the frame before its payload so the consumer can
                     // timestamp it for capture/latency telemetry. The bytes are
                     // produced inline, so time the encoding here.
                     let t_encode = Instant::now();
-                    if let Some(grid) = self.blocks.as_mut() {
-                        // Block mode: diff against the previous frame and
-                        // retransmit only changed blocks. Each block is a
-                        // transmit+place under its own image id, mapped through
-                        // frame->pane scaling so the blocks tile the pane.
-                        let seed = self.frame_count.wrapping_add(1);
-                        let grid_cols = grid.cols() as usize;
-                        let n_slots = (grid.cols() * grid.rows()) as usize;
-                        if self.block_ids.len() != n_slots {
-                            self.block_ids.clear();
-                            self.block_ids.resize(n_slots, None);
-                            self.slot_hash.clear();
-                            self.slot_hash.resize(n_slots, None);
-                        }
-                        let origin = self.config.pane_origin.unwrap_or((0, 0));
-                        let changed = grid.diff(&frame, self.config.debug_blocks, seed);
-                        let placement = BlockPlacement::new(
-                            (frame.metadata.width, frame.metadata.height),
-                            (placement_columns, placement_rows),
-                        );
-                        if self.config.render_pixel_budget > 0 {
-                            self.enqueue_blocks(&changed, n_slots, grid_cols);
-                            self.drain_render_queue(
-                                self.config.render_pixel_budget,
-                                &mut on_event,
-                                origin,
-                                placement,
-                            )?;
+                    // Per-frame block telemetry: edited tiles (a=f) over grid total.
+                    // Full-frame mode edits nothing, so both stay 0.
+                    let (mut edited_this_frame, grid_total): (u32, u32) = {
+                        if let Some(g) = self.blocks.as_ref() {
+                            (0, g.cols() * g.rows())
                         } else {
-                            for b in &changed {
-                                let slot = (b.row as usize) * grid_cols + b.col as usize;
-                                self.emit_block(b, slot, &mut on_event, origin, placement)?;
+                            (0, 0)
+                        }
+                    };
+                    if let Some(grid) = self.blocks.as_mut() {
+                        // Animation-backed block mode: the whole canvas is one
+                        // image whose root frame (frame 1) was placed on the
+                        // first frame. Each later frame diffs against the
+                        // previous and emits `a=f` edits that compose changed
+                        // blocks back into that same root frame in place at
+                        // their grid rect — no per-block image ids, placements
+                        // or deletes. Static blocks emit nothing: the canvas
+                        // keeps showing them.
+                        let seed = self.frame_count.wrapping_add(1);
+                        let changed = grid.diff(&frame, self.config.debug_blocks, seed);
+                        edited_this_frame = (changed.len() as u32).min(grid_total);
+                        if !self.anim_root_placed {
+                            // First frame: transmit+place the full canvas as the
+                            // root image. This creates the animation image and
+                            // its frame 1 (the canvas). Every later edit targets
+                            // this same id, so no further transmits are needed.
+                            let root_id = self.image_id;
+                            self.image_id = self.image_id.wrapping_add(1);
+                            for bytes in full_frame_commands(
+                                &frame,
+                                &base_control(&frame.metadata, root_id, placement_columns, placement_rows),
+                                self.config.png,
+                                self.config.color_bits,
+                                self.config.zlib,
+                            ) {
+                                on_event(EncoderEvent::Bytes(bytes))?;
+                            }
+                            self.anim_image_id = Some(root_id);
+                            self.anim_root_placed = true;
+                        }
+                        let root_id = self.anim_image_id.unwrap_or(cur_id);
+                        // Emit an in-place a=f edit for each changed block.
+                        for b in &changed {
+                            for c in animation_frame_edit(root_id, b, self.config.png, self.config.color_bits, self.config.zlib) {
+                                on_event(EncoderEvent::Bytes(c))?;
                             }
                         }
                         self.frame_count += 1;
@@ -729,9 +368,8 @@ impl TgpEncoder {
                         pacing_ms,
                         encode_ms,
                         timing: frame.timing,
-                        tile_reused: self.tile_stats.reused,
-                        tile_transmitted: self.tile_stats.transmitted,
-                        tile_unique_pct: self.unique_tile_pct(),
+                        tiles_edited: edited_this_frame,
+                        tiles_total: grid_total,
                     })?;
                 }
             }
@@ -853,112 +491,55 @@ fn base_control(
     c
 }
 
-/// Maps a block's source-pixel rect through the frame->pane scale onto the
-/// on-screen cell grid, so changed blocks tile the pane exactly like full-frame
-/// mode (which scales the whole frame to fill `placement_columns x rows`).
-#[derive(Debug, Clone, Copy)]
-struct BlockPlacement {
-    /// Source frame pixel dimensions.
-    frame_w: u32,
-    frame_h: u32,
-    /// On-screen pane size in cells.
-    pane_cells: (u32, u32),
-}
-
-impl BlockPlacement {
-    fn new(frame: (u32, u32), pane_cells: (u32, u32)) -> Self {
-        BlockPlacement { frame_w: frame.0, frame_h: frame.1, pane_cells }
-    }
-
-    /// Block's top-left cell within the pane.
-    fn cell_origin(&self, x: u32, y: u32) -> (u32, u32) {
-        let (fw, fh) = (self.frame_w.max(1), self.frame_h.max(1));
-        let (pc, pr) = (self.pane_cells.0.max(1), self.pane_cells.1.max(1));
-        let cx = (x as u64 * pc as u64 / fw as u64) as u32;
-        let cy = (y as u64 * pr as u64 / fh as u64) as u32;
-        (cx, cy)
-    }
-
-    /// Cell width/height the block spans on screen.
-    fn cell_size(&self, b: &tuigui_streamer::blocks::MicroBlock) -> (u32, u32) {
-        let (cx0, cy0) = self.cell_origin(b.x, b.y);
-        let (cx1, cy1) = self.cell_origin(b.x + b.width, b.y + b.height);
-        ((cx1 - cx0).max(1), (cy1 - cy0).max(1))
-    }
-}
-
-/// Transmit + place for a single changed micro-block. The block's source rect
-/// (pixels) is mapped through the frame->pane scale into an on-screen cell
-/// rect that tiles the pane: the cursor is moved to the block's top-left cell
-/// and the block's pixels are scaled to fill exactly that cell extent (so
-/// adjacent blocks tile the pane, matching full-frame mode).
-fn transmit_block(
+/// Emit an in-place kitty animation-frame edit (`a=f`) that composes a changed
+/// block's full-resolution pixels back into the root frame of `image_id` at the
+/// block's grid rect. Because the terminal writes the payload 1:1 (no upscale
+/// — see `completeAnimationFrame`), the payload must be the block's full-res
+/// data, which is why the LOD ladder is disabled for the animation backend.
+///
+/// Keys: `i`=image (the whole-canvas root), `r=1` edit frame 1 (the root, which
+/// is the displayed frame — editing it bumps generation and redraws the
+/// placement), `x`/`y` the block's top-left source pixel, `s`/`v` the payload
+/// size, `X=1` overwrite (not alpha-blend).
+fn animation_frame_edit(
+    image_id: u32,
     b: &tuigui_streamer::blocks::MicroBlock,
-    control: &[(char, String)],
     png: bool,
     color_bits: u8,
-    pane_origin: (u16, u16),
-    placement: BlockPlacement,
     zlib: bool,
-) -> Vec<u8> {
+) -> Vec<Vec<u8>> {
+    let fmt = if png { 100u32 } else { 32u32 };
     let payload = if png {
         encode_png(&b.data, b.payload_width, b.payload_height, color_bits)
     } else {
         b.data.clone()
     };
-    transmit_block_payload(b, control, pane_origin, placement, &payload, if png { 100 } else { 32 }, zlib)
-}
-
-/// Transmit + place for a single changed micro-block, using an already-computed
-/// `payload` (so callers that hashed it for tile reuse don't encode twice). The
-/// block's source rect is mapped through the frame->pane scale into an
-/// on-screen cell rect that tiles the pane.
-fn transmit_block_payload(
-    b: &tuigui_streamer::blocks::MicroBlock,
-    control: &[(char, String)],
-    pane_origin: (u16, u16),
-    placement: BlockPlacement,
-    payload: &[u8],
-    fmt: u32,
-    zlib: bool,
-) -> Vec<u8> {
-    let (cs, rs) = placement.cell_origin(b.x, b.y);
-    let cur_col = pane_origin.0 as u32 + cs;
-    let cur_row = pane_origin.1 as u32 + rs;
-
-    let mut out = Vec::new();
-    // Move the cursor to the block's top-left cell (CSI r;c H).
-    out.extend_from_slice(format!("\x1b[{};{}H", cur_row + 1, cur_col + 1).as_bytes());
-    let mut ctrl: Vec<(char, String)> = vec![('a', "T".into()), ('C', "1".into())];
-    ctrl.extend(control.iter().cloned());
-    for c in tgp::chunked_transmit(fmt, ctrl, payload, zlib) {
-        out.extend_from_slice(&c);
-    }
-    out
-}
-
-/// Control block for a changed micro-block: a fresh id, source dims = the
-/// *full-resolution* source pixel size of the block (the terminal scales this
-/// intrinsic size to fill the on-screen rect), and a placement rect (`c`/`r`
-/// in cells) sized to the block's on-screen cell extent after frame->pane
-/// scaling. Because `s`/`v` always describe the full-res rect and `c`/`r` the
-/// same rect's cell span, the terminal upscales a downscaled payload to fill
-/// the block, tiling with adjacent blocks and matching full-frame mode.
-fn base_control_for_block(
-    b: &tuigui_streamer::blocks::MicroBlock,
-    image_id: u32,
-    placement: BlockPlacement,
-) -> Vec<(char, String)> {
-    let (c, r) = placement.cell_size(b);
-    vec![
+    let ctrl: Vec<(char, String)> = vec![
+        ('a', "f".into()),
         ('i', image_id.to_string()),
-        ('s', b.width.to_string()),
-        ('v', b.height.to_string()),
-        ('c', c.to_string()),
-        ('r', r.to_string()),
-        ('p', 1u32.to_string()),
-    ]
+        ('r', "1".into()),
+        ('x', b.x.to_string()),
+        ('y', b.y.to_string()),
+        ('s', b.payload_width.to_string()),
+        ('v', b.payload_height.to_string()),
+        ('X', "1".into()),
+    ];
+    tgp::chunked_transmit(fmt, ctrl, &payload, zlib)
 }
+
+/// Delete a stored image from the terminal.
+fn delete_image(image_id: u32) -> Vec<u8> {
+    tgp::command(
+        &[
+            ('a', "d".into()),
+            ('d', "i".into()),
+            ('i', image_id.to_string()),
+            ('A', "1".into()),
+        ],
+        &[],
+    )
+}
+
 
 /// Compress raw RGBA/RGB pixel data into a PNG byte string (in-memory).
 ///
@@ -1025,83 +606,11 @@ fn round_channels(data: &[u8], bits: u8) -> Vec<u8> {
     out
 }
 
-fn delete_image(image_id: u32) -> Vec<u8> {
-    tgp::command(
-        &[
-            ('a', "d".into()),
-            ('d', "i".into()),
-            ('i', image_id.to_string()),
-            ('A', "1".into()),
-        ],
-        &[],
-    )
-}
-
-/// Place an already-transmitted image at the block's on-screen cell without
-/// re-transmitting any pixels. This is a proper *untracked* placement: `p=0`
-/// lets the same image id be placed at many cells simultaneously (tracked
-/// placements, `p=1..`, replace each other per the spec, which is what made
-/// reused tiles go transparent — each later reuse moved the single placement).
-///
-/// `C=1` keeps the cursor put; `c`/`r` scale the stored image to the block's
-/// on-screen cell span so it tiles exactly like a fresh transmit would. No
-/// `s`/`v`/`p=1`: the image's own pixels are the source, drawn to `c`x`r`.
-fn place_block(
-    b: &tuigui_streamer::blocks::MicroBlock,
-    image_id: u32,
-    placement: BlockPlacement,
-    pane_origin: (u16, u16),
-) -> Vec<u8> {
-    let (cs, rs) = placement.cell_origin(b.x, b.y);
-    let cur_col = pane_origin.0 as u32 + cs;
-    let cur_row = pane_origin.1 as u32 + rs;
-    let (c, r) = placement.cell_size(b);
-    let mut out = Vec::new();
-    out.extend_from_slice(format!("\x1b[{};{}H", cur_row + 1, cur_col + 1).as_bytes());
-    let ctrl: Vec<(char, String)> = vec![
-        ('a', "p".into()),
-        ('C', "1".into()),
-        ('i', image_id.to_string()),
-        ('p', 0u32.to_string()),
-        ('c', c.to_string()),
-        ('r', r.to_string()),
-    ];
-    for c in tgp::chunked_transmit(0, ctrl, &[], false) {
-        out.extend_from_slice(&c);
-    }
-    out
-}
 
 fn quiet_probe_reposition() -> Vec<u8> {
     // Placeholder for re-placement after resize: the TUI layer owns cursor
     // management, so this is a no-op marker for now.
     Vec::new()
-}
-
-/// Debug tint for a reused tile: replace every pixel of the raw RGBA/RGB byte
-/// buffer with a solid color derived deterministically from the content `hash`,
-/// so all tiles sharing that content render the same color when re-encoded. This
-/// is what visually flags "these tiles all dedupe to one stored image". Alpha is
-/// forced opaque (so the tile never renders transparent). Operates on the *raw*
-/// pixel bytes, never an encoded PNG, so it cannot corrupt a payload.
-fn tint_raw(data: &[u8], hash: u64) -> bytes::Bytes {
-    let (r, g, b) = (
-        (hash & 0xff) as u8,
-        ((hash >> 8) & 0xff) as u8,
-        ((hash >> 16) & 0xff) as u8,
-    );
-    // Guess bpp from the buffer length so both Rgb24 and Rgba32 work.
-    let bpp = if data.len() % 4 == 0 { 4 } else { 3 };
-    let mut out = data.to_vec();
-    for px in out.chunks_exact_mut(bpp) {
-        px[0] = r;
-        px[1] = g;
-        px[2] = b;
-        if bpp == 4 {
-            px[3] = 0xff;
-        }
-    }
-    bytes::Bytes::from(out)
 }
 
 /// Length in bytes of the base64 encoding of `n` bytes (padded).
@@ -1163,12 +672,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // 2 frames × (transmit+place), delete-of-previous after frame 2, then
-        // delete of the last image on Ended.
-        assert_eq!(strings.len(), 4);
+        // 2 frames × (transmit+place), then delete-of-previous after frame 2.
+        // No delete on Ended: the terminal holds the last image and the
+        // alternate screen clears it on exit.
+        assert_eq!(strings.len(), 3);
         assert!(strings[0].starts_with("\x1b_Gq=2,a=T"));
         assert!(strings[0].contains("a=T"));
-        assert!(strings[3].starts_with("\x1b_Gq=2,a=d"));
+        assert!(strings[2].starts_with("\x1b_Gq=2,a=d"));
     }
 
     /// Extract the `i=<id>` value from a TGP command's control block.
@@ -1199,9 +709,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // 2 frames: transmit+place each, then delete-of-previous after frame 2,
-        // then delete of the last image on Ended -> 4 events.
-        assert_eq!(strings.len(), 4);
+        // 2 frames: transmit+place each, then delete-of-previous after frame 2.
+        // No delete on Ended -> 3 events.
+        assert_eq!(strings.len(), 3);
         assert!(strings[0].starts_with("\x1b_Gq=2,a=T"));
         assert!(strings[0].contains("a=T"));
         assert!(strings[1].starts_with("\x1b_Gq=2,a=T"), "frame 2 must retransmit");
@@ -1213,22 +723,19 @@ mod tests {
         // frame 2's delete targets the previous first-frame id.
         assert!(strings[2].starts_with("\x1b_Gq=2,a=d"));
         assert!(strings[2].contains(&format!("i={id0}")));
-        // final delete removes the last placed image on Ended.
-        assert!(strings[3].starts_with("\x1b_Gq=2,a=d"));
-        assert!(strings[3].contains(&format!("i={id1}")));
     }
 
     #[tokio::test]
-    async fn block_mode_emits_only_changed_blocks_then_quiet() {
+    async fn animation_backend_transmits_root_once_then_edits_changed_blocks() {
         use bytes::Bytes as B;
         // A 40x40 RGBA frame split 2x2 (blocks_per_side=2) gives 4 blocks of
-        // 20x20. Frame 1 transmits all 4; frame 2 changes nothing so emits no
-        // block bytes; frame 3 paints the top-left block differently and only
-        // that block is retransmitted.
-        struct BlkSrc {
-            n: u32,
-            // frame_index -> which block is painted a distinct color.
-        }
+        // 20x20. Frame 1 must transmit+place the whole canvas as the root
+        // animation image (one `a=T`, no per-block transmits). Frame 2 changes
+        // nothing -> only the single root transmit has happened, no further
+        // bytes. Frame 3 repaints the top-left block -> one `a=f` edit targeting
+        // the SAME root image id at x=0,y=0, and nothing else (no per-block
+        // transmits, placements or deletes).
+        struct BlkSrc { n: u32 }
         #[async_trait]
         impl FrameSource for BlkSrc {
             fn metadata(&self) -> FrameMetadata {
@@ -1239,15 +746,13 @@ mod tests {
                     return Ok(Some(FrameUpdate::Ended));
                 }
                 self.n -= 1;
-                let gen = self.n; // 2, 1, 0 => three frames then Ended
-                // Frames 1, 2, 3 all use the same solid gray base; only the
-                // last frame differs in its top-left block (painted white).
+                let gen = self.n; // 2,1,0 => three frames then Ended
                 let mut data = vec![0u8; 40 * 40 * 4];
                 for b in 0..(40 * 40) {
                     data[b * 4..b * 4 + 4].copy_from_slice(&[5, 5, 5, 255]);
                 }
                 if gen == 0 {
-                    // Repaint top-left 20x20 to a different color.
+                    // Repaint the top-left 20x20 block to white.
                     for y in 0..20 {
                         for x in 0..20 {
                             let i = (y * 40 + x) as usize * 4;
@@ -1265,54 +770,53 @@ mod tests {
             placement_columns: 40,
             placement_rows: 40,
             png: false, // deterministic raw payload
-            tile_reuse: false, // this test verifies diffing, not dedupe
             ..EncoderConfig::default()
         };
         let mut enc = TgpEncoder::new(cfg);
         let mut src = BlkSrc { n: 3 };
         let mut events = Vec::new();
         enc.run(&mut src, |e| { events.push(e); Ok(()) }).await.unwrap();
-        let blocks: Vec<String> = events
+        let bytes: Vec<String> = events
             .iter()
             .filter_map(|e| match e {
                 EncoderEvent::Bytes(b) => Some(String::from_utf8(b.clone()).unwrap()),
                 _ => None,
             })
             .collect();
-        // Every placed block's transmit event(*) carries a cursor move then a
-        // `a=T` transmit. Frame 1 -> 4 blocks; frame 2 (unchanged) -> 0;
-        // frame 3 -> 1 changed (top-left).
-        let mut transmit_events = 0;
-        let mut delete_events = 0;
-        for s in &blocks {
-            if s.contains("a=T") && s.contains("\x1b[") {
-                transmit_events += 1;
-            }
-            if s.contains("a=d") {
-                delete_events += 1;
-            }
+
+        // One full-canvas root transmit (a=T), carrying the placement rect.
+        let roots: Vec<&str> = bytes.iter().map(|s| s.as_str()).filter(|s| s.contains("a=T")).collect();
+        assert_eq!(roots.len(), 1, "the whole canvas must be transmitted exactly once");
+        assert!(roots[0].contains("c=40") && roots[0].contains("r=40"), "root placement fills the pane");
+        let root_id = id_of(roots[0]);
+
+        // Every changed block after frame 1 is an a=f edit of the same root id.
+        let edits: Vec<&str> = bytes.iter().map(|s| s.as_str()).filter(|s| s.contains("a=f")).collect();
+        assert_eq!(edits.len(), 5, "frame 1 emits 4 edits (all changed) + frame 3 emits 1 (top-left)");
+        for e in &edits {
+            assert!(e.contains(&format!("i={root_id}")), "edit must target the root image, got: {e}");
+            assert!(e.contains(",r=1,"), "edits update frame 1 (the root), got: {e}");
         }
-        assert_eq!(transmit_events, 5, "4 blocks (first frame) + 1 changed top-left");
-        // Each changed slot places a fresh id (covered, no flicker) and then
-        // deletes the displaced id so the terminal image store stays bounded at
-        // the grid size instead of filling up forever. Frame 3 retransmits the
-        // top-left slot -> 1 displaced delete; Ended frees the 4 on-screen
-        // block images -> 5 deletes total.
-        assert_eq!(delete_events, 5, "1 displaced-slot delete + 4 ended-cleanup deletes");
+        // Top-left edit lands at x=0,y=0 sized 20x20.
+        let top_left = edits[edits.len() - 1];
+        assert!(top_left.contains("x=0") && top_left.contains("y=0"), "top-left block edits at (0,0), got: {top_left}");
+        assert!(top_left.contains("s=20") && top_left.contains("v=20"), "top-left block is 20x20, got: {top_left}");
+        // No per-block transmits, placements or deletes anywhere.
+        assert!(
+            bytes.iter().all(|s| !s.contains("a=p") && !s.contains("a=d")),
+            "animation backend must not place or delete per-tile images"
+        );
     }
 
     #[tokio::test]
-    async fn render_queue_budget_caps_tiles_per_frame_and_spills_over() {
+    async fn animation_backend_static_frames_emit_nothing_after_root() {
         use bytes::Bytes as B;
         use tokio_stream::StreamExt as _;
-        // A static 40x40 frame split 2x2 into 20x20 blocks. The source emits 4
-        // identical frames then Ended. With the budget set to exactly one
-        // full-res 20x20 block (400 px), each frame drains at most one tile from
-        // the queue, so the 4 blocks spill across frames 1-4. This proves both
-        // the per-frame pixel cap and that undrained tiles persist across frames.
-        struct StaticSrc {
-            n: u32,
-        }
+        // Completely static source: frame 1 transmits the root + 4 edits for the
+        // initial changed blocks; every subsequent identical frame emits NOTHING
+        // (no root retransmit, no edits). This proves the diff keeps static
+        // blocks silent under the animation backend.
+        struct StaticSrc { n: u32 }
         #[async_trait]
         impl FrameSource for StaticSrc {
             fn metadata(&self) -> FrameMetadata {
@@ -1333,234 +837,58 @@ mod tests {
             pane_origin: Some((0, 0)),
             placement_columns: 40,
             placement_rows: 40,
-            png: false,             // deterministic raw payload
-            res_levels: 1,          // single rung: level==res_levels -> factor 1 -> full res 20x20 = 400 px
-            render_pixel_budget: 400, // allow exactly one tile per frame
-            tile_reuse: false,      // this test verifies queue budget/spill, not dedupe
+            png: false,
             ..EncoderConfig::default()
         };
         let enc = TgpEncoder::new(cfg);
-        let src = StaticSrc { n: 4 };
+        let src = StaticSrc { n: 5 };
         let mut stream = enc.into_stream(src);
-        let mut transmits = 0usize;
-        // Watch how many transmits appear per frame (between Frame events).
-        // We count total transmits and also split per-frame spends by tracking
-        // a cumulative counter across Frame event boundaries mis, simpler: assert
-        // the total is 4 across 4 frames.
+        // Track bytes between Frame events: after the first frame's root+edits,
+        // every later identical frame must add no bytes.
+        let mut roots = 0usize;
+        let mut edits = 0usize;
         while let Some(item) = stream.next().await {
             match item.unwrap() {
                 EncoderEvent::Bytes(b) => {
                     let s = String::from_utf8_lossy(&b);
-                    if s.contains("a=T") {
-                        transmits += 1;
-                    }
+                    if s.contains("a=T") { roots += 1; }
+                    if s.contains("a=f") { edits += 1; }
                 }
                 EncoderEvent::Frame { .. } => {}
                 EncoderEvent::Ended => break,
             }
         }
-        // 4 blocks, one drained per frame => exactly 4 transmit events total.
-        assert_eq!(transmits, 4, "each 400px tile drains one per frame across 4 frames");
-    }
-
-    #[tokio::test]
-    async fn tile_reuse_dedupes_identical_blocks_to_one_transmit() {
-        use bytes::Bytes as B;
-        use tokio_stream::StreamExt as _;
-        // Uniform 40x40 frame split 2x2 -> four identical 20x20 solid blocks.
-        // With tile_reuse on, the first block transmits and caches; the other
-        // three identical blocks place that same id (`a=p`) instead of
-        // re-transmitting. So a single frame emits exactly one transmit and
-        // three place commands, not four transmits.
-        struct SolidSrc {
-            n: u32,
-        }
-        #[async_trait]
-        impl FrameSource for SolidSrc {
-            fn metadata(&self) -> FrameMetadata {
-                FrameMetadata { width: 40, height: 40, format: PixelFormat::Rgba32 }
-            }
-            async fn next(&mut self) -> Result<Option<FrameUpdate>, SourceError> {
-                if self.n == 0 {
-                    return Ok(Some(FrameUpdate::Ended));
-                }
-                self.n -= 1;
-                let data = vec![0x33u8; 40 * 40 * 4];
-                Ok(Some(FrameUpdate::Frame(Frame::full(self.metadata(), B::from(data)))))
-            }
-        }
-
-        let cfg = EncoderConfig {
-            blocks_per_side: 2,
-            pane_origin: Some((0, 0)),
-            placement_columns: 40,
-            placement_rows: 40,
-            png: false,
-            res_levels: 1, // single rung -> all four blocks are identical full-res 20x20 payloads
-            ..EncoderConfig::default()
-        };
-        let enc = TgpEncoder::new(cfg);
-        let src = SolidSrc { n: 1 };
-        let mut stream = enc.into_stream(src);
-        let (mut transmits, mut places, mut p0_places) = (0usize, 0usize, 0usize);
-        let mut reused_total = 0u64;
-        while let Some(item) = stream.next().await {
-            match item.unwrap() {
-                EncoderEvent::Bytes(b) => {
-                    let s = String::from_utf8_lossy(&b);
-                    if s.contains("a=T") {
-                        transmits += 1;
-                    } else if s.contains("a=p") {
-                        places += 1;
-                        // A reuse place must be an *untracked* placement (`p=0`)
-                        // so the same id can occupy several cells at once; a
-                        // tracked `p=1..` placement would replace the previous
-                        // one, blanking tiles (the transparency bug).
-                        assert!(s.contains("p=0"), "reuse place must be untracked p=0, got: {s}");
-                        assert!(s.contains("c=") && s.contains("r="), "reuse place must size the block, got: {s}");
-                        p0_places += 1;
-                    }
-                }
-                EncoderEvent::Frame { tile_reused, .. } => reused_total = tile_reused,
-                EncoderEvent::Ended => break,
-            }
-        }
-        assert_eq!(transmits, 1, "only the first identical block is transmitted");
-        assert_eq!(places, 3, "the three other identical blocks place the cached id");
-        assert_eq!(p0_places, 3, "every reuse placement is untracked (p=0)");
-        assert_eq!(reused_total, 3, "Frame telemetry counts the 3 reused tiles");
-    }
-
-    #[tokio::test]
-    async fn tile_reuse_disabled_retransmits_every_block() {
-        use bytes::Bytes as B;
-        use tokio_stream::StreamExt as _;
-        // Same uniform frame as above, but tile_reuse off: all four identical
-        // blocks are re-transmitted individually (classic behaviour).
-        struct SolidSrc {
-            n: u32,
-        }
-        #[async_trait]
-        impl FrameSource for SolidSrc {
-            fn metadata(&self) -> FrameMetadata {
-                FrameMetadata { width: 40, height: 40, format: PixelFormat::Rgba32 }
-            }
-            async fn next(&mut self) -> Result<Option<FrameUpdate>, SourceError> {
-                if self.n == 0 {
-                    return Ok(Some(FrameUpdate::Ended));
-                }
-                self.n -= 1;
-                let data = vec![0x33u8; 40 * 40 * 4];
-                Ok(Some(FrameUpdate::Frame(Frame::full(self.metadata(), B::from(data)))))
-            }
-        }
-
-        let cfg = EncoderConfig {
-            blocks_per_side: 2,
-            pane_origin: Some((0, 0)),
-            placement_columns: 40,
-            placement_rows: 40,
-            png: false,
-            res_levels: 1,
-            tile_reuse: false,
-            ..EncoderConfig::default()
-        };
-        let enc = TgpEncoder::new(cfg);
-        let src = SolidSrc { n: 1 };
-        let mut stream = enc.into_stream(src);
-        let (mut transmits, mut places) = (0usize, 0usize);
-        while let Some(item) = stream.next().await {
-            match item.unwrap() {
-                EncoderEvent::Bytes(b) => {
-                    let s = String::from_utf8_lossy(&b);
-                    if s.contains("a=T") {
-                        transmits += 1;
-                    } else if s.contains("a=p") {
-                        places += 1;
-                    }
-                }
-                EncoderEvent::Frame { .. } => {}
-                EncoderEvent::Ended => break,
-            }
-        }
-        assert_eq!(transmits, 4, "with reuse off every identical block is retransmitted");
-        assert_eq!(places, 0);
-    }
-
-    #[tokio::test]
-    async fn debug_reused_tiles_tints_every_same_content_block() {
-        use bytes::Bytes as B;
-        use tokio_stream::StreamExt as _;
-        // four identical solid blocks with reuse on + debug tint: instead of
-        // placing the cached id for the last three, the encoder re-transmits
-        // each as a tinted solid of the *same* content-derived color, proving
-        // which tiles would dedupe. Every tinted tile must use one color.
-        struct SolidSrc {
-            n: u32,
-        }
-        #[async_trait]
-        impl FrameSource for SolidSrc {
-            fn metadata(&self) -> FrameMetadata {
-                FrameMetadata { width: 40, height: 40, format: PixelFormat::Rgba32 }
-            }
-            async fn next(&mut self) -> Result<Option<FrameUpdate>, SourceError> {
-                if self.n == 0 {
-                    return Ok(Some(FrameUpdate::Ended));
-                }
-                self.n -= 1;
-                let data = vec![0x21u8; 40 * 40 * 4];
-                Ok(Some(FrameUpdate::Frame(Frame::full(self.metadata(), B::from(data)))))
-            }
-        }
-        let cfg = EncoderConfig {
-            blocks_per_side: 2,
-            pane_origin: Some((0, 0)),
-            placement_columns: 40,
-            placement_rows: 40,
-            png: false,
-            res_levels: 1,
-            debug_reused_tiles: true,
-            ..EncoderConfig::default()
-        };
-        let enc = TgpEncoder::new(cfg);
-        let src = SolidSrc { n: 1 };
-        let mut stream = enc.into_stream(src);
-        let mut transmits = 0usize;
-        let mut places = 0usize;
-        while let Some(item) = stream.next().await {
-            match item.unwrap() {
-                EncoderEvent::Bytes(b) => {
-                    let s = String::from_utf8_lossy(&b);
-                    if s.contains("a=T") {
-                        transmits += 1;
-                    } else if s.contains("a=p") {
-                        places += 1;
-                    }
-                }
-                EncoderEvent::Frame { .. } => {}
-                EncoderEvent::Ended => break,
-            }
-        }
-        // Reuse is still detected (cache), but debug tint re-transmits all four
-        // tinted blocks instead of placing three. No place commands.
-        assert_eq!(transmits, 4, "debug tint re-transmits every block, none placed");
-        assert_eq!(places, 0);
+        assert_eq!(roots, 1, "root canvas transmitted exactly once");
+        assert_eq!(edits, 4, "only the first frame's 4 initial changed blocks are edited");
     }
 
     #[test]
-    fn debug_tint_raw_keeps_png_valid() {
-        // Tinting corrupts a *payload* if it's already PNG, which made reused
-        // tiles transparent. Tinting raw pixels and re-encoding must still emit
-        // a decodeable PNG (starts with the 8-byte signature).
-        let raw = vec![0x33u8; 20 * 20 * 4]; // 20x20 RGBA
-        let tinted = tint_raw(&raw, 0x11223344);
-        // Alpha forced opaque.
-        assert!(tinted.iter().enumerate().all(|(i, &v)| (i % 4) != 3 || v == 0xff));
-        // Re-encode as PNG: must start with the PNG signature, proving the raw
-        // pixel buffer (not an encoded payload) is what the extras expects.
-        let png = encode_png(&tinted, 20, 20, 8);
-        assert!(png.starts_with(b"\x89PNG"), "re-encoded tinted raw must be a valid PNG");
+    fn animation_frame_edit_uses_root_frame_and_in_place_rect() {
+        // A synthetic a=f control block must target the root (r=1), place the
+        // payload at the block's x/y, size it to the payload, and overwrite.
+        let b = tuigui_streamer::blocks::MicroBlock {
+            col: 1,
+            row: 0,
+            x: 20,
+            y: 0,
+            width: 20,
+            height: 20,
+            level: 1,
+            payload_width: 20,
+            payload_height: 20,
+            data: bytes::Bytes::from(vec![0u8; 20 * 20 * 4]),
+        };
+        let chunks = animation_frame_edit(777, &b, false, 8, false);
+        assert_eq!(chunks.len(), 1, "a 20x20 RGBA raw payload fits one chunk");
+        let s = String::from_utf8(chunks.into_iter().next().unwrap()).unwrap();
+        assert!(s.contains("a=f"), "must be a frame edit, got: {s}");
+        assert!(s.contains("i=777"));
+        assert!(s.contains(",r=1,"), "edits the root (frame 1), got: {s}");
+        assert!(s.contains("x=20") && s.contains("y=0"));
+        assert!(s.contains("s=20") && s.contains("v=20"));
+        assert!(s.contains("X=1"), "must overwrite, not alpha-blend, got: {s}");
     }
+
 
     #[tokio::test]
     async fn delta_stream_terminates_with_last_chunk() {

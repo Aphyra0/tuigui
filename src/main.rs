@@ -129,13 +129,6 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     debug_lod: bool,
 
-    /// With --blocks, disable content-addressable tile reuse (on by default).
-    /// When enabled, a changed block whose exact payload bytes are already
-    /// stored on the terminal is placed (not re-transmitted), deduping repeated
-    /// content. Pass --no-tile-reuse to always re-transmit changed blocks.
-    #[arg(long, action = clap::ArgAction::SetFalse, default_value_t = true)]
-    no_tile_reuse: bool,
-
     /// Opt-in zlib compression of transmitted payloads via the Kitty `o=z`
     /// key (RFC 1950), which the terminal inflates before rendering. Off by
     /// default; `--no-zlib` is provided for symmetry / to force it off. When
@@ -144,28 +137,12 @@ struct Cli {
     #[arg(long, action = clap::ArgAction::SetTrue, default_value_t = false)]
     zlib: bool,
 
-    /// With tile reuse, tint would-be-reused tiles a deterministic color derived
-    /// from their content hash and re-transmit them, so every tile sharing the
-    /// same deduped content shows the same color. Visually proves which tiles
-    /// are reused.
-    #[arg(long, default_value_t = false)]
-    debug_reused_tiles: bool,
-
     /// Debuggy block grid: every other block (linear odd index) is filled with
     /// a per-block pseudo-random color that changes each frame; even blocks
     /// carry the real pixels. Visually proves the block grid and per-block
     /// diffing. Implies `--blocks 4` if not already set.
     #[arg(long, default_value_t = false)]
     debug_blocks: bool,
-
-    /// With --blocks, cap how many payload pixels each frame hands the terminal
-    /// decoder by routing changed blocks through a rendering queue drained up to
-    /// this budget per frame. `0` (default) disables the queue and retransmits
-    /// every changed block inline. Assess the natural budget as
-    /// `(pixels of one tile at the lowest resolution level) x (all on-screen
-    /// tiles)`; supply it here explicitly by that value (see spec/RENDER_QUEUE.md).
-    #[arg(long, value_name = "PIXELS", default_value_t = 0)]
-    render_pixel_budget: u64,
 }
 
 #[tokio::main]
@@ -252,10 +229,7 @@ async fn main() -> Result<()> {
         debug_lod: cli.debug_lod,
         debug_blocks: cli.debug_blocks,
         pane_origin: Some((0, 0)),
-        render_pixel_budget: cli.render_pixel_budget,
-        tile_reuse: cli.no_tile_reuse,
         zlib: cli.zlib,
-        debug_reused_tiles: cli.debug_reused_tiles,
     });
     let mut tgp_stream = encoder.into_stream(source);
 
@@ -617,6 +591,12 @@ async fn run_ui(
             crossterm::execute!(out, crossterm::cursor::MoveTo(rect.x, rect.y))?;
         }
         let mut written_chunks = 0usize;
+        // Peak tiles edited / total observed across this drain batch. The
+        // encoder can flood many source frames (most near-identical tails) per
+        // UI iteration, so the *last* Frame event would usually read ~0%; take
+        // the max so a real change spike survives to the next draw.
+        let mut batch_tiles_edited: u32 = 0;
+        let mut batch_tiles_total: u32 = 0;
         let mut written_bytes = 0usize;
         // Time the buffered writes (bytes into userspace) separately from the
         // flush that pushes them to the terminal. `stdout` is a LineWriter, so
@@ -650,7 +630,7 @@ async fn run_ui(
                 // even when the encoder idles between frames. Spinning on
                 // empty chunks would busy-loop and starve input polling.
                 Ok(Some(Ok(EncoderEvent::Bytes(_)))) => break,
-                Ok(Some(Ok(EncoderEvent::Frame { width, height, capture_ms, pacing_ms, encode_ms, timing, tile_reused, tile_transmitted, tile_unique_pct }))) => {
+                Ok(Some(Ok(EncoderEvent::Frame { width, height, capture_ms, pacing_ms, encode_ms, timing, tiles_edited, tiles_total }))) => {
                     // Record the frame's resolution and capture cost into the
                     // rolling window.
                     frame_count_accum += 1;
@@ -658,9 +638,8 @@ async fn run_ui(
                     pacing_ms_accum += pacing_ms;
                     encode_ms_accum += encode_ms;
                     stats.resolution = (width, height);
-                    stats.tile_reused = tile_reused;
-                    stats.tile_transmitted = tile_transmitted;
-                    stats.tile_unique_pct = tile_unique_pct;
+                    batch_tiles_edited = batch_tiles_edited.max(tiles_edited);
+                    batch_tiles_total = batch_tiles_total.max(tiles_total);
                     if let Some(t) = timing {
                         announce_accum += t.announce_ms;
                         setup_accum += t.setup_ms;
@@ -684,6 +663,9 @@ async fn run_ui(
                 Err(_elapsed) => break,
             }
         }
+        // Fold this batch's peak tile-edit fraction into displayed stats.
+        stats.tiles_edited = batch_tiles_edited;
+        stats.tiles_total = batch_tiles_total;
         let write_ms = write_t0.elapsed().as_secs_f64() * 1000.0;
         let flush_t0 = std::time::Instant::now();
         out.flush()?;

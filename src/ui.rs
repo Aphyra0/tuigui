@@ -31,13 +31,9 @@ pub struct Stats {
     pub setup_ms: f64,
     pub copy_ms: f64,
     pub readout_ms: f64,
-    /// Cumulative tiles reusing an already-uploaded id (no transmit), block mode.
-    pub tile_reused: u64,
-    /// Cumulative tiles that transmitted a fresh payload, block mode.
-    pub tile_transmitted: u64,
-    /// Percent of on-screen tiles that are distinct content (unique/ all tiles),
-    /// from the last frame's block grid.
-    pub tile_unique_pct: u32,
+    /// Tiles edited (a=f) in the last frame, over the total block grid slots.
+    pub tiles_edited: u32,
+    pub tiles_total: u32,
 }
 
 /// Render the shell and return the area the TGP image should be placed into —
@@ -55,13 +51,9 @@ pub fn draw(f: &mut Frame, app: &str, status: &str, stats: &Stats) -> Rect {
     } else {
         String::new()
     };
-    let tile_hr = stats.tile_reused + stats.tile_transmitted;
-    let tiles = if tile_hr > 0 {
-        let pct = stats.tile_reused as f64 * 100.0 / tile_hr as f64;
-        format!(
-            " · Tiles: {} re-used · {} sent · {:.0}% hit · {}% unique",
-            stats.tile_reused, stats.tile_transmitted, pct, stats.tile_unique_pct
-        )
+    let tiles = if stats.tiles_total > 0 {
+        let pct = stats.tiles_edited as f64 * 100.0 / stats.tiles_total as f64;
+        format!("  ·  Tiles: {:.0}% updated", pct)
     } else {
         String::new()
     };
