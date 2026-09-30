@@ -6,7 +6,8 @@
 //!    walks them through a synchronous fade: every tile starts white, ramps
 //!    linearly toward black over `n_frames` (derived from the interval so the
 //!    whole fade lasts `--duration-ms`, default 1s), and the last frame flashes
-//!    them all bright red before exiting. Purpose: probe whether a terminal/sink
+//!    them all bright red, holds it for 500ms regardless of pacing, then
+//!    exits. Purpose: probe whether a terminal/sink
 //!    keeps up — if it lags behind the sequence it won't land on red, exposing
 //!    where the pipeline throttles. Reuse/merge/delta logic is deliberately
 //!    absent (every frame re-transmits every tile), giving a ceiling for the raw
@@ -16,10 +17,11 @@
 //!    updating the entire root frame in place each frame (`a=f r=1 x=0 y=0
 //!    s=<w> v=<h> X=1` — the whole rect, never replacing the base frame) under
 //!    a single image id/placement. The path defaults to `CAPY_VID_PATH` (set by
-//!    the dev shell to the public-domain capybara clip). `--duration-ms` caps
-//!    the run; if the file ends before that, playback loops from the top. The
-//!    per-frame cadence stays configurable via `--interval-ms` (or
-//!    `--fps`/`--frame-ms`, whichever is set last).
+//!    the dev shell to the public-domain capybara clip). `--loops` (default 1)
+//!    plays the clip that many times start-to-finish before the 500ms red
+//!    screen; `--duration-ms` still caps the run. The per-frame cadence stays
+//!    configurable via `--interval-ms` (or `--fps`/`--frame-ms`, whichever is
+//!    set last).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -47,6 +49,14 @@ struct Cli {
     /// `--cols x --rows`.
     #[arg(long)]
     blocks: Option<u32>,
+    /// In --video, decode resolution divisor: 1 = full, 2 = half of the
+    /// resolution, 3 = a third, and so on.
+    #[arg(long, default_value_t = 1)]
+    lod: u32,
+    /// In --video, on-screen scale divisor: 1 = full screen, 2 = half of it,
+    /// and so on. The image is physically smaller and takes less terminal space.
+    #[arg(long, default_value_t = 1)]
+    scale: u32,
     /// Milliseconds between each full-grid re-transmit (every tile recolors).
     #[arg(long, default_value_t = 1000)]
     interval_ms: u64,
@@ -77,6 +87,10 @@ struct Cli {
     /// With --video, milliseconds per frame. Overrides a later `--interval-ms`.
     #[arg(long)]
     frame_ms: Option<u64>,
+    /// In --video, how many times the video plays start-to-finish before the
+    /// 500ms red screen. `--duration-ms` still caps the whole run.
+    #[arg(long, default_value_t = 1)]
+    loops: u32,
     /// Do all the work (decode, sample tiles, encode, assert) but write nothing
     /// to stdout — no draw commands escape. Useful to validate the pipeline
     /// without touching the terminal.
@@ -91,28 +105,33 @@ fn main() -> std::io::Result<()> {
     execute!(out, EnterAlternateScreen, cursor::Hide)?;
 
     if cli.video.is_some() {
-        let res = run_video(&mut out, &cli);
+        let mut report = Vec::new();
+        let res = run_video(&mut out, &cli, &mut report);
         crossterm::execute!(out, cursor::Show)?;
         crossterm::execute!(out, event::DisableMouseCapture)?;
         execute!(out, LeaveAlternateScreen)?;
         disable_raw_mode()?;
         let _ = out.flush();
-        return res;
+        for line in report {
+            println!("{line}");
+        }
+        res
+    } else {
+        // collect() the run so the report can be printed AFTER the alternate
+        // screen is left; stdout text written inside the alt buffer disappears
+        // on exit.
+        let mut report = Vec::new();
+        let res = run(&mut out, &cli, &mut report);
+        crossterm::execute!(out, cursor::Show)?;
+        crossterm::execute!(out, event::DisableMouseCapture)?;
+        execute!(out, LeaveAlternateScreen)?;
+        disable_raw_mode()?;
+        let _ = out.flush();
+        for line in report {
+            println!("{line}");
+        }
+        res
     }
-
-    // collect() the run so the report can be printed AFTER the alternate screen
-    // is left; stdout text written inside the alt buffer disappears on exit.
-    let mut report = Vec::new();
-    let res = run(&mut out, &cli, &mut report);
-    crossterm::execute!(out, cursor::Show)?;
-    crossterm::execute!(out, event::DisableMouseCapture)?;
-    execute!(out, LeaveAlternateScreen)?;
-    disable_raw_mode()?;
-    let _ = out.flush();
-    for line in report {
-        println!("{line}");
-    }
-    res
 }
 
 /// Resolve the video path: `-` reads `$CAPY_VID_PATH`, anything else is used
@@ -182,13 +201,13 @@ fn run(out: &mut std::io::Stdout, cli: &Cli, report: &mut Vec<String>) -> std::i
     let static_rate = cli.static_rate.clamp(0.0, 1.0);
     let static_cells = ((cli.rows * cli.cols) as f64 * static_rate).round() as u32;
 
-    // Pre-compute the frame color once per frame (shared by all dynamic tiles).
+    // Fade is white -> black; the red flash is a separate frame appended after
+    // the loop so it always exists (even when the fade is a single frame) and
+    // holds 500ms regardless of pacing.
     for frame in 0..n_frames {
         let t0 = Instant::now();
-        // Last dynamic frame flashes bright red; otherwise fade white -> black.
-        let (cr, cg, cb): (u8, u8, u8) = if frame + 1 == n_frames {
-            (255, 0, 0)
-        } else {
+
+        let (cr, cg, cb): (u8, u8, u8) = {
             let denom = (n_frames.saturating_sub(1)).max(1) as f64;
             let t = frame as f64 / denom; // 0 .. 1
             let v = (255.0 * (1.0 - t)).round().clamp(0.0, 255.0) as u8;
@@ -258,16 +277,83 @@ fn run(out: &mut std::io::Stdout, cli: &Cli, report: &mut Vec<String>) -> std::i
             }
         }
     }
+
+    // Final red flash: separate frame after the fade, held for 500ms starting
+    // only after it has been fully flushed, so it stays visible exactly that
+    // long regardless of pacing or transmit time.
+    {
+        let t0 = Instant::now();
+        let (cr, cg, cb): (u8, u8, u8) = (255, 0, 0);
+        let static_color: (u8, u8, u8) = (255, 255, 255);
+        let mut cell_idx = 0u32;
+        for r in 0..cli.rows {
+            for c in 0..cli.cols {
+                let (x, y) = (c * cell_w, r * cell_h);
+                let is_static = cell_idx < static_cells;
+                cell_idx += 1;
+                let (fr, fg, fb) = if is_static { static_color } else { (cr, cg, cb) };
+                for px in buf.chunks_exact_mut(4) {
+                    px[0] = fr;
+                    px[1] = fg;
+                    px[2] = fb;
+                    px[3] = 0xff;
+                }
+                execute!(out, cursor::MoveTo(x as u16, y as u16))?;
+                let id = 100 + (r * cli.cols + c);
+                let chunks = tuigui_tgp::proto::chunked_transmit(
+                    32,
+                    vec![
+                        ('a', "T".into()),
+                        ('C', "1".into()),
+                        ('i', id.to_string()),
+                        ('s', cli.tile_px.to_string()),
+                        ('v', cli.tile_py.to_string()),
+                        ('c', cell_w.to_string()),
+                        ('r', cell_h.to_string()),
+                    ],
+                    &buf,
+                    false,
+                );
+                for ch in chunks {
+                    out.write_all(&ch)?;
+                }
+            }
+        }
+        std::io::stdout().flush()?;
+        let frame_ms = t0.elapsed();
+        frame_work += frame_ms;
+        tick += 1;
+        report.push(format!(
+            "frame {tick} (red flash): rgb(255,0,0) in {:.2} ms",
+            t0.elapsed().as_secs_f64() * 1000.0
+        ));
+        let hold_start = Instant::now();
+        loop {
+            let elapsed = hold_start.elapsed();
+            if elapsed >= Duration::from_millis(500) {
+                break;
+            }
+            let step = (Duration::from_millis(500) - elapsed).min(Duration::from_millis(50));
+            std::thread::sleep(step);
+            if let Some(true) = poll_quit() {
+                report.push(format!("quitting early during red hold at frame {tick}"));
+                report_elapsed(report, start, frame_work, tick, total_ms, cli.interval_ms);
+                return Ok(());
+            }
+        }
+    }
     report_elapsed(report, start, frame_work, tick, total_ms, cli.interval_ms);
     Ok(())
 }
 
-/// Stream `cli.video`'s FIRST frame as the animation root (`a=T`), then a tiny
-/// probe: one random tile is repainted solid pink via an in-place `a=f r=1`
-/// edit. If pink shows, the terminal renders in-place animation edits.
-/// `--static-rate 1` freezes the whole image on the first frame (no edits at
-/// all), isolating the root transmit from the edit path. `q` quits early.
-fn run_video(out: &mut std::io::Stdout, cli: &Cli) -> std::io::Result<()> {
+/// Stream `cli.video` frame by frame. Each frame is transmitted+placed as a
+/// brand-new image (fresh id per frame); the terminal's image LRU reclaims the
+/// previous frame's image when it ages out, so we never need in-place `a=f`
+/// edits. A fixed tile region (grid slot 2,2) is repainted solid pink on every
+/// frame as a probe: if you see a pink square tracking on top of the video, the
+/// transmit+place pipeline is live end to end. `--static-rate 1` freezes the
+/// whole image on the first frame (nothing is re-transmitted). `q` quits early.
+fn run_video(out: &mut std::io::Stdout, cli: &Cli, report: &mut Vec<String>) -> std::io::Result<()> {
     let path = video_path(cli.video.as_deref().unwrap_or("-"))?;
 
     let explicit_ffmpeg = std::env::var("FFMPEG_BIN").ok();
@@ -283,7 +369,7 @@ fn run_video(out: &mut std::io::Stdout, cli: &Cli) -> std::io::Result<()> {
     crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
 
     let start = Instant::now();
-    let id = 7000u32 + (std::process::id() % 1000);
+    let id_base = 7000u32 + (std::process::id() % 1000);
 
     // In --dry-run, discard all draw bytes instead of writing to stdout; the
     // encode/assert work still runs so the pipeline is validated without
@@ -291,148 +377,261 @@ fn run_video(out: &mut std::io::Stdout, cli: &Cli) -> std::io::Result<()> {
     let mut sink: Box<dyn Write> = if cli.dry_run {
         Box::new(std::io::sink())
     } else {
-        Box::new(std::io::BufWriter::new(out))
+        Box::new(std::io::BufWriter::new(&mut *out))
     };
+
+    // `--lod` divides the decode resolution (2 = half, 3 = a third, ...).
+    let lod = cli.lod.max(1);
+    let (fw, fh) = (fw.max(1) / lod, fh.max(1) / lod);
+
+    // The tile grid geometry (in lod-resolution pixels): the frame is split
+    // into a `div x div` grid. `--blocks` overrides `--cols`; the probe paints
+    // grid slot (2,2) solid pink on every transmitted frame.
+    let div = cli
+        .blocks
+        .unwrap_or(cli.cols)
+        .max(1)
+        .min(fw.max(1));
+    let bw = fw.div_ceil(div);
+    let bh = fh.div_ceil(div);
+    let bx = 2u32;
+    let by = 2u32;
+    let tx = bx * bw;
+    let ty = by * bh;
+    let tw = bw.min(fw - tx);
+    let th = bh.min(fh - ty);
+
+    // `--scale` shrinks the on-screen placement (2 = half the terminal, ...).
+    let scale = cli.scale.max(1);
+    let place_cols = term_cols.max(1) / scale;
+    let place_rows = term_rows.max(1) / scale;
 
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| std::io::Error::other(format!("tokio runtime: {e}")))?;
-    let run_probe: std::io::Result<(u64, usize)> = rt.block_on(async move {
-        // Pull ONLY the first frame from the video as the root; ignore the rest.
+
+    #[derive(Default)]
+    struct Stage {
+        total: Duration,
+        count: u64,
+        max: Duration,
+    }
+    impl Stage {
+        fn record(&mut self, d: Duration) {
+            self.total += d;
+            self.count += 1;
+            if d > self.max {
+                self.max = d;
+            }
+        }
+    }
+    #[derive(Default)]
+    struct Timings {
+        decode: Stage,
+        paint: Stage,
+        encode: Stage,
+        write: Stage,
+        frame: Stage,
+        /// Longest idle gap between consecutive frame timings (a proxy for
+        /// where the pipeline stalls / the terminal backpressure).
+        max_gap: Duration,
+    }
+
+    let loops_target = cli.loops.max(1);
+
+    let run_probe: std::io::Result<(u64, usize, u32, Timings)> = rt.block_on(async move {
         let mut frames = 0u64;
         let mut bytes_total = 0usize;
-        let first = loop {
-            match src.next().await {
-                Ok(Some(tuigui_streamer::source::FrameUpdate::Frame(f))) => break f,
-                Ok(Some(_)) | Ok(None) => {
-                    return Err(std::io::Error::other("no frames in video"));
-                }
-                Err(e) => return Err(std::io::Error::other(format!("video read: {e}"))),
-            }
-        };
-
-        // Root transmit+place of the first frame, scaled by the terminal size (`c`/
-        // `r`) so the full frame is visible regardless of video aspect ratio.
-        let ctrl: Vec<(char, String)> = vec![
-            ('a', "T".into()),
-            ('C', "1".into()),
-            ('i', id.to_string()),
-            ('s', fw.to_string()),
-            ('v', fh.to_string()),
-            ('c', term_cols.to_string()),
-            ('r', term_rows.to_string()),
-            ('p', "1".into()),
-        ];
-        let png = encode_png(&first.data, fw, fh);
-        for ch in tuigui_tgp::proto::chunked_transmit(100u32, ctrl, &png, false) {
-            sink.write_all(&ch)?;
-            bytes_total += ch.len();
-        }
-        frames += 1;
-
-        // Repaint one random tile solid pink via an in-place `a=f r=1` edit.
-        // With `--static-rate >= 1` skip the edit and just hold the root.
-        let pink_edit: Option<Vec<Vec<u8>>> = if cli.static_rate >= 1.0 {
-            None
-        } else {
-            // Pick the capybara tile grid resolution.
-            let div = cli.cols.max(1).min(fw.max(1));
-            let bw = fw.div_ceil(div);
-            let bh = fh.div_ceil(div);
-
-            // Destination: the tile at grid slot (2,2), offset from the top-left
-            // by two tile steps in both axes (clamped to stay in-bounds).
-            let bx = 2u32;
-            let by = 2u32;
-            let x = bx * bw;
-            let y = by * bh;
-            let w = bw.min(fw - x);
-            let h = bh.min(fh - y);
-
-            // Tile placed at dest tile (2,2): the TOP-LEFT capy tile (slot 0,0), mostly
-            // unaltered except the last 1/5 of pixels, which are overwritten with
-            // solid pink. RGBA, like the pink path.
-            let sx = 0u32;
-            let sy = 0u32;
-            let total_px = (w * h) as usize;
-            let mut tile = vec![0u8; total_px * 4]; // RGBA, exactly like pink
-            for r in 0..h {
-                let src_off = ((sy + r) * fw + sx) as usize * 3; // capy frame is Rgb24
-                for c in 0..w {
-                    let i = (r * w + c) as usize;
-                    let d = i * 4;
-                    if i >= total_px - total_px / 5 {
-                        // keep the original capy pixel unaltered (last 1/5)
-                        let s = src_off + (c as usize) * 3;
-                        tile[d] = first.data[s];
-                        tile[d + 1] = first.data[s + 1];
-                        tile[d + 2] = first.data[s + 2];
-                    } else {
-                        // overwrite this pixel with solid pink
-                        tile[d..d + 3].copy_from_slice(&[255, 105, 180]);
-                    }
-                    tile[d + 3] = 255;
-                }
-            }
-
-            let ctrl: Vec<(char, String)> = vec![
-                ('a', "f".into()),
-                ('i', id.to_string()),
-                ('r', "1".into()),
-                ('x', x.to_string()),
-                ('y', y.to_string()),
-                ('s', w.to_string()),
-                ('v', h.to_string()),
-                ('X', "1".into()),
-            ];
-            let png = encode_png(&tile, w, h);
-            Some(tuigui_tgp::proto::chunked_transmit(100u32, ctrl, &png, false))
-        };
-
-        // Hold the image on screen for `--duration-ms`, re-issuing the edit on
-        // the `--interval-ms` cadence (default 1s) so it stays live.
         let total = Duration::from_millis(cli.duration_ms.max(1));
-        let edit_cycle = Duration::from_millis(cli.interval_ms.max(1));
-        let mut next_edit = Instant::now();
+        let mut timings = Timings::default();
+        let mut last_frame_end: Option<Instant> = None;
+        let mut loops_done = 0u32;
+
         loop {
             if start.elapsed() >= total {
                 break;
             }
-            if let Some(edit) = &pink_edit {
-                if Instant::now() >= next_edit {
-                    for ch in edit {
-                        sink.write_all(ch)?;
-                        bytes_total += ch.len();
-                    }
-                    sink.flush()?;
-                    next_edit = Instant::now() + edit_cycle;
+            let t_frame = Instant::now();
+
+            // Measure the idle gap before this frame (decode wait / backpressure).
+            if let Some(end) = last_frame_end {
+                let gap = t_frame.duration_since(end);
+                if gap > timings.max_gap {
+                    timings.max_gap = gap;
                 }
             }
-            let step = Duration::from_millis(20);
-            std::thread::sleep(step.min(total.saturating_sub(start.elapsed())));
+
+            let t_decode = Instant::now();
+            let next = src.next().await;
+            let frame = match next {
+                Ok(Some(tuigui_streamer::source::FrameUpdate::Frame(f))) => f,
+                Ok(Some(_)) | Ok(None) => {
+                    loops_done += 1;
+                    if loops_done >= loops_target || start.elapsed() >= total {
+                        break;
+                    }
+                    src = Mp4VideoSource::open(
+                        path.clone(),
+                        std::env::var("FFMPEG_BIN").ok(),
+                        std::env::var("FFPROBE_BIN").ok(),
+                        false,
+                    )
+                    .map_err(|e| {
+                        std::io::Error::other(format!("reopening {}: {e}", path.display()))
+                    })?;
+                    continue;
+                }
+                Err(e) => return Err(std::io::Error::other(format!("video read: {e}"))),
+            };
+            timings.decode.record(t_decode.elapsed());
+
+            // Downscale this RGB24 frame to the lod resolution, then paint the tile.
+            let t_paint = Instant::now();
+            let (sw, sh) = (frame.metadata.width as usize, frame.metadata.height as usize);
+            let mut px = vec![0u8; (fw as usize) * (fh as usize) * 3];
+            for dy in 0..fh {
+                // Nearest box-sample source row (same divisor as the decode).
+                let sy = ((dy as u64) * (sh as u64) / (fh as u64)) as usize * sw * 3;
+                for dx in 0..fw {
+                    let sx = ((dx as u64) * (sw as u64) / (fw as u64)) as usize * 3;
+                    let d = (dy as usize * fw as usize + dx as usize) * 3;
+                    px[d..d + 3].copy_from_slice(&frame.data[sy + sx..sy + sx + 3]);
+                }
+            }
+            // Paint grid slot (2,2) pink in lod-resolution pixel space.
+            for r in 0..th {
+                let row = ((ty + r) * fw + tx) as usize * 3;
+                for c in 0..tw {
+                    let off = row + c as usize * 3;
+                    px[off] = 255;
+                    px[off + 1] = 105;
+                    px[off + 2] = 180;
+                }
+            }
+            timings.paint.record(t_paint.elapsed());
+
+            // Transmit+place this frame as a brand-new image. A fresh id per
+            // frame means the terminal's LRU cleans up old frames for us and
+            // we never do in-place edits. `--scale` shrinks the placement.
+            let fid = id_base.wrapping_add(frames as u32);
+            let ctrl: Vec<(char, String)> = vec![
+                ('a', "T".into()),
+                ('C', "1".into()),
+                ('i', fid.to_string()),
+                ('s', fw.to_string()),
+                ('v', fh.to_string()),
+                ('c', place_cols.to_string()),
+                ('r', place_rows.to_string()),
+                ('p', "1".into()),
+            ];
+            let t_encode = Instant::now();
+            let png = encode_png(&px, fw, fh);
+            timings.encode.record(t_encode.elapsed());
+
+            let t_write = Instant::now();
+            for ch in tuigui_tgp::proto::chunked_transmit(100u32, ctrl, &png, false) {
+                sink.write_all(&ch)?;
+                bytes_total += ch.len();
+            }
+            sink.flush()?; // push the frame's TGP bytes out before the next decode
+            timings.write.record(t_write.elapsed());
+
+            frames += 1;
+            timings.frame.record(t_frame.elapsed());
+            last_frame_end = Some(Instant::now());
+
             if poll_quit() == Some(true) {
-                frames += 1;
-                return Ok((frames, bytes_total));
+                return Ok((frames, bytes_total, loops_done, timings));
             }
         }
-        frames += 1;
-        Ok((frames, bytes_total))
+        Ok((frames, bytes_total, loops_done, timings))
     });
-    let (frames, bytes_total) = run_probe?;
+    let (frames, bytes_total, loops_done, timings) = run_probe?;
+
+    // Final red flash, same hold rule as grid mode: 500ms starting only after
+    // the frame is fully flushed, regardless of fps/pacing. Same geometry as
+    // playback so it lands where the video was.
+    let red = encode_png(&{
+        let mut red = vec![0u8; (fw as usize) * (fh as usize) * 3];
+        for px in red.chunks_exact_mut(3) {
+            px[0] = 255;
+            px[1] = 0;
+            px[2] = 0;
+        }
+        red
+    }, fw, fh);
+    let red_ctrl: Vec<(char, String)> = vec![
+        ('a', "T".into()),
+        ('C', "1".into()),
+        ('i', (id_base.wrapping_add(u32::MAX / 2)).to_string()),
+        ('s', fw.to_string()),
+        ('v', fh.to_string()),
+        ('c', place_cols.to_string()),
+        ('r', place_rows.to_string()),
+        ('p', "1".into()),
+    ];
+    let t_red = Instant::now();
+    if !cli.dry_run {
+        for ch in tuigui_tgp::proto::chunked_transmit(100u32, red_ctrl, &red, false) {
+            out.write_all(&ch)?;
+        }
+        out.flush()?;
+    }
+    let red_ms = t_red.elapsed();
+    report.push(format!(
+        "red flash sent in {:.2} ms; holding 500 ms",
+        red_ms.as_secs_f64() * 1000.0
+    ));
+    let hold_start = Instant::now();
+    loop {
+        let elapsed = hold_start.elapsed();
+        if elapsed >= Duration::from_millis(500) {
+            break;
+        }
+        std::thread::sleep((Duration::from_millis(500) - elapsed).min(Duration::from_millis(50)));
+        if poll_quit() == Some(true) {
+            break;
+        }
+    }
 
     let wall = start.elapsed();
+    let wall_s = wall.as_secs_f64().max(0.001);
     let bytes_mb = bytes_total as f64 / (1024.0 * 1024.0);
-    eprintln!(
-        "video stress: {frames} frames in {:.1}s ({:.2} MB, {:.1} MB/s, {:.1} fps) \
-         src {}x{} term {}x{}",
-        wall.as_secs_f64(),
+    let fps = frames as f64 / wall.as_secs_f64().max(0.001);
+    let avg_ms = wall.as_secs_f64() * 1000.0 / (frames as f64).max(1.0);
+    let ns = |st: &Stage| -> String {
+        let sum_ms = st.total.as_secs_f64() * 1000.0;
+        let a = if st.count > 0 { sum_ms / st.count as f64 } else { 0.0 };
+        format!(
+            "{:9.1} ms avg | {:9.1} ms max | {:4} samples ({:6.2}% of wall)",
+            a,
+            st.max.as_secs_f64() * 1000.0,
+            st.count,
+            st.total.as_secs_f64() / wall_s * 100.0,
+        )
+    };
+    report.push(format!(
+        "video stress: {frames} frames over {loops_done}/{loops_target} loop(s) in {wall_s:.1}s \
+         ({:.2} MB, {:.1} MB/s, {:.1} fps, {avg_ms:.1} ms/frame) \
+         src {fw}x{fh} term {term_cols}x{term_rows}",
         bytes_mb,
-        bytes_mb / wall.as_secs_f64().max(0.001),
-        frames as f64 / wall.as_secs_f64().max(0.001),
-        fw,
-        fh,
-        term_cols,
-        term_rows,
-    );
+        bytes_mb / wall_s,
+        fps,
+    ));
+    report.push("--- per-stage timing (per frame) ---".into());
+    report.push(format!("  decode   {}", ns(&timings.decode)));
+    report.push(format!("  paint    {}", ns(&timings.paint)));
+    report.push(format!("  encode   {}", ns(&timings.encode)));
+    report.push(format!("  write    {}", ns(&timings.write)));
+    report.push(format!("  frame    {}", ns(&timings.frame)));
+    report.push(format!(
+        "  total encode time {:.1}s, total write time {:.1}s",
+        timings.encode.total.as_secs_f64(),
+        timings.write.total.as_secs_f64(),
+    ));
+    report.push(format!(
+        "  max idle gap between frames: {:.1} ms",
+        timings.max_gap.as_secs_f64() * 1000.0
+    ));
     Ok(())
 }
 
@@ -445,7 +644,7 @@ fn encode_png(data: &[u8], w: u32, h: u32) -> Vec<u8> {
     {
         let mut enc = png::Encoder::new(&mut buf, w, h);
         enc.set_depth(png::BitDepth::Eight);
-        enc.set_compression(png::Compression::Default);
+        enc.set_compression(png::Compression::Fast);
         enc.set_color(if rgba { png::ColorType::Rgba } else { png::ColorType::Rgb });
         let mut wr = enc.write_header().expect("png header");
         wr.write_image_data(data).expect("png data");
