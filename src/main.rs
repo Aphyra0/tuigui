@@ -585,7 +585,6 @@ async fn run_ui(
     let mut pacing_ms_accum = 0f64;
     let mut encode_ms_accum = 0f64;
     let mut write_ms_accum = 0f64;
-    let mut flush_ms_accum = 0f64;
     let mut scale_ms_accum = 0f64;
     let mut frame_count_accum = 0usize;
     let mut announce_accum = 0f64;
@@ -624,12 +623,12 @@ async fn run_ui(
         let mut batch_tiles_edited: u32 = 0;
         let mut batch_tiles_total: u32 = 0;
         let mut written_bytes = 0usize;
-        // Time the buffered writes (bytes into userspace) separately from the
-        // flush that pushes them to the terminal. `stdout` is a LineWriter, so
-        // `write_all` only memcpys into a buffer; the kernel/PTY handoff happens
-        // on `flush`. Each drained chunk is timed individually so the idle
-        // wait on the encoder stream (the 4ms timeout) never lands in
-        // `Sink:` — only real write time does.
+        // `Sink:` mirrors the stress binary's write stage: the total wall
+        // clock spent pushing the drained bytes to the terminal — buffered
+        // writes plus the final flush, which is where the PTY handoff blocks
+        // and waits for the terminal to consume the data. Chunks are timed
+        // individually so the idle await on the encoder stream (the 4ms
+        // timeout) never pollutes the number.
         // Bail out after this many bytes per frame so the UI loop always
         // yields to redraw + key polling, even when a fast encoder floods the
         // (now bounded) channel every iteration.
@@ -697,10 +696,11 @@ async fn run_ui(
         stats.tiles_total = batch_tiles_total;
         let flush_t0 = std::time::Instant::now();
         out.flush()?;
-        let flush_ms = flush_t0.elapsed().as_secs_f64() * 1000.0;
-        // Buffered writes were accrued per chunk above; the flush gets its own
-        // entry so `Sink:` and `Flush:` show separately.
-        flush_ms_accum += flush_ms;
+        // The flush is the dominant half of the send: it hands the buffered
+        // batch to the PTY and blocks until the terminal consumes it. Fold it
+        // into the same `Sink:` total as the chunk writes, exactly like the
+        // stress binary's write stage (write_all loop + flush, one timer).
+        write_ms_accum += flush_t0.elapsed().as_secs_f64() * 1000.0;
 
         // Accrue this iteration's transmitted bytes into the rolling window.
         frame_bytes_accum += written_bytes;
@@ -717,7 +717,6 @@ async fn run_ui(
             stats.pacing_ms = pacing_ms_accum / n;
             stats.encode_ms = encode_ms_accum / n;
             stats.sink_ms = write_ms_accum / n;
-            stats.flush_ms = flush_ms_accum / n;
             stats.downscale_ms = scale_ms_accum / n;
             stats.announce_ms = announce_accum / n;
             stats.setup_ms = setup_accum / n;
@@ -730,7 +729,6 @@ async fn run_ui(
             pacing_ms_accum = 0.0;
             encode_ms_accum = 0.0;
             write_ms_accum = 0.0;
-            flush_ms_accum = 0.0;
             scale_ms_accum = 0.0;
             announce_accum = 0.0;
             setup_accum = 0.0;

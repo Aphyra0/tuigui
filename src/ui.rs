@@ -22,10 +22,10 @@ pub struct Stats {
     pub resolution: (u32, u32),
     /// Wall-clock cost of encoding a frame's pixels into TGP bytes (base64).
     pub encode_ms: f64,
-    /// Wall-clock cost of writing a frame's bytes into the (buffered) output.
+    /// Wall-clock cost of sending a drained batch to the terminal: buffered
+    /// writes plus the blocking flush (PTY handoff + terminal consumption),
+    /// matching the stress binary's write stage. Averages over 1s.
     pub sink_ms: f64,
-    /// Wall-clock cost of flushing those bytes to the terminal (pty/pipe write).
-    pub flush_ms: f64,
     /// Wall-clock cost of downscaling frame payloads (block LOD rungs +
     /// loading-layer coarse canvas), per frame (1s rolling average).
     pub downscale_ms: f64,
@@ -61,7 +61,7 @@ pub fn draw(f: &mut Frame, app: &str, status: &str, stats: &Stats) -> Rect {
         String::new()
     };
     let line1 = format!(
-        " {status} · {app}  ·  FPS: {:.0}  ·  Bw: {:.1} MiB/s  ·  Cap: {:.1} ms  ·  Pace: {:.1} ms  ·  Enc: {:.1} ms  ·  Scale: {:.1} ms  ·  Sink: {:.1} ms  ·  Flush: {:.1} ms  ·  {rw}x{rh}{phases}{tiles}  ·  q to quit",
+        " {status} · {app}  ·  FPS: {:.0}  ·  Bw: {:.1} MiB/s  ·  Cap: {:.1} ms  ·  Pace: {:.1} ms  ·  Enc: {:.1} ms  ·  Scale: {:.1} ms  ·  Sink: {:.1} ms  ·  {rw}x{rh}{phases}{tiles}  ·  q to quit",
         stats.fps,
         stats.bandwidth / (1024.0 * 1024.0),
         stats.capture_ms,
@@ -69,7 +69,6 @@ pub fn draw(f: &mut Frame, app: &str, status: &str, stats: &Stats) -> Rect {
         stats.encode_ms,
         stats.downscale_ms,
         stats.sink_ms,
-        stats.flush_ms,
     );
 
     f.render_widget(
