@@ -29,6 +29,8 @@
 //! it stops it sharpens to full detail over a couple frames — a classic
 //! progressive/progressive-resolution scheme (TigerVNC-style).
 
+use std::time::Duration;
+
 use bytes::Bytes;
 
 use crate::frame::Frame;
@@ -183,6 +185,9 @@ pub struct BlockGrid {
     shown_level: Vec<u8>,
     /// Frame dims the grid was built from.
     dims: BlockGridDim,
+    /// Cumulative wall-clock time spent in `downscale_block` across all
+    /// `diff` calls, for the UI's `Scale:` stat.
+    downscale_time: Duration,
 }
 
 impl BlockGrid {
@@ -208,6 +213,7 @@ impl BlockGrid {
             block_class: Vec::new(),
             shown_level: Vec::new(),
             dims: BlockGridDim { cols, rows },
+            downscale_time: Duration::ZERO,
         }
     }
 
@@ -227,6 +233,12 @@ impl BlockGrid {
     /// Number of resolution levels configured for this grid.
     pub fn res_levels(&self) -> u32 {
         self.res_levels
+    }
+
+    /// Cumulative time spent downscaling payloads in `diff` since grid
+    /// creation.
+    pub fn downscale_time(&self) -> Duration {
+        self.downscale_time
     }
 
     /// Split `frame` into blocks and decide, per block, whether and at what
@@ -345,7 +357,9 @@ impl BlockGrid {
 
                 // Downscale to the chosen level's payload. factor 1 = full res.
                 let factor = (self.res_levels + 1 - level as u32).max(1);
+                let t_scale = std::time::Instant::now();
                 let (data, pw, ph) = downscale_block(&cur, bw, bh, bpp, factor);
+                self.downscale_time += t_scale.elapsed();
                 // Debug LOD tint: push red into the payload in proportion to how
                 // far below the original resolution this block is. Full res
                 // (level == res_levels) is untouched; the coarsest level

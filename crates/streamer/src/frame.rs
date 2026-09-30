@@ -42,11 +42,14 @@ pub struct CaptureTiming {
     pub copy_ms: f64,
     /// Reading the pixels out of the shared buffer into an owned RGBA Vec.
     pub readout_ms: f64,
+    /// Resampling the grabbed frame to the capture `--scale` factor.
+    /// Zero when capture runs at full resolution.
+    pub downscale_ms: f64,
 }
 
 impl CaptureTiming {
     pub fn total_ms(&self) -> f64 {
-        self.announce_ms + self.setup_ms + self.copy_ms + self.readout_ms
+        self.announce_ms + self.setup_ms + self.copy_ms + self.readout_ms + self.downscale_ms
     }
 }
 

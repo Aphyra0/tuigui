@@ -735,7 +735,15 @@ fn downscale_frame(shot: &Screenshot, scale: f32) -> Frame {
     let oh = shot.height;
     let nw = ((ow as f32) / scale).floor().max(1.0) as u32;
     let nh = ((oh as f32) / scale).floor().max(1.0) as u32;
+    let t0 = std::time::Instant::now();
     let (data, _, _) = tuigui_streamer::scale::resample(&shot.rgba, ow, oh, 4, nw, nh);
+    // Surface the resample cost as a fifth capture phase so the UI's
+    // `Scale:` stat shows real numbers instead of folding it into readout.
+    let timing = shot.timing;
+    let timing = CaptureTiming {
+        downscale_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        ..timing.unwrap_or_default()
+    };
     Frame {
         metadata: FrameMetadata {
             width: nw,
@@ -746,7 +754,7 @@ fn downscale_frame(shot: &Screenshot, scale: f32) -> Frame {
         presentation_timestamp: shot
             .to_frame()
             .presentation_timestamp,
-        timing: shot.timing,
+        timing: Some(timing),
         damage: shot.damage.clone(),
     }
 }

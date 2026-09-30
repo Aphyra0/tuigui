@@ -39,6 +39,10 @@ pub enum EncoderEvent {
         /// Total block grid slots (blocks per side squared). `0` when not in
         /// block mode.
         tiles_total: u32,
+        /// Wall-clock time spent downscaling this frame's payloads (block LOD
+        /// rungs + loading-layer coarse canvas). Zero when nothing was
+        /// downscaled (full-res frames, loading disabled).
+        downscale_ms: f64,
     },
     /// Bytes to write to the terminal, in order.
     Bytes(Vec<u8>),
@@ -162,6 +166,10 @@ pub struct TgpEncoder {
     /// written coarse here and marked; the frame it stops changing it is
     /// cleared to reveal the sharp layer behind.
     loading_covered: Vec<bool>,
+    /// Wall-clock ms spent in the loading-layer `downscale_rgba` calls since
+    /// the last `Frame` event (atomically reset on read; the field only
+    /// accumulates inside `emit_loading_block`/root setup between events).
+    loading_downscale_ms: std::sync::atomic::AtomicU64,
 }
 
 impl TgpEncoder {
@@ -184,6 +192,7 @@ impl TgpEncoder {
             loading_id: None,
             loading_placed: false,
             loading_covered: Vec::new(),
+            loading_downscale_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -196,15 +205,24 @@ impl TgpEncoder {
     /// pixels are downscaled by `loading_scale` then nearest-upscaled back to
     /// the block rect, so it renders low-res yet stays 1:1 aligned with sharp
     /// (no scale-coordinate drift, so nothing looks zoomed or misplaced).
+    /// Accumulates the downscale cost into `loading_downscale_ms`. Free
+    /// function (not a method) so it never borrows the encoder while `grid`
+    /// is mutably borrowed.
     #[allow(clippy::too_many_arguments)]
     fn emit_loading_block(
+        loading_counter: &std::sync::atomic::AtomicU64,
         b: &tuigui_streamer::blocks::MicroBlock,
         loading_id: u32,
         scale: u32,
         color_bits: u8,
         zlib: bool,
     ) -> Vec<Vec<u8>> {
+        let t0 = std::time::Instant::now();
         let (down, _pw, _ph) = downscale_rgba(&b.data, b.payload_width, b.payload_height, scale);
+        loading_counter.fetch_add(
+            (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let blocky = upscale_nearest(&down, scale, b.payload_width, b.payload_height);
         frame_edit(loading_id, b.x, b.y, b.payload_width, b.payload_height, &blocky, color_bits, zlib, 32)
     }
@@ -283,6 +301,7 @@ impl TgpEncoder {
                     );
                     let t_encode = Instant::now();
                     let grid_total = self.blocks.cols() * self.blocks.rows();
+                    let scale_before = self.blocks.downscale_time();
                     let edited_this_frame: u32;
                     {
                         let seed = self.frame_count.wrapping_add(1);
@@ -329,11 +348,16 @@ impl TgpEncoder {
                                 // canvas, so it stacks exactly over sharp (1:1 rects).
                                 let lid = self.image_id;
                                 self.image_id = self.image_id.wrapping_add(1);
+                                let t_load = std::time::Instant::now();
                                 let (down, _dw, _dh) = downscale_rgba(
                                     &frame.data,
                                     frame.metadata.width,
                                     frame.metadata.height,
                                     scale,
+                                );
+                                self.loading_downscale_ms.fetch_add(
+                                    (t_load.elapsed().as_secs_f64() * 1000.0 * 1000.0) as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
                                 );
                                 let blocky = upscale_nearest(
                                     &down,
@@ -379,6 +403,7 @@ impl TgpEncoder {
                             if loading_id != 0 {
                                 let slot = (b.row * grid.rows() + b.col) as usize;
                                 for c in Self::emit_loading_block(
+                                    &self.loading_downscale_ms,
                                     b,
                                     loading_id,
                                     scale,
@@ -426,6 +451,14 @@ impl TgpEncoder {
                         self.frame_count += 1;
                     }
                     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
+                    // Downscale cost for this frame: block-grid diff scaling
+                    // plus any loading-layer coarse canvas built here.
+                    let downscale_ms = (self.blocks.downscale_time() - scale_before)
+                        .as_secs_f64()
+                        * 1000.0
+                        + self.loading_downscale_ms.swap(0, std::sync::atomic::Ordering::Relaxed)
+                            as f64
+                            / 1000.0;
                     let capture_ms = frame
                         .timing
                         .map(|t| t.total_ms())
@@ -444,6 +477,7 @@ impl TgpEncoder {
                         timing: frame.timing,
                         tiles_edited: edited_this_frame,
                         tiles_total: grid_total,
+                        downscale_ms,
                     })?;
                 }
             }

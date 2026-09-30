@@ -586,6 +586,7 @@ async fn run_ui(
     let mut encode_ms_accum = 0f64;
     let mut write_ms_accum = 0f64;
     let mut flush_ms_accum = 0f64;
+    let mut scale_ms_accum = 0f64;
     let mut frame_count_accum = 0usize;
     let mut announce_accum = 0f64;
     let mut setup_accum = 0f64;
@@ -605,7 +606,13 @@ async fn run_ui(
         // region; `C=1` on the transmit command keeps the cursor put, so each
         // chunk lands exactly at the pane's top-left cell.
         use std::io::Write as _;
-        let mut out = std::io::stdout();
+        // Wrap stdout in an explicit BufWriter so `Sink:` measures real
+        // userspace buffering costs instead of LineWriter's all-or-nothing
+        // pass-through: LineWriter flushes on every newline and large chunks
+        // bypass its buffer entirely, making write_all near-free and the stat
+        // useless. A 256 KiB buffer accumulates the whole drain batch, so the
+        // single flush at the end is where the PTY handoff cost lands.
+        let mut out = std::io::BufWriter::with_capacity(256 * 1024, std::io::stdout().lock());
         if let Some(rect) = pane {
             crossterm::execute!(out, crossterm::cursor::MoveTo(rect.x, rect.y))?;
         }
@@ -620,9 +627,9 @@ async fn run_ui(
         // Time the buffered writes (bytes into userspace) separately from the
         // flush that pushes them to the terminal. `stdout` is a LineWriter, so
         // `write_all` only memcpys into a buffer; the kernel/PTY handoff happens
-        // on `flush`. Reporting them apart shows where the sink cost actually
-        // lands.
-        let write_t0 = std::time::Instant::now();
+        // on `flush`. Each drained chunk is timed individually so the idle
+        // wait on the encoder stream (the 4ms timeout) never lands in
+        // `Sink:` — only real write time does.
         // Bail out after this many bytes per frame so the UI loop always
         // yields to redraw + key polling, even when a fast encoder floods the
         // (now bounded) channel every iteration.
@@ -642,20 +649,23 @@ async fn run_ui(
                 Ok(Some(Ok(EncoderEvent::Bytes(b)))) if !b.is_empty() => {
                     written_chunks += 1;
                     written_bytes += b.len();
+                    let w0 = std::time::Instant::now();
                     out.write_all(&b)?;
+                    write_ms_accum += w0.elapsed().as_secs_f64() * 1000.0;
                 }
                 // Empty batch means nothing more to drain right now; stop and
                 // return control to the UI loop so keys/mouse stay responsive
                 // even when the encoder idles between frames. Spinning on
                 // empty chunks would busy-loop and starve input polling.
                 Ok(Some(Ok(EncoderEvent::Bytes(_)))) => break,
-                Ok(Some(Ok(EncoderEvent::Frame { width, height, capture_ms, pacing_ms, encode_ms, timing, tiles_edited, tiles_total }))) => {
+                Ok(Some(Ok(EncoderEvent::Frame { width, height, capture_ms, pacing_ms, encode_ms, timing, tiles_edited, tiles_total, downscale_ms }))) => {
                     // Record the frame's resolution and capture cost into the
                     // rolling window.
                     frame_count_accum += 1;
                     cap_ms_accum += capture_ms;
                     pacing_ms_accum += pacing_ms;
                     encode_ms_accum += encode_ms;
+                    scale_ms_accum += downscale_ms;
                     stats.resolution = (width, height);
                     batch_tiles_edited = batch_tiles_edited.max(tiles_edited);
                     batch_tiles_total = batch_tiles_total.max(tiles_total);
@@ -685,13 +695,11 @@ async fn run_ui(
         // Fold this batch's peak tile-edit fraction into displayed stats.
         stats.tiles_edited = batch_tiles_edited;
         stats.tiles_total = batch_tiles_total;
-        let write_ms = write_t0.elapsed().as_secs_f64() * 1000.0;
         let flush_t0 = std::time::Instant::now();
         out.flush()?;
         let flush_ms = flush_t0.elapsed().as_secs_f64() * 1000.0;
-        // Accrue both the buffered writes and the flush into the per-second
-        // window so `Sink:` and `Flush:` show separately.
-        write_ms_accum += write_ms;
+        // Buffered writes were accrued per chunk above; the flush gets its own
+        // entry so `Sink:` and `Flush:` show separately.
         flush_ms_accum += flush_ms;
 
         // Accrue this iteration's transmitted bytes into the rolling window.
@@ -710,6 +718,7 @@ async fn run_ui(
             stats.encode_ms = encode_ms_accum / n;
             stats.sink_ms = write_ms_accum / n;
             stats.flush_ms = flush_ms_accum / n;
+            stats.downscale_ms = scale_ms_accum / n;
             stats.announce_ms = announce_accum / n;
             stats.setup_ms = setup_accum / n;
             stats.copy_ms = copy_accum / n;
@@ -722,6 +731,7 @@ async fn run_ui(
             encode_ms_accum = 0.0;
             write_ms_accum = 0.0;
             flush_ms_accum = 0.0;
+            scale_ms_accum = 0.0;
             announce_accum = 0.0;
             setup_accum = 0.0;
             copy_accum = 0.0;
