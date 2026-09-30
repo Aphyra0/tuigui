@@ -621,9 +621,9 @@ async fn run_ui(
         // Time the buffered writes (bytes into userspace) separately from the
         // flush that pushes them to the terminal. `stdout` is a LineWriter, so
         // `write_all` only memcpys into a buffer; the kernel/PTY handoff happens
-        // on `flush`. Reporting them apart shows where the sink cost actually
-        // lands.
-        let write_t0 = std::time::Instant::now();
+        // on `flush`. Each drained chunk is timed individually so the idle
+        // wait on the encoder stream (the 4ms timeout) never lands in
+        // `Sink:` — only real write time does.
         // Bail out after this many bytes per frame so the UI loop always
         // yields to redraw + key polling, even when a fast encoder floods the
         // (now bounded) channel every iteration.
@@ -643,7 +643,9 @@ async fn run_ui(
                 Ok(Some(Ok(EncoderEvent::Bytes(b)))) if !b.is_empty() => {
                     written_chunks += 1;
                     written_bytes += b.len();
+                    let w0 = std::time::Instant::now();
                     out.write_all(&b)?;
+                    write_ms_accum += w0.elapsed().as_secs_f64() * 1000.0;
                 }
                 // Empty batch means nothing more to drain right now; stop and
                 // return control to the UI loop so keys/mouse stay responsive
@@ -684,13 +686,11 @@ async fn run_ui(
                 Err(_elapsed) => break,
             }
         }
-        let write_ms = write_t0.elapsed().as_secs_f64() * 1000.0;
         let flush_t0 = std::time::Instant::now();
         out.flush()?;
         let flush_ms = flush_t0.elapsed().as_secs_f64() * 1000.0;
-        // Accrue both the buffered writes and the flush into the per-second
-        // window so `Sink:` and `Flush:` show separately.
-        write_ms_accum += write_ms;
+        // Buffered writes were accrued per chunk above; the flush gets its own
+        // entry so `Sink:` and `Flush:` show separately.
         flush_ms_accum += flush_ms;
 
         // Accrue this iteration's transmitted bytes into the rolling window.
