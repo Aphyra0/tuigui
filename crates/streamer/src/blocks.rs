@@ -382,35 +382,18 @@ impl BlockGrid {
 }
 
 /// Downscale `data` (an `w x h` image of `bpp`-byte pixels) by an integer
-/// `factor`, averaging each `factor x factor` source region into one output
-/// pixel (edge regions clamped). `factor <= 1` returns the input unchanged.
+/// `factor`. Delegates to the shared area-weighted tent resampler
+/// ([`tuigui_streamer::scale::resample`]): unlike the old per-region integer
+/// average it blends across uneven edge regions and any factor, so low-rung
+/// LOD payloads keep smooth gradients instead of dropping rows/columns.
+/// `factor <= 1` returns the input unchanged.
 fn downscale_block(data: &[u8], w: u32, h: u32, bpp: usize, factor: u32) -> (Bytes, u32, u32) {
     if factor <= 1 {
         return (Bytes::copy_from_slice(data), w, h);
     }
     let pw = w.div_ceil(factor);
     let ph = h.div_ceil(factor);
-    let mut out = vec![0u8; (pw * ph) as usize * bpp];
-    for oy in 0..ph {
-        let y0 = oy * factor;
-        let y1 = (y0 + factor).min(h);
-        for ox in 0..pw {
-            let x0 = ox * factor;
-            let x1 = (x0 + factor).min(w);
-            let count = (x1 - x0) * (y1 - y0);
-            let dst = ((oy * pw + ox) as usize) * bpp;
-            for lane in 0..bpp {
-                let mut s: u32 = 0;
-                for sy in y0..y1 {
-                    for sx in x0..x1 {
-                        s += data[(((sy * w + sx) as usize) * bpp) + lane] as u32;
-                    }
-                }
-                out[dst + lane] = (s / count) as u8;
-            }
-        }
-    }
-    (Bytes::from(out), pw, ph)
+    crate::scale::resample(data, w, h, bpp, pw, ph)
 }
 
 /// Measure `data` (an `w x h` image of `bpp`-byte pixels) for resolution

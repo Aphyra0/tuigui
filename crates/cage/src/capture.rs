@@ -724,34 +724,25 @@ fn frame_blank(frame: &Frame) -> bool {
     true
 }
 
-/// Nearest-neighbor downscale of a captured screenshot by integer `scale`
-/// (>=1). Produces a new Screenshot of `w/scale x h/scale` with box-sampled
-/// pixels, so the encoder's resolution reflects the requested scale even when
-/// the compositor fixed its output size.
+/// Downscale of a captured screenshot by `scale` (>=1). Produces a new
+/// Screenshot of `w/scale x h/scale` with area-weighted tent-filter pixels
+/// (see `tuigui_streamer::scale`), so the encoder's resolution reflects the
+/// requested scale even when the compositor fixed its output size — without
+/// the nearest-neighbor aliasing (shimmering gradients, dropped rows at
+/// fractional ratios) the old point sampler produced.
 fn downscale_frame(shot: &Screenshot, scale: f32) -> Frame {
     let ow = shot.width;
     let oh = shot.height;
     let nw = ((ow as f32) / scale).floor().max(1.0) as u32;
     let nh = ((oh as f32) / scale).floor().max(1.0) as u32;
-    let mut out = vec![0u8; (nw as usize) * (nh as usize) * 4];
-    let sx = ow as f32 / nw as f32;
-    let sy = oh as f32 / nh as f32;
-    for y in 0..nh {
-        for x in 0..nw {
-            let sy0 = ((y as f32) * sy) as usize;
-            let sx0 = ((x as f32) * sx) as usize;
-            let src = &shot.rgba[(sy0 * ow as usize + sx0) * 4..][..4];
-            let dst = &mut out[((y as usize) * nw as usize + x as usize) * 4..][..4];
-            dst.copy_from_slice(src);
-        }
-    }
+    let (data, _, _) = tuigui_streamer::scale::resample(&shot.rgba, ow, oh, 4, nw, nh);
     Frame {
         metadata: FrameMetadata {
             width: nw,
             height: nh,
             format: PixelFormat::Rgba32,
         },
-        data: bytes::Bytes::from(out),
+        data,
         presentation_timestamp: shot
             .to_frame()
             .presentation_timestamp,

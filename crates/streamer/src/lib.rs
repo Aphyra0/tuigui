@@ -12,6 +12,7 @@ pub mod blocks;
 pub mod frame;
 pub mod mp4;
 pub mod pink;
+pub mod scale;
 pub mod source;
 
 pub use blocks::{BlockGrid, BlockGridDim, MicroBlock, DEFAULT_BLOCKS_PER_SIDE};

@@ -644,50 +644,30 @@ fn round_channels(data: &[u8], bits: u8) -> Vec<u8> {
     out
 }
 
-/// Downscale `data` (an `w x h` image of `bpp`-byte pixels) by `factor`,
-/// averaging each `factor x factor` region into one output RGBA pixel. Always
-/// returns 4 bpp (RGBA). `factor <= 1` returns `(data, w, h)` unchanged.
+/// Downscale `data` (an `w x h` image) by `factor` into one output RGBA
+/// image. Delegates to the shared area-weighted tent resampler
+/// ([`tuigui_streamer::scale::resample`]) and converts to RGBA when the
+/// source is RGB. `factor <= 1` keeps the size (converting RGB -> RGBA).
 fn downscale_rgba(data: &[u8], w: u32, h: u32, factor: u32) -> (bytes::Bytes, u32, u32) {
+    let bpp = if data.len() == (w * h * 4) as usize { 4usize } else { 3usize };
     if factor <= 1 {
-        // ensure 4bpp output; if input is already RGBA use it
-        if data.len() == (w * h * 4) as usize {
+        if bpp == 4 {
             return (bytes::Bytes::copy_from_slice(data), w, h);
         }
-        // RGB -> RGBA
         let mut out = Vec::with_capacity((w * h) as usize * 4);
         for px in data.chunks_exact(3) {
             out.extend_from_slice(&[px[0], px[1], px[2], 255]);
         }
         return (bytes::Bytes::from(out), w, h);
     }
-    let pw = w.div_ceil(factor);
-    let ph = h.div_ceil(factor);
-    let mut out = vec![0u8; (pw * ph) as usize * 4];
-    let bpp = if data.len() == (w * h * 4) as usize { 4usize } else { 3usize };
-    for oy in 0..ph {
-        let y0 = oy * factor;
-        let y1 = (y0 + factor).min(h);
-        for ox in 0..pw {
-            let x0 = ox * factor;
-            let x1 = (x0 + factor).min(w);
-            let mut sums = [0u32; 4];
-            let mut count = 0u32;
-            for sy in y0..y1 {
-                for sx in x0..x1 {
-                    let o = ((sy * w + sx) as usize) * bpp;
-                    sums[0] += data[o] as u32;
-                    sums[1] += data[o + 1] as u32;
-                    sums[2] += data[o + 2] as u32;
-                    sums[3] += if bpp == 4 { data[o + 3] as u32 } else { 255 };
-                    count += 1;
-                }
-            }
-            let dst = ((oy * pw + ox) as usize) * 4;
-            out[dst] = (sums[0] / count) as u8;
-            out[dst + 1] = (sums[1] / count) as u8;
-            out[dst + 2] = (sums[2] / count) as u8;
-            out[dst + 3] = (sums[3] / count) as u8;
-        }
+    let (down, pw, ph) = tuigui_streamer::scale::resample(data, w, h, bpp, w.div_ceil(factor), h.div_ceil(factor));
+    if bpp == 4 {
+        return (down, pw, ph);
+    }
+    // RGB -> RGBA.
+    let mut out = Vec::with_capacity((pw * ph) as usize * 4);
+    for px in down.chunks_exact(3) {
+        out.extend_from_slice(&[px[0], px[1], px[2], 255]);
     }
     (bytes::Bytes::from(out), pw, ph)
 }
@@ -858,9 +838,9 @@ mod tests {
         ];
         let (out, pw, ph) = downscale_rgba(&data, 2, 2, 2);
         assert_eq!((pw, ph), (1, 1));
-        // Average = (0+100+200+255)/4 = 138.75 -> 138.
+        // Average = (0+100+200+255)/4 = 138.75 -> 139 (proper rounding).
         assert_eq!(out.len(), 4);
-        assert_eq!(out[0], 138);
+        assert_eq!(out[0], 139);
         assert_eq!(out[1], 0);
         assert_eq!(out[2], 0);
         assert_eq!(out[3], 255);
