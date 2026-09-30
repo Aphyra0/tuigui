@@ -64,6 +64,7 @@ tokio-stream = { workspace = true }
 futures = { workspace = true }
 futures-core = { workspace = true }
 anyhow = { workspace = true }
+png = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tracing = { workspace = true }

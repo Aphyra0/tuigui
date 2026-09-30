@@ -1,15 +1,28 @@
 //! TGP stress-test binary.
 //!
-//! Spawns a grid of independent TGP images, one per grid cell, and walks them
-//! through a synchronous fade: every tile starts white, ramps linearly toward
-//! black over `n_frames` (derived from the interval so the whole fade lasts
-//! `--duration-ms`, default 1s), and the last frame flashes them all bright red
-//! before exiting. Purpose: probe whether a terminal/sink keeps up — if it lags
-//! behind the sequence it won't land on red, exposing where the pipeline
-//! throttles. Reuse/merge/delta logic is deliberately absent (every frame
-//! re-transmits every tile), giving a ceiling for the raw upload path.
+//! Two modes:
+//!
+//! 1. Default: spawns a grid of independent TGP images, one per grid cell, and
+//!    walks them through a synchronous fade: every tile starts white, ramps
+//!    linearly toward black over `n_frames` (derived from the interval so the
+//!    whole fade lasts `--duration-ms`, default 1s), and the last frame flashes
+//!    them all bright red before exiting. Purpose: probe whether a terminal/sink
+//!    keeps up — if it lags behind the sequence it won't land on red, exposing
+//!    where the pipeline throttles. Reuse/merge/delta logic is deliberately
+//!    absent (every frame re-transmits every tile), giving a ceiling for the raw
+//!    upload path.
+//!
+//! 2. `--video`: stream a video file through the kitty *animation backend*,
+//!    updating the entire root frame in place each frame (`a=f r=1 x=0 y=0
+//!    s=<w> v=<h> X=1` — the whole rect, never replacing the base frame) under
+//!    a single image id/placement. The path defaults to `CAPY_VID_PATH` (set by
+//!    the dev shell to the public-domain capybara clip). `--duration-ms` caps
+//!    the run; if the file ends before that, playback loops from the top. The
+//!    per-frame cadence stays configurable via `--interval-ms` (or
+//!    `--fps`/`--frame-ms`, whichever is set last).
 
-use std::io::{stdout, Write};
+use std::io::Write;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -17,7 +30,8 @@ use crossterm::{
     cursor, event, execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use tuigui_tgp::proto::chunked_transmit;
+use tuigui_streamer::mp4::Mp4VideoSource;
+use tuigui_streamer::source::FrameSource;
 
 /// Grid + pacing configuration.
 #[derive(Parser, Debug)]
@@ -43,17 +57,39 @@ struct Cli {
     /// possible and observe the point it becomes too much.
     #[arg(long, default_value_t = 1000)]
     duration_ms: u64,
-    /// Fraction of tiles (0..=1) that keep their frame-0 color and never change.
-    /// The rest follow the white->black fade and the final red flash.
+    /// Fraction of tiles (0..=1) that stay frozen on their initial content.
+    /// Grid mode: those tiles keep the frame-0 white shade for the whole run.
+    /// Video mode: those tiles keep their FIRST frame's pixels until exit.
+    /// 0 = everything animates, 1 = nothing but the base frame updates.
     #[arg(long, default_value_t = 0.0)]
     static_rate: f64,
+    /// Stream a video through the animation backend instead of the grid. `-`
+    /// means "read the path from $CAPY_VID_PATH".
+    #[arg(long, value_name = "PATH")]
+    video: Option<String>,
+    /// With --video, frames per second. Overrides a later `--interval-ms`.
+    #[arg(long, default_value_t = 30)]
+    fps: u32,
+    /// With --video, milliseconds per frame. Overrides a later `--interval-ms`.
+    #[arg(long)]
+    frame_ms: Option<u64>,
 }
 
 fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
-    let mut out = stdout();
+    let mut out = std::io::stdout();
     enable_raw_mode()?;
     execute!(out, EnterAlternateScreen, cursor::Hide)?;
+
+    if cli.video.is_some() {
+        let res = run_video(&mut out, &cli);
+        crossterm::execute!(out, cursor::Show)?;
+        crossterm::execute!(out, event::DisableMouseCapture)?;
+        execute!(out, LeaveAlternateScreen)?;
+        disable_raw_mode()?;
+        let _ = out.flush();
+        return res;
+    }
 
     // collect() the run so the report can be printed AFTER the alternate screen
     // is left; stdout text written inside the alt buffer disappears on exit.
@@ -68,6 +104,21 @@ fn main() -> std::io::Result<()> {
         println!("{line}");
     }
     res
+}
+
+/// Resolve the video path: `-` reads `$CAPY_VID_PATH`, anything else is used
+/// verbatim. Errors if neither is set.
+fn video_path(cli_path: &str) -> std::io::Result<PathBuf> {
+    if cli_path != "-" {
+        return Ok(PathBuf::from(cli_path));
+    }
+    match std::env::var("CAPY_VID_PATH") {
+        Ok(p) if !p.is_empty() => Ok(PathBuf::from(p)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "--video - given but $CAPY_VID_PATH is not set (run inside `nix develop`)",
+        )),
+    }
 }
 
 /// Drive the grid: every `interval_ms`, recolor each tile to a deterministic
@@ -91,6 +142,7 @@ fn run(out: &mut std::io::Stdout, cli: &Cli, report: &mut Vec<String>) -> std::i
     crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
 
     // LCG kept for parity but unused now (uniform fade replaces per-tile rand).
+    #[allow(unused_mut)]
     let mut _rng: u64 = Instant::now().elapsed().as_nanos() as u64;
     let start = Instant::now();
     let mut frame_work = Duration::ZERO; // cumulative in-frame transmit/flush time
@@ -108,6 +160,7 @@ fn run(out: &mut std::io::Stdout, cli: &Cli, report: &mut Vec<String>) -> std::i
     } else {
         Duration::from_millis(1000 / n_frames.max(1))
     };
+    let _ = frame_target; // grid path paces via the poll loop below
     let mut tick = 0u64;
 
     // Reused solid RGBA buffer: recolor its RGB, alpha stays 255. Static tiles
@@ -149,7 +202,7 @@ fn run(out: &mut std::io::Stdout, cli: &Cli, report: &mut Vec<String>) -> std::i
                 }
                 execute!(out, cursor::MoveTo(x as u16, y as u16))?;
                 let id = 100 + (r * cli.cols + c);
-                let chunks = chunked_transmit(
+                let chunks = tuigui_tgp::proto::chunked_transmit(
                     32,
                     vec![
                         ('a', "T".into()),
@@ -168,7 +221,7 @@ fn run(out: &mut std::io::Stdout, cli: &Cli, report: &mut Vec<String>) -> std::i
                 }
             }
         }
-        out.flush()?;
+        std::io::stdout().flush()?;
         let frame_ms = t0.elapsed();
         frame_work += frame_ms;
         tick += 1;
@@ -177,12 +230,17 @@ fn run(out: &mut std::io::Stdout, cli: &Cli, report: &mut Vec<String>) -> std::i
             t0.elapsed().as_secs_f64() * 1000.0
         ));
         // Pace to the target while watching for `q`.
+        let target = Duration::from_millis(if cli.interval_ms > 0 {
+            cli.interval_ms
+        } else {
+            1000 / n_frames.max(1)
+        });
         loop {
             let elapsed = t0.elapsed();
-            if elapsed >= frame_target {
+            if elapsed >= target {
                 break;
             }
-            let step = (frame_target - elapsed).min(Duration::from_millis(50));
+            let step = (target - elapsed).min(Duration::from_millis(50));
             std::thread::sleep(step);
             if let Some(true) = poll_quit() {
                 report.push(format!("quitting early at frame {tick}"));
@@ -193,6 +251,168 @@ fn run(out: &mut std::io::Stdout, cli: &Cli, report: &mut Vec<String>) -> std::i
     }
     report_elapsed(report, start, frame_work, tick, total_ms, cli.interval_ms);
     Ok(())
+}
+
+/// Stream `cli.video`'s FIRST frame as the animation root (`a=T`), then a tiny
+/// probe: one random block repainted solid pink via an in-place `a=f r=1` edit
+/// on that same image. If pink shows, the terminal understands the animation
+/// backend and in-place frame edits. `--static-rate 1` freezes the whole image
+/// on the first frame (no edits at all), isolating the root transmit from the
+/// edit path. `q` quits early.
+fn run_video(out: &mut std::io::Stdout, cli: &Cli) -> std::io::Result<()> {
+    let path = video_path(cli.video.as_deref().unwrap_or("-"))?;
+
+    let explicit_ffmpeg = std::env::var("FFMPEG_BIN").ok();
+    let explicit_ffprobe = std::env::var("FFPROBE_BIN").ok();
+    let mut src = Mp4VideoSource::open(path.clone(), explicit_ffmpeg, explicit_ffprobe, false)
+        .map_err(|e| std::io::Error::other(format!("opening {}: {e}", path.display())))?;
+    let meta = src.metadata();
+    let (fw, fh) = (meta.width, meta.height);
+
+    let (term_cols, term_rows) = crossterm::terminal::size()?;
+    let (term_cols, term_rows) = (term_cols as u32, term_rows as u32);
+
+    crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
+
+    let start = Instant::now();
+    let id = 7000u32 + (std::process::id() % 1000);
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| std::io::Error::other(format!("tokio runtime: {e}")))?;
+    let run_probe: std::io::Result<(u64, usize)> = rt.block_on(async move {
+        // Pull ONLY the first frame from the video as the root; ignore the rest.
+        let mut frames = 0u64;
+        let mut bytes_total = 0usize;
+        let first = loop {
+            match src.next().await {
+                Ok(Some(tuigui_streamer::source::FrameUpdate::Frame(f))) => break f,
+                Ok(Some(_)) | Ok(None) => {
+                    return Err(std::io::Error::other("no frames in video"));
+                }
+                Err(e) => return Err(std::io::Error::other(format!("video read: {e}"))),
+            }
+        };
+
+        // Root transmit+place of the first frame.
+        let ctrl: Vec<(char, String)> = vec![
+            ('a', "T".into()),
+            ('C', "1".into()),
+            ('i', id.to_string()),
+            ('s', fw.to_string()),
+            ('v', fh.to_string()),
+            ('c', term_cols.to_string()),
+            ('r', term_rows.to_string()),
+            ('p', "1".into()),
+        ];
+        let png = encode_png(&first.data, fw, fh);
+        for ch in tuigui_tgp::proto::chunked_transmit(100u32, ctrl, &png, false) {
+            out.write_all(&ch)?;
+            bytes_total += ch.len();
+        }
+        frames += 1;
+
+        // One random block to repaint solid pink via an in-place `a=f r=1` edit.
+        // With `--static-rate >= 1` skip the edit and just hold the root.
+        let pink_edit: Option<Vec<Vec<u8>>> = if cli.static_rate >= 1.0 {
+            None
+        } else {
+            // Pick a random block coverage, and a random block offset within it.
+            let div = cli.cols.max(1).min(fw.max(1));
+            let bw = fw.div_ceil(div);
+            let bh = fh.div_ceil(div);
+            let rng_seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .subsec_nanos() as u64;
+            let bx = (rng_seed % div as u64) as u32;
+            let by = ((rng_seed / 7) % div as u64) as u32;
+            let x = bx * bw;
+            let y = by * bh;
+            let w = bw.min(fw - x);
+            let h = bh.min(fh - y);
+
+            // Solid pink RGBA block (255,105,180,255).
+            let mut pink = vec![0u8; (w * h) as usize * 4];
+            for px in pink.chunks_exact_mut(4) {
+                px.copy_from_slice(&[255, 105, 180, 255]);
+            }
+            let ctrl: Vec<(char, String)> = vec![
+                ('a', "f".into()),
+                ('i', id.to_string()),
+                ('r', "1".into()),
+                ('x', x.to_string()),
+                ('y', y.to_string()),
+                ('s', w.to_string()),
+                ('v', h.to_string()),
+                ('X', "1".into()),
+            ];
+            let png = encode_png(&pink, w, h);
+            Some(tuigui_tgp::proto::chunked_transmit(100u32, ctrl, &png, false))
+        };
+
+        // Hold the image on screen for `--duration-ms`, re-issuing the edit on
+        // the `--interval-ms` cadence (default 1s) so it stays live.
+        let total = Duration::from_millis(cli.duration_ms.max(1));
+        let edit_cycle = Duration::from_millis(cli.interval_ms.max(1));
+        let mut next_edit = Instant::now();
+        loop {
+            if start.elapsed() >= total {
+                break;
+            }
+            if let Some(edit) = &pink_edit {
+                if Instant::now() >= next_edit {
+                    for ch in edit {
+                        out.write_all(ch)?;
+                        bytes_total += ch.len();
+                    }
+                    out.flush()?;
+                    next_edit = Instant::now() + edit_cycle;
+                }
+            }
+            let step = Duration::from_millis(20);
+            std::thread::sleep(step.min(total.saturating_sub(start.elapsed())));
+            if poll_quit() == Some(true) {
+                frames += 1;
+                return Ok((frames, bytes_total));
+            }
+        }
+        frames += 1;
+        Ok((frames, bytes_total))
+    });
+    let (frames, bytes_total) = run_probe?;
+
+    let wall = start.elapsed();
+    let bytes_mb = bytes_total as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "video stress: {frames} frames in {:.1}s ({:.2} MB, {:.1} MB/s, {:.1} fps) \
+         src {}x{} term {}x{}",
+        wall.as_secs_f64(),
+        bytes_mb,
+        bytes_mb / wall.as_secs_f64().max(0.001),
+        frames as f64 / wall.as_secs_f64().max(0.001),
+        fw,
+        fh,
+        term_cols,
+        term_rows,
+    );
+    Ok(())
+}
+
+/// Encode `data` (`w` x `h` pixels, 3 bpp RGB or 4 bpp RGBA) into a PNG byte
+/// string for TGP `f=100` transmission. The terminal (wuffs) decodes it on
+/// receipt.
+fn encode_png(data: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let rgba = data.len() == (w as usize) * (h as usize) * 4;
+    let mut buf = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut buf, w, h);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.set_compression(png::Compression::Default);
+        enc.set_color(if rgba { png::ColorType::Rgba } else { png::ColorType::Rgb });
+        let mut wr = enc.write_header().expect("png header");
+        wr.write_image_data(data).expect("png data");
+    }
+    buf
 }
 
 /// Emit the run summary into `report` (printed after the alt screen is left):
@@ -224,14 +444,19 @@ fn report_elapsed(
     let _ = interval_ms;
 }
 
-/// Non-blocking: true if `q` was pressed.
+/// Non-blocking: true if `q` or `Ctrl+C` was pressed.
 fn poll_quit() -> Option<bool> {
     use crossterm::event::{Event, KeyCode, KeyEventKind};
     while event::poll(Duration::from_millis(0)).ok()? {
-        if let Event::Key(k) = event::read().ok()? {
-            if k.kind == KeyEventKind::Press && k.code == KeyCode::Char('q') {
+        match event::read().ok()? {
+            Event::Key(k)
+                if k.kind == KeyEventKind::Press
+                    && (k.code == KeyCode::Char('q')
+                        || k.code == KeyCode::Char('c') && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)) =>
+            {
                 return Some(true);
             }
+            _ => {}
         }
     }
     Some(false)

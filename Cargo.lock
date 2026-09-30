@@ -1109,6 +1109,7 @@ dependencies = [
  "futures",
  "futures-core",
  "libc",
+ "png",
  "ratatui",
  "tokio",
  "tokio-stream",
