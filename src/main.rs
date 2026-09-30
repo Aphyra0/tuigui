@@ -3,6 +3,7 @@
 //!
 //! Final shape: `tui ./path/to/binary`.
 
+mod comp_bridge;
 mod ui;
 
 use std::path::PathBuf;
@@ -12,10 +13,8 @@ use clap::Parser;
 use futures::{Stream, StreamExt};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
-use tuigui_cage::{
-    CageFrameSource, CageSession, CageSpec, CaptureConfig, HeadlessConfig, InputSink, InputSock,
-    KeyEvent, KeyState, PointerEvent,
-};
+use tuigui_cage::{KeyEvent, KeyState, PointerEvent};
+use tuigui_comp::Compositor;
 use tuigui_streamer::{FrameSource, Mp4VideoSource, PinkFrameSource};
 use tuigui_tgp::proto as tgp;
 use tuigui_tgp::{EncoderConfig, EncoderEvent, EncoderError, TgpEncoder};
@@ -179,31 +178,27 @@ async fn main() -> Result<()> {
 
     let app_path = cli.app.clone().unwrap();
 
-    let spec = CageSpec::new(&app_path);
     // Size the virtual display to the terminal's drawing area so the app's
-    // pixels map ~1:1 to on-screen cells; avoids resampling the capture.
+    // pixels map ~1:1 to on-screen cells. `scale` shrinks the output
+    // resolution directly (the client is created at the smaller size), so no
+    // post-capture downscale work is needed.
     let (tcols, trows) = terminal_pixel_size()?;
     let scale = cli.scale.clamp(1.0, 4.0);
+    let (cw, ch) = scaled_size(tcols, trows, scale);
     let (pc, pr) = pane_placement()?;
-    let cfg = HeadlessConfig {
-        width: tcols,
-        height: trows,
-        ..HeadlessConfig::default()
-    };
 
-    // 1. Launch the caged session.
-    let session = CageSession::spawn(spec, cfg)
-        .await
-        .context("spawning headless cage session")?;
-    tracing::info!(socket = %session.wayland_socket().display(), "session up");
+    // 1. Launch the in-process compositor and spawn the app into it. `Client`
+    //    is the handle for capture + input; `Compositor` stays alive for the
+    //    session and shuts the headless thread down on drop.
+    let compositor = Compositor::init((cw, ch)).context("starting compositor")?;
+    tracing::info!(socket = %compositor.wayland_socket().display(), "compositor up");
+    let client = compositor
+        .spawn(&app_path, (cw, ch))
+        .context("spawning app into compositor")?;
 
-    // 2. Attach capture. The capture feed doubles as a tuigui-streamer
-    //    FrameSource; the TGP encoder is codec-agnostic and only sees frames.
-    //    `scale` shrinks each captured frame so the encoder sees fewer pixels.
-    let capture = CaptureConfig::new(session.wayland_socket().clone())
-        .max_fps(cli.max_fps)
-        .scale(scale);
-    let source = CageFrameSource::connect(&capture).context("connecting screencopy client")?;
+    // 2. Attach a FrameSource that pulls committed frames. The TGP encoder is
+    //    codec-agnostic and only sees frames.
+    let source = comp_bridge::CompFrameSource::new(client.clone(), cli.max_fps);
 
     // 3. Encode to a TGP byte stream, scaled to fill the pane (in cells).
     //    Every frame is fully transmitted and placed; no delta/damage logic.
@@ -246,63 +241,24 @@ async fn main() -> Result<()> {
     let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
 
     // Input pipeline: the render loop pushes events into a channel (never
-    // blocking), and a dedicated writer task drains them into the Wayland
-    // virtual pointer. This fully decouples input I/O (which can block on a
-    // full socket) from the render loop, so flooding mouse events can never
-    // stall the stream or the quit key.
-    let (tx, mut rx) = mpsc::unbounded_channel::<InputMsg>();
-    let sock_path = session.wayland_socket().clone();
-    let (tw, th) = (tcols, trows);
-    let writer = tokio::spawn(async move {
-        // Connect with a timeout so a slow/refusing server just disables input.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
-            let mut ins = InputSock::connect(&sock_path)?;
-            ins.set_frame_size(tw, th);
-            Ok::<_, anyhow::Error>(ins)
+    // blocking), and a dedicated std thread drains them into the compositor's
+    // seat. This fully decouples input I/O (which can block on the cross-thread
+    // channel) from the render loop, so flooding mouse events can never stall
+    // the stream or the quit key.
+    let (tx, rx) = mpsc::unbounded_channel::<InputMsg>();
+    let writer_client = client.clone();
+    std::thread::Builder::new()
+        .name("tuigui-comp-input".into())
+        .spawn(move || {
+            comp_bridge::input_writer_loop(&writer_client, rx);
         })
-        .await;
-        let mut sink: Option<Box<dyn InputSink>> = match result {
-            Ok(Ok(ins)) => Some(Box::new(ins)),
-            Ok(Err(e)) => {
-                tracing::warn!(err = %e, "input injection unavailable");
-                None
-            }
-            Err(_) => {
-                tracing::warn!("input connect timed out; input disabled");
-                None
-            }
-        };
-        // Drain queued events into the sink until the channel closes (render
-        // loop exit). Blocking sends live here, off the render loop.
-        while let Some(msg) = rx.recv().await {
-            if let Some(s) = sink.as_mut() {
-                match msg {
-                    InputMsg::Key(kev) => {
-                        let _ = s.send_key(kev).await;
-                    }
-                    InputMsg::Pointer(pev) => {
-                        let _ = s.send_pointer(pev).await;
-                    }
-                }
-            }
-        }
-    });
+        .context("spawning input writer thread")?;
 
-    let res = run_ui(
-        terminal,
-        &mut tgp_stream,
-        &app_path,
-        Some(session),
-        (tcols, trows),
-        tx,
-    )
-    .await;
-    // The writer task holds a clone of runtime resources (its rx channel). If
-    // it is parked inside a blocking Wayland flush it won't observe tx closing
-    // via rx.recv() returning None, so it would keep the tokio runtime alive
-    // and the process would hang after `q`. Abort it now that the UI loop is
-    // done.
-    writer.abort();
+    let res = run_ui(terminal, &mut tgp_stream, &app_path, (tcols, trows), tx).await;
+    // Drop tx is handled inside run_ui; the input thread observes the channel
+    // close and exits. Shut the compositor thread down now that streaming is
+    // over.
+    compositor.shutdown();
     res
 }
 
@@ -458,6 +414,17 @@ fn pane_placement() -> Result<(u32, u32)> {
     Ok((cols as u32, (rows - 3) as u32))
 }
 
+/// Divide a full-resolution pixel size by `scale` (>=1), floors, and never
+/// lets a dimension drop below 1. The compositor is created at this lower
+/// resolution so the captured frames stream directly without a downscale step.
+fn scaled_size(w: u32, h: u32, scale: f32) -> (u32, u32) {
+    let s = scale.max(1.0);
+    (
+        ((w as f32) / s).floor().max(1.0) as u32,
+        ((h as f32) / s).floor().max(1.0) as u32,
+    )
+}
+
 /// Drain any TGP stream writing raw bytes to `out` until Ended.
 async fn drain_to_file<S>(mut stream: S, out: &str) -> Result<()>
 where
@@ -515,15 +482,7 @@ async fn run_video_tui(path: &str, blocks: u32, png: bool) -> Result<()> {
     let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     // No Wayland session here; forward inputs into a discard sink.
     let (tx, _rx) = mpsc::unbounded_channel::<InputMsg>();
-    run_ui(
-        terminal,
-        &mut tgp_stream,
-        &format!("video: {path}"),
-        None,
-        (0, 0),
-        tx,
-    )
-    .await
+    run_ui(terminal, &mut tgp_stream, &format!("video: {path}"), (0, 0), tx).await
 }
 
 /// A queued input event for the writer task: keyboard or pointer.
@@ -536,7 +495,6 @@ async fn run_ui(
     mut terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
     tgp_stream: &mut (impl Unpin + Stream<Item = Result<EncoderEvent, EncoderError>>),
     app_path: &str,
-    session: Option<CageSession>,
     output_px: (u32, u32),
     tx: mpsc::UnboundedSender<InputMsg>,
 ) -> Result<()> {
@@ -779,9 +737,6 @@ async fn run_ui(
     // Close the input channel so the writer task's recv() returns None and it
     // exits; otherwise the runtime waits on it forever and the binary hangs.
     drop(tx);
-    if let Some(s) = session {
-        s.shutdown().await.ok();
-    }
     Ok(())
 }
 
@@ -910,29 +865,19 @@ fn mouse_to_pointer(
     out
 }
 
-/// `--debug-capture`: spawn the caged session exactly like the real path, but
-/// instead of streaming the frames to the TGP encoder, write a live screenshot
-/// of the app to a PNG file every `interval` seconds (overwriting the previous
-/// one). Use it to inspect what the headless app actually renders.
+/// `--debug-capture`: spawn the app inside the compositor exactly like the
+/// real path, but instead of streaming the frames to the TGP encoder, write a
+/// live screenshot of the app to a PNG file every `interval` seconds
+/// (overwriting the previous one). Use it to inspect what the headless app
+/// actually renders.
 async fn run_capture_png(cli: &Cli) -> Result<()> {
-    use tuigui_cage::{CaptureConfig, PageSource};
-
     let app_path = cli.app.clone().unwrap();
-    let spec = CageSpec::new(&app_path);
     let (tcols, trows) = terminal_pixel_size()?;
-    let cfg = HeadlessConfig {
-        width: tcols,
-        height: trows,
-        ..HeadlessConfig::default()
-    };
 
-    let session = CageSession::spawn(spec, cfg)
-        .await
-        .context("spawning headless cage session")?;
-    tracing::info!(socket = %session.wayland_socket().display(), "session up");
-
-    let mut source = PageSource::connect(&CaptureConfig::new(session.wayland_socket().clone()))
-        .context("connecting screencopy client")?;
+    let compositor = Compositor::init((tcols, trows)).context("starting compositor")?;
+    let client = compositor
+        .spawn(&app_path, (tcols, trows))
+        .context("spawning app into compositor")?;
     let interval = std::time::Duration::from_secs_f64(cli.capture_interval.max(0.05));
 
     tracing::info!(
@@ -941,13 +886,20 @@ async fn run_capture_png(cli: &Cli) -> Result<()> {
         "debug-capture: overwriting PNG every interval"
     );
     loop {
-        match source.capture_once() {
-            Ok(shot) => {
-                shot.write_png(&cli.capture_out)?;
+        match client.capture() {
+            Ok(frame) => {
+                let mut file = std::io::BufWriter::new(std::fs::File::create(&cli.capture_out)?);
+                {
+                    let mut enc = png::Encoder::new(&mut file, frame.width, frame.height);
+                    enc.set_color(png::ColorType::Rgba);
+                    enc.set_depth(png::BitDepth::Eight);
+                    let mut writer = enc.write_header()?;
+                    writer.write_image_data(&frame.rgba)?;
+                }
                 tracing::info!(
                     out = %cli.capture_out,
-                    width = shot.width,
-                    height = shot.height,
+                    width = frame.width,
+                    height = frame.height,
                     "screenshot written"
                 );
             }
@@ -1051,7 +1003,6 @@ async fn run_pink_streaming() -> Result<()> {
         terminal,
         &mut tgp_stream,
         "debug-streaming: pink",
-        None,
         (0, 0),
         tx,
     )

@@ -1,0 +1,242 @@
+//! Bridge from the in-process compositor (`tuigui-comp`) to the streaming and
+//! input pipelines, mirroring the roles `CageFrameSource` / `InputSock` filled
+//! for the external `cage` binary.
+
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use async_trait::async_trait;
+use bytes::Bytes;
+use tuigui_cage::PointerEvent;
+use tuigui_comp::{Client, Rect, ScrollDelta};
+use tuigui_streamer::{
+    Cadence, Frame, FrameMetadata, FrameSource, FrameUpdate, PixelFormat, SourceError,
+};
+use tokio::sync::mpsc;
+
+use crate::InputMsg;
+
+/// A [`FrameSource`] that pulls frames from a `tuigui-comp` [`Client`] by
+/// blocking `capture()` round-trips, paced to `max_fps`. The client is created
+/// at the scaled resolution upstream, so captured frames need no downscale.
+pub struct CompFrameSource {
+    client: Client,
+    max_fps: u32,
+    last_dims: Option<(u32, u32)>,
+    prev_emit: Option<Instant>,
+    seen_content: bool,
+    boot_start: Instant,
+}
+
+impl CompFrameSource {
+    pub fn new(client: Client, max_fps: u32) -> Self {
+        CompFrameSource {
+            client,
+            max_fps,
+            last_dims: None,
+            prev_emit: None,
+            seen_content: false,
+            boot_start: Instant::now(),
+        }
+    }
+}
+
+/// Convert `tuigui-comp::Rect` (pixel damage) into `tuigui-streamer::Rect`.
+fn to_streamer_damage(damage: Vec<Rect>) -> Vec<tuigui_streamer::Rect> {
+    damage
+        .into_iter()
+        .map(|r| tuigui_streamer::Rect {
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
+        })
+        .collect()
+}
+
+/// True when a frame is entirely (or almost entirely) black — the signature of
+/// a pre-paint capture frame.
+fn frame_blank(rgba: &[u8]) -> bool {
+    const SAMPLE: usize = 64;
+    let px = rgba.len() / 4;
+    if px == 0 {
+        return true;
+    }
+    let step = (px / SAMPLE).max(1);
+    for (i, px0) in rgba.as_chunks::<4>().0.iter().enumerate().step_by(step) {
+        if i >= SAMPLE {
+            break;
+        }
+        if px0[0] > 8 || px0[1] > 8 || px0[2] > 8 {
+            return false;
+        }
+    }
+    true
+}
+
+#[async_trait]
+impl FrameSource for CompFrameSource {
+    fn metadata(&self) -> FrameMetadata {
+        let (width, height) = self.last_dims.unwrap_or((0, 0));
+        FrameMetadata {
+            width,
+            height,
+            format: PixelFormat::Rgba32,
+        }
+    }
+
+    fn cadence(&self) -> Cadence {
+        Cadence::Live
+    }
+
+    async fn next(&mut self) -> Result<Option<FrameUpdate>, SourceError> {
+        // Pace the producer to the configured frame interval so it can't
+        // outrun the sink (mirrors the cage path's rate limiter).
+        if let Some(prev) = self.prev_emit {
+            let elapsed = prev.elapsed();
+            let interval = Duration::from_secs_f32(1.0 / self.max_fps.max(1) as f32);
+            if elapsed < interval {
+                tokio::time::sleep(interval - elapsed).await;
+            }
+        }
+        let frame = match self.client.capture() {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(err = %e, "comp capture failed; treating as idle");
+                self.prev_emit = Some(Instant::now());
+                return Ok(Some(FrameUpdate::Idle));
+            }
+        };
+        self.prev_emit = Some(Instant::now());
+
+        // The client is created at the scaled resolution in main.rs, so the
+        // captured frame is already the size we stream — no resample needed.
+        let (nw, nh) = (frame.width, frame.height);
+        let data = Bytes::from(frame.rgba);
+        self.last_dims = Some((nw, nh));
+
+        let streamer_frame = Frame {
+            metadata: FrameMetadata {
+                width: nw,
+                height: nh,
+                format: PixelFormat::Rgba32,
+            },
+            data,
+            presentation_timestamp: None,
+            timing: None,
+            damage: to_streamer_damage(frame.damage),
+        };
+
+        // Skip blank boot frames until real content appears (or a budget
+        // elapses, so genuinely unlit apps still show), mirroring the cage path.
+        let blank = frame_blank(&streamer_frame.data);
+        if !self.seen_content {
+            const BLANK_BUDGET: Duration = Duration::from_secs(5);
+            if blank && self.boot_start.elapsed() < BLANK_BUDGET {
+                return Ok(Some(FrameUpdate::Idle));
+            }
+        }
+        self.seen_content = true;
+        Ok(Some(FrameUpdate::Frame(streamer_frame)))
+    }
+}
+
+/// Convert a cage `KeyEvent` (evdev code + state) into a `tuigui-comp` `Key`.
+/// Returns `None` for keys the comp client can't represent yet.
+pub fn comp_key_from_evdev(code: u32, pressed: bool) -> Option<(tuigui_comp::Key, tuigui_comp::KeyState)> {
+    use tuigui_comp::Key;
+    let key = match code {
+        28 => Key::Return,
+        15 => Key::Tab,
+        14 => Key::Backspace,
+        111 => Key::Delete,
+        1 => Key::Escape,
+        57 => Key::Space,
+        105 => Key::Left,
+        106 => Key::Right,
+        103 => Key::Up,
+        108 => Key::Down,
+        102 => Key::Home,
+        107 => Key::End,
+        104 => Key::PageUp,
+        109 => Key::PageDown,
+        _ => return to_printable_key(code),
+    };
+    let state = if pressed {
+        tuigui_comp::KeyState::Pressed
+    } else {
+        tuigui_comp::KeyState::Released
+    };
+    Some((key, state))
+}
+
+/// Map an evdev code in the letter/number/symbol ranges to a printable char
+/// (matches `char_evdev` in `tuigui-comp`). Returns its `Key::Char`.
+fn to_printable_key(code: u32) -> Option<(tuigui_comp::Key, tuigui_comp::KeyState)> {
+    let c = match code {
+        2 => '1', 3 => '2', 4 => '3', 5 => '4', 6 => '5', 7 => '6', 8 => '7', 9 => '8', 10 => '9',
+        11 => '0',
+        12 => '-', 13 => '=', 26 => '[', 27 => ']', 39 => ';', 40 => '\'', 41 => '`',
+        43 => '\\', 51 => ',', 52 => '.', 53 => '/',
+        30..=38 => (b'a' + (code - 30) as u8) as char,
+        _ => return None,
+    };
+    Some((tuigui_comp::Key::Char(c), tuigui_comp::KeyState::Pressed))
+}
+
+/// Drain an `mpsc::UnboundedReceiver<InputMsg>` on a dedicated std thread and
+/// forward each event into the `Client`. Returns when the channel closes.
+pub fn input_writer_loop(client: &Client, mut rx: mpsc::UnboundedReceiver<InputMsg>) {
+    while let Some(msg) = rx.blocking_recv() {
+        match msg {
+            InputMsg::Key(kev) => {
+                let pressed = kev.state == tuigui_cage::KeyState::Press;
+                if let Some((key, state)) = comp_key_from_evdev(kev.code, pressed) {
+                    if let Err(e) = client.key(key, state) {
+                        tracing::warn!(err = %e, "comp key failed");
+                    }
+                }
+            }
+            InputMsg::Pointer(pev) => comp_pointer(client, pev),
+        }
+    }
+}
+
+/// Translate a [`PointerEvent`] into blocking `Client` calls.
+fn comp_pointer(client: &Client, ev: PointerEvent) {
+    match ev {
+        PointerEvent::Motion { x, y } => {
+            if let Err(e) = client.move_mouse(x, y) {
+                tracing::warn!(err = %e, "comp mouse move failed");
+            }
+        }
+        PointerEvent::Button { code, state } => {
+            // `Client::click` already sends press+release. Only act on the
+            // Press half of a real click; the matching Release is redundant
+            // (forwarding both would make one physical click fire twice).
+            if state != tuigui_cage::KeyState::Press {
+                return;
+            }
+            let button = match code {
+                0x110 => Some(tuigui_comp::Button::Left),
+                0x111 => Some(tuigui_comp::Button::Right),
+                0x112 => Some(tuigui_comp::Button::Middle),
+                _ => None,
+            };
+            if let Some(button) = button {
+                if let Err(e) = client.click(button) {
+                    tracing::warn!(err = %e, "comp click failed");
+                }
+            }
+        }
+        PointerEvent::Axis { dx, dy } => {
+            let delta = ScrollDelta {
+                vertical: dy.round() as i32,
+                horizontal: dx.round() as i32,
+            };
+            if let Err(e) = client.scroll(delta) {
+                tracing::warn!(err = %e, "comp scroll failed");
+            }
+        }
+    }
+}

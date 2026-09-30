@@ -104,6 +104,10 @@
             buildInputs = with pkgs; [
               wayland
               wayland-protocols
+              # system libs the comp crate (in-process smithay compositor)
+              # links against: pixman renderer + xkbcommon keymaps
+              pixman
+              libxkbcommon
             ];
 
             meta = with pkgs.lib; {
@@ -144,6 +148,9 @@
               pkgs.wayland
               pkgs.wayland-protocols
               pkgs.wayland-scanner
+              # libs the comp crate (in-process smithay compositor) links against
+              pkgs.pixman
+              pkgs.libxkbcommon
               # runtime for the cage head + demo apps to stream + TGP test terminals
               pkgs.cage
               pkgs.foot

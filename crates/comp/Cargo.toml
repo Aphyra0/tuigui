@@ -1,0 +1,17 @@
+[package]
+name = "tuigui-comp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Minimal in-process headless Wayland compositor for capture + input"
+
+[dependencies]
+smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend", "renderer_pixman", "desktop"] }
+wayland-client = { workspace = true }
+wayland-protocols = { workspace = true, features = ["client"] }
+memmap2 = { workspace = true }
+rustix = { version = "0.38", features = ["fs", "mm"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
