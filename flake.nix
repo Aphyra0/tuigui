@@ -39,6 +39,45 @@
           };
         in
         {
+          # Public-domain (1887 Eadweard Muybridge) capybara clip, transcoded
+          # from Wikimedia's WebM to a YUV420P H.264 MP4 (even-dims) so any
+          # consumer can decode it with baseline ffmpeg. Stable URL, no
+          # attribution or reuse restrictions.
+          # capyVideo — sample capybara video for the `--video` streaming path.
+          #
+          # Source: "Animal Locomotion Pl.746 - Capybara Walking" (1887), a
+          # manually reconstructed animation of Eadweard Muybridge's walk-cycle
+          # photographs (photos 1-9 of Plate 746).
+          #   - Project homepage: https://commons.wikimedia.org/wiki/File:Animal_Locomotion_Pl.746_-_Capybara_Walking.webm
+          #   - Full history / background article (the 1887 Animal Locomotion
+          #     plate series this clip came from):
+          #     https://en.wikipedia.org/wiki/Animal_Locomotion_(Muybridge)
+          #   - License: Public domain (PD-old-100 + PD-Mark; no attribution,
+          #     no reuse restrictions). Not used on any wiki project page —
+          #     only hosted on Wikimedia Commons.
+          #   - Direct file URL (stable, permanent): the fetchurl below.
+          #   - Format: 1s WebM (VP9), 1693x1221, ~1.2 MB. Transcoded to
+          #     H.264 MP4 here because the source has ODD pixel dimensions
+          #     (1693x1221), which baseline decoders/encoders reject; the
+          #     scale filter rounds to even dims (1692x1220), YUV420P, audio
+          #     dropped. ~1 MB output.
+          #   - Exposed to the dev shell as `CAPY_VID_PATH`.
+          capyVideo = pkgs.stdenv.mkDerivation {
+            pname = "capy-video";
+            version = "0.1.0";
+            src = pkgs.fetchurl {
+              url = "https://upload.wikimedia.org/wikipedia/commons/e/e9/Animal_Locomotion_Pl.746_-_Capybara_Walking.webm";
+              sha256 = "sha256-y85/twSZdOqqEmW22vlN3p8Cod5zvmbMyX+K2KT+xwg=";
+            };
+            nativeBuildInputs = with pkgs; [ ffmpeg ];
+            buildCommand = ''
+              mkdir -p $out
+              ffmpeg -y -loglevel error -i $src \
+                -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
+                -c:v libx264 -pix_fmt yuv420p -an $out/capybara.mp4
+            '';
+          };
+
           # buildRustPackage splits the build into a `cargoDeps` derivation
           # hashed only on Cargo.lock plus the app derivation itself, so
           # dependency objects stay in the store across rebuilds that only
@@ -81,9 +120,17 @@
         system:
         let
           pkgs = pkgsFor system;
+          # Capybara demo video, pinned to the capyVideo package above.
+          # `CAPY_VID_PATH` points at the transcoded H.264 MP4 so dev tools
+          # can stream it with `tuigui --video "$CAPY_VID_PATH"` without
+          # handling licensing or re-encoding themselves.
+          capy = self.packages.${system}.capyVideo or (pkgs.runCommand "capy-video" {} "mkdir -p $out; touch $out/capybara.mp4; echo 'no capybara package; build default first' >&2");
         in
         {
           default = pkgs.mkShell {
+            shellHook = ''
+              export CAPY_VID_PATH="${capy}/capybara.mp4"
+            '';
             packages = [
               # rustup "minimal" profile (rustc, cargo, rust-std) plus the two
               # dev tools; binaries come from upstream's dist tarballs.

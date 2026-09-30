@@ -92,10 +92,11 @@ struct Cli {
     #[arg(long, default_value_t = 1.0)]
     capture_interval: f64,
 
-    /// Stream as NxN-pixel micro-blocks instead of one full-frame image.
-    /// `0` (default) disables block streaming. When set, the encoder diffs each
-    /// block against the previous frame and retransmits only the changed ones.
-    #[arg(long, value_name = "N", default_value_t = 0)]
+    /// Split the canvas into an NxN block grid and stream changes via the
+    /// kitty animation backend (`a=f` rect edits into one root frame).
+    /// `10` (default) = 10x10 grid (100 blocks). The transmit+place backend
+    /// was removed; this is the only encode path.
+    #[arg(long, value_name = "N", default_value_t = 10)]
     blocks: u32,
 
     /// With --blocks, the downscale factor applied to the *loading* layer — a
@@ -169,10 +170,11 @@ async fn main() -> Result<()> {
     }
     if let Some(path) = cli.video {
         // Dialect for --out: write raw TGP bytes to a file (no TUI).
-        if let Some(out) = cli.out {
-            return run_video_to_file(&path, &out, cli.loop_video).await;
+        if let Some(out) = cli.out.clone() {
+            let blocks = cli.blocks;
+            return run_video_to_file(&path, &out, cli.loop_video, blocks, !cli.no_png).await;
         }
-        return run_video_tui(&path).await;
+        return run_video_tui(&path, cli.blocks, !cli.no_png).await;
     }
 
     let app_path = cli.app.clone().unwrap();
@@ -305,7 +307,7 @@ async fn main() -> Result<()> {
 }
 
 /// Stream a video file's decoded frames through the TGP encoder into a file.
-async fn run_video_to_file(path: &str, out: &str, loop_forever: bool) -> Result<()> {
+async fn run_video_to_file(path: &str, out: &str, loop_forever: bool, blocks: u32, png: bool) -> Result<()> {
     let explicit_ffmpeg = std::env::var("FFMPEG_BIN").ok();
     let explicit_ffprobe = std::env::var("FFPROBE_BIN").ok();
     tracing::info!(?explicit_ffmpeg, ?explicit_ffprobe, "video mode ffmpeg overrides");
@@ -320,7 +322,13 @@ async fn run_video_to_file(path: &str, out: &str, loop_forever: bool) -> Result<
     let meta = src.metadata();
     tracing::info!(width = meta.width, height = meta.height, "video opened");
 
-    let encoder = TgpEncoder::new(EncoderConfig::default());
+    let encoder = TgpEncoder::new(EncoderConfig {
+        png,
+        blocks_per_side: blocks,
+        placement_columns: 80,
+        placement_rows: 24,
+        ..Default::default()
+    });
     let stream = encoder.into_stream(src);
     drain_to_file(stream, out).await
 }
@@ -478,7 +486,7 @@ where
 /// Stream the decoded frames of `path` through the TGP encoder into the live
 /// ratatui TUI shell (no cage, no Wayland): validates the display path a
 /// TGP-capable terminal sees when consuming our byte stream.
-async fn run_video_tui(path: &str) -> Result<()> {
+async fn run_video_tui(path: &str, blocks: u32, png: bool) -> Result<()> {
     let explicit_ffmpeg = std::env::var("FFMPEG_BIN").ok();
     let explicit_ffprobe = std::env::var("FFPROBE_BIN").ok();
     let src = Mp4VideoSource::open(
@@ -491,7 +499,17 @@ async fn run_video_tui(path: &str) -> Result<()> {
     let meta = src.metadata();
     tracing::info!(width = meta.width, height = meta.height, "video opened in TUI (looping)");
 
-    let encoder = TgpEncoder::new(EncoderConfig::default());
+    // Animation backend with PNG: one root frame, per-block a=f edits. Use the
+    // same pane placement as the app path (body minus the footer rows) so the
+    // image is exactly as large as ui::draw's body rect.
+    let (pc, pr) = pane_placement()?;
+    let encoder = TgpEncoder::new(EncoderConfig {
+        png,
+        blocks_per_side: blocks,
+        placement_columns: pc,
+        placement_rows: pr,
+        ..Default::default()
+    });
     let mut tgp_stream = encoder.into_stream(src);
 
     let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;

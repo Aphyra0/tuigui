@@ -78,32 +78,32 @@ pub struct EncoderConfig {
     /// bits snap the pixel to the nearest representable shade. Unused when
     /// [`png`](/self#structfield-png) is false.
     pub color_bits: u8,
-    /// Stream as an `N x N` grid of micro-blocks instead of a single full-frame
-    /// image. `0` (default) disables block streaming: every frame is one
-    /// transmit+place. When `> 0`, the encoder diffs each block against the
-    /// previous frame's content and only edits the changed ones in place.
+    /// The animation backend's block grid: the canvas is split into an
+    /// `N x N` grid and each changed block is diffed and edited in place with
+    /// `a=f` animation-frame commands. `10` (default) = a 10x10 grid (100
+    /// blocks). The encoder never falls back to whole-frame transmit+place.
     pub blocks_per_side: u32,
-    /// With `blocks_per_side > 0`, the downscale factor applied to the *loading*
-    /// layer — a coarse copy of the canvas stacked on top (front, z=1) of the
-    /// full-res sharp layer (z=0). While a block changes it is shown coarse on
-    /// the loading layer; once it settles the block's rect is cleared there to
-    /// transparent so the sharp layer shows through. `0` (default) disables the
-    /// loading layer entirely (single-layer animation backend).
+    /// The downscale factor applied to the *loading* layer — a coarse copy of the
+    /// canvas stacked on top (front, z=1) of the full-res sharp layer (z=0).
+    /// While a block changes it is shown coarse on the loading layer; once it
+    /// settles the block's rect is cleared there to transparent so the sharp
+    /// layer shows through. `0` (default) disables the loading layer entirely
+    /// (single-layer animation backend).
     pub loading_scale: u32,
-    /// With `blocks_per_side > 0`, detail-adaptive resolution ceilings: each block's
+    /// Detail-adaptive resolution ceilings: each block's
     /// largest neighbor color difference picks its ceiling on a linear ladder
     /// (see `spec/LOD.md`). Disabled keeps the classic always-full ladder.
     pub detail: tuigui_streamer::blocks::DetailConfig,
-    /// With `blocks_per_side > 0`, tint each transmitted block's payload red in
+    /// Tint each transmitted block's payload red in
     /// proportion to its resolution level (level 1 untouched, higher = more
     /// red). Visually proves what resolution each block settles at.
     pub debug_lod: bool,
-    /// With `blocks_per_side > 0`, colorize every other block (linear grid
+    /// Colorize every other block (linear grid
     /// index odd) with a per-block pseudo-random color that changes each frame,
     /// and leave even blocks as the real pixels. Visually proves the block grid
     /// and the per-block diffing. `false` (default) transmits true pixels.
     pub debug_blocks: bool,
-    /// With `blocks_per_side > 0`, the pane's top-left cell in terminal
+    /// The pane's top-left cell in terminal
     /// coordinates (0-based, as ratatui reports). Unused here (the pane is
     /// positioned once by the host TUI); kept for API stability.
     pub pane_origin: Option<(u16, u16)>,
@@ -119,7 +119,7 @@ impl Default for EncoderConfig {
             placement_rows: 0,
             png: false,
             color_bits: 8,
-            blocks_per_side: 0,
+            blocks_per_side: 10,
             loading_scale: 0,
             detail: Default::default(),
             debug_lod: false,
@@ -145,10 +145,10 @@ pub struct TgpEncoder {
     image_id: u32,
     /// Running frame count, used as a seed for `--debug-blocks` colorization.
     frame_count: u64,
-    /// Block differ, only used when `config.blocks_per_side > 0`. Built with
+    /// Block differ: the animation backend's change detector. Built with
     /// `res_levels=1` (pure change detection) — the ladder is not used; the
     /// loading layer provides all LOD via `loading_scale`.
-    blocks: Option<tuigui_streamer::blocks::BlockGrid>,
+    blocks: tuigui_streamer::blocks::BlockGrid,
     /// Full-res sharp canvas image id (z=0). The source of truth.
     sharp_id: Option<u32>,
     /// Whether the sharp canvas has been transmitted+placed yet.
@@ -166,18 +166,12 @@ pub struct TgpEncoder {
 
 impl TgpEncoder {
     pub fn new(config: EncoderConfig) -> Self {
-        let blocks = (config.blocks_per_side > 0).then(|| {
-            // Pure change detection (res_levels=1): the two-layer loading
-            // scheme does LOD by downscaling whole blocks onto the coarse layer,
-            // not via a per-block sharpening ladder.
-            tuigui_streamer::blocks::BlockGrid::new(
-                config.blocks_per_side,
-                config.blocks_per_side,
-                1,
-                config.detail,
-                config.debug_lod,
-            )
-        });
+        // Pure change detection (res_levels=1): the two-layer loading
+        // scheme does LOD by downscaling whole blocks onto the coarse layer,
+        // not via a per-block sharpening ladder. The animation backend is the
+        // only encode path, so a block grid is mandatory.
+        let n = config.blocks_per_side.max(1);
+        let blocks = tuigui_streamer::blocks::BlockGrid::new(n, n, 1, config.detail, config.debug_lod);
         TgpEncoder {
             config,
             // Image ids are a shared namespace with other TGP programs; start
@@ -242,7 +236,6 @@ impl TgpEncoder {
         mut on_event: impl FnMut(EncoderEvent) -> Result<(), EncoderError>,
     ) -> Result<(), EncoderError> {
         let mut last_meta: Option<FrameMetadata> = None;
-        let mut prev_image_id: Option<u32> = None;
         let (placement_columns, placement_rows) = (self.config.placement_columns, self.config.placement_rows);
 
         loop {
@@ -288,19 +281,13 @@ impl TgpEncoder {
                         damage = frame.damage.len(),
                         "encoder frame start"
                     );
-                    let cur_id = self.image_id;
-                    self.image_id = self.image_id.wrapping_add(1);
                     let t_encode = Instant::now();
-                    let (mut edited_this_frame, grid_total): (u32, u32) = {
-                        if let Some(g) = self.blocks.as_ref() {
-                            (0, g.cols() * g.rows())
-                        } else {
-                            (0, 0)
-                        }
-                    };
-                    if let Some(grid) = self.blocks.as_mut() {
+                    let grid_total = self.blocks.cols() * self.blocks.rows();
+                    let edited_this_frame: u32;
+                    {
                         let seed = self.frame_count.wrapping_add(1);
-                        let n_slots = (grid.cols() * grid.rows()) as usize;
+                        let n_slots = (grid_total as usize).max(1);
+                        let grid = &mut self.blocks;
                         let changed = grid.diff(&frame, self.config.debug_blocks, seed);
                         edited_this_frame = (changed.len() as u32).min(grid_total);
                         if self.loading_covered.len() != n_slots {
@@ -331,7 +318,7 @@ impl TgpEncoder {
                             self.sharp_id = Some(sid);
                             self.sharp_placed = true;
                         }
-                        let sharp_id = self.sharp_id.unwrap_or(cur_id);
+                        let sharp_id = self.sharp_id.unwrap_or(0);
 
                         // Establish the loading canvas (z=1, full-size) on frame 1.
                         let scale = self.config.loading_scale.max(1);
@@ -437,20 +424,6 @@ impl TgpEncoder {
                             }
                         }
                         self.frame_count += 1;
-                    } else {
-                        for bytes in full_frame_commands(
-                            &frame,
-                            &base_control(&frame.metadata, cur_id, placement_columns, placement_rows, 0),
-                            self.config.png,
-                            self.config.color_bits,
-                            self.config.zlib,
-                        ) {
-                            on_event(EncoderEvent::Bytes(bytes))?;
-                        }
-                        if let Some(prev) = prev_image_id.take() {
-                            on_event(EncoderEvent::Bytes(delete_image(prev)))?;
-                        }
-                        prev_image_id = Some(cur_id);
                     }
                     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
                     let capture_ms = frame
@@ -618,43 +591,40 @@ fn frame_edit(
     tgp::chunked_transmit(fmt, ctrl, &payload, zlib)
 }
 
-/// Delete a stored image from the terminal.
-fn delete_image(image_id: u32) -> Vec<u8> {
-    tgp::command(
-        &[
-            ('a', "d".into()),
-            ('d', "i".into()),
-            ('i', image_id.to_string()),
-            ('A', "1".into()),
-        ],
-        &[],
-    )
-}
-
-/// Compress raw RGBA/RGB pixel data into a PNG byte string (in-memory).
+/// Compress raw RGB/RGBA pixel data into a PNG byte string (in-memory).
+///
+/// RGB24 input is upgraded to RGBA (alpha=255) before encoding. The animation
+/// backend applies `a=f` edits by alpha-compositing the transmitted block onto
+/// the existing frame, so an edit lacking an alpha channel (an `ColorType::Rgb`
+/// PNG) is dropped and the frame never repaints — only fades. Video sources
+/// decode to RGB24, so they must be widened here or their in-place updates are
+/// silently ignored (first frame shows, nothing after). `a=T` placements are
+/// unaffected either way.
 fn encode_png(data: &[u8], width: u32, height: u32, color_bits: u8) -> bytes::Bytes {
-    let mut buf = Vec::new();
-    let encoded = if color_bits >= 8 {
+    let _ = color_bits; // rounding is applied before this call
+    let pixels: Vec<u8> = if data.len() == (width * height * 4) as usize {
         data.to_vec()
-    } 
-    // raw RGBA payload rounding happens before calling into PNG normally
-    else {
-        data.to_vec()
+    } else {
+        // RGB24 -> RGBA: inject a full-alpha channel so in-place `a=f` edits
+        // carry alpha and aren't dropped by the terminal's compositor.
+        let mut out = Vec::with_capacity((width * height) as usize * 4);
+        for px in data.chunks_exact(3) {
+            out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+        }
+        out
     };
+    let mut buf = Vec::new();
     {
-        #[allow(clippy::needless_range_loop)]
         let mut enc = png::Encoder::new(&mut buf, width, height);
         enc.set_depth(png::BitDepth::Eight);
         enc.set_compression(png::Compression::Default);
         enc.set_color(png::ColorType::Rgba);
         let mut w = enc.write_header().expect("png header");
-        w.write_image_data(&encoded).expect("png data");
+        w.write_image_data(&pixels).expect("png data");
     }
     bytes::Bytes::from(buf)
 }
 
-/// Round each RGBA channel to `bits` significant bits (1-8), snapping the pixel
-/// to the nearest representable level. Alpha untouched. `bits >= 8` is identity.
 fn round_channels(data: &[u8], bits: u8) -> Vec<u8> {
     debug_assert_eq!(data.len() % 4, 0);
     let bits = bits.clamp(1, 8);

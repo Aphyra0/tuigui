@@ -43,6 +43,10 @@ struct Cli {
     /// Grid rows (image cells down).
     #[arg(long, default_value_t = 8)]
     rows: u32,
+    /// In --video, the number of cells per side for the tile grid. 0 uses
+    /// `--cols x --rows`.
+    #[arg(long)]
+    blocks: Option<u32>,
     /// Milliseconds between each full-grid re-transmit (every tile recolors).
     #[arg(long, default_value_t = 1000)]
     interval_ms: u64,
@@ -73,6 +77,11 @@ struct Cli {
     /// With --video, milliseconds per frame. Overrides a later `--interval-ms`.
     #[arg(long)]
     frame_ms: Option<u64>,
+    /// Do all the work (decode, sample tiles, encode, assert) but write nothing
+    /// to stdout — no draw commands escape. Useful to validate the pipeline
+    /// without touching the terminal.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 fn main() -> std::io::Result<()> {
@@ -254,11 +263,10 @@ fn run(out: &mut std::io::Stdout, cli: &Cli, report: &mut Vec<String>) -> std::i
 }
 
 /// Stream `cli.video`'s FIRST frame as the animation root (`a=T`), then a tiny
-/// probe: one random block repainted solid pink via an in-place `a=f r=1` edit
-/// on that same image. If pink shows, the terminal understands the animation
-/// backend and in-place frame edits. `--static-rate 1` freezes the whole image
-/// on the first frame (no edits at all), isolating the root transmit from the
-/// edit path. `q` quits early.
+/// probe: one random tile is repainted solid pink via an in-place `a=f r=1`
+/// edit. If pink shows, the terminal renders in-place animation edits.
+/// `--static-rate 1` freezes the whole image on the first frame (no edits at
+/// all), isolating the root transmit from the edit path. `q` quits early.
 fn run_video(out: &mut std::io::Stdout, cli: &Cli) -> std::io::Result<()> {
     let path = video_path(cli.video.as_deref().unwrap_or("-"))?;
 
@@ -277,6 +285,15 @@ fn run_video(out: &mut std::io::Stdout, cli: &Cli) -> std::io::Result<()> {
     let start = Instant::now();
     let id = 7000u32 + (std::process::id() % 1000);
 
+    // In --dry-run, discard all draw bytes instead of writing to stdout; the
+    // encode/assert work still runs so the pipeline is validated without
+    // touching the terminal.
+    let mut sink: Box<dyn Write> = if cli.dry_run {
+        Box::new(std::io::sink())
+    } else {
+        Box::new(std::io::BufWriter::new(out))
+    };
+
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| std::io::Error::other(format!("tokio runtime: {e}")))?;
     let run_probe: std::io::Result<(u64, usize)> = rt.block_on(async move {
@@ -293,7 +310,8 @@ fn run_video(out: &mut std::io::Stdout, cli: &Cli) -> std::io::Result<()> {
             }
         };
 
-        // Root transmit+place of the first frame.
+        // Root transmit+place of the first frame, scaled by the terminal size (`c`/
+        // `r`) so the full frame is visible regardless of video aspect ratio.
         let ctrl: Vec<(char, String)> = vec![
             ('a', "T".into()),
             ('C', "1".into()),
@@ -306,36 +324,56 @@ fn run_video(out: &mut std::io::Stdout, cli: &Cli) -> std::io::Result<()> {
         ];
         let png = encode_png(&first.data, fw, fh);
         for ch in tuigui_tgp::proto::chunked_transmit(100u32, ctrl, &png, false) {
-            out.write_all(&ch)?;
+            sink.write_all(&ch)?;
             bytes_total += ch.len();
         }
         frames += 1;
 
-        // One random block to repaint solid pink via an in-place `a=f r=1` edit.
+        // Repaint one random tile solid pink via an in-place `a=f r=1` edit.
         // With `--static-rate >= 1` skip the edit and just hold the root.
         let pink_edit: Option<Vec<Vec<u8>>> = if cli.static_rate >= 1.0 {
             None
         } else {
-            // Pick a random block coverage, and a random block offset within it.
+            // Pick the capybara tile grid resolution.
             let div = cli.cols.max(1).min(fw.max(1));
             let bw = fw.div_ceil(div);
             let bh = fh.div_ceil(div);
-            let rng_seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .subsec_nanos() as u64;
-            let bx = (rng_seed % div as u64) as u32;
-            let by = ((rng_seed / 7) % div as u64) as u32;
+
+            // Destination: the tile at grid slot (2,2), offset from the top-left
+            // by two tile steps in both axes (clamped to stay in-bounds).
+            let bx = 2u32;
+            let by = 2u32;
             let x = bx * bw;
             let y = by * bh;
             let w = bw.min(fw - x);
             let h = bh.min(fh - y);
 
-            // Solid pink RGBA block (255,105,180,255).
-            let mut pink = vec![0u8; (w * h) as usize * 4];
-            for px in pink.chunks_exact_mut(4) {
-                px.copy_from_slice(&[255, 105, 180, 255]);
+            // Tile placed at dest tile (2,2): the TOP-LEFT capy tile (slot 0,0), mostly
+            // unaltered except the last 1/5 of pixels, which are overwritten with
+            // solid pink. RGBA, like the pink path.
+            let sx = 0u32;
+            let sy = 0u32;
+            let total_px = (w * h) as usize;
+            let mut tile = vec![0u8; total_px * 4]; // RGBA, exactly like pink
+            for r in 0..h {
+                let src_off = ((sy + r) * fw + sx) as usize * 3; // capy frame is Rgb24
+                for c in 0..w {
+                    let i = (r * w + c) as usize;
+                    let d = i * 4;
+                    if i >= total_px - total_px / 5 {
+                        // keep the original capy pixel unaltered (last 1/5)
+                        let s = src_off + (c as usize) * 3;
+                        tile[d] = first.data[s];
+                        tile[d + 1] = first.data[s + 1];
+                        tile[d + 2] = first.data[s + 2];
+                    } else {
+                        // overwrite this pixel with solid pink
+                        tile[d..d + 3].copy_from_slice(&[255, 105, 180]);
+                    }
+                    tile[d + 3] = 255;
+                }
             }
+
             let ctrl: Vec<(char, String)> = vec![
                 ('a', "f".into()),
                 ('i', id.to_string()),
@@ -346,7 +384,7 @@ fn run_video(out: &mut std::io::Stdout, cli: &Cli) -> std::io::Result<()> {
                 ('v', h.to_string()),
                 ('X', "1".into()),
             ];
-            let png = encode_png(&pink, w, h);
+            let png = encode_png(&tile, w, h);
             Some(tuigui_tgp::proto::chunked_transmit(100u32, ctrl, &png, false))
         };
 
@@ -362,10 +400,10 @@ fn run_video(out: &mut std::io::Stdout, cli: &Cli) -> std::io::Result<()> {
             if let Some(edit) = &pink_edit {
                 if Instant::now() >= next_edit {
                     for ch in edit {
-                        out.write_all(ch)?;
+                        sink.write_all(ch)?;
                         bytes_total += ch.len();
                     }
-                    out.flush()?;
+                    sink.flush()?;
                     next_edit = Instant::now() + edit_cycle;
                 }
             }

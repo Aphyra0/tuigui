@@ -71,8 +71,9 @@ pub fn command(control: &[(char, String)], payload: &[u8]) -> Vec<u8> {
 /// Chunk a payload into TGP-transmittable command sequences (direct medium).
 ///
 /// Chunks are <= 4096 base64 chars; only the first carries `extra_control`;
-/// continuation chunks carry `m=1`, the last `m=0`. The raw payload bytes are
-/// sliced here and passed to [`command`], which performs the single base64
+/// continuation chunks carry only `m=1` (more) / `m=0` (last) — never an `a=`
+/// action, which kitty reserves for starting a new load. The raw payload bytes
+/// are sliced here and passed to [`command`], which performs the single base64
 /// encoding (do NOT pre-encode here, or you'd double-encode).
 ///
 /// When `compress` is true the whole payload is deflated (RFC 1950 zlib) before
@@ -93,6 +94,13 @@ pub fn chunked_transmit(
         (Vec::new(), false)
     };
     let payload: &[u8] = if compressed_payload { &deflated } else { payload };
+    // Kitty's chunked-load protocol keys continuation chunks off the
+    // previously started load, NOT off any key on the chunk itself: a
+    // continuation chunk must carry NO `a=` action (graphics.c routes an
+    // actionless "f"-started load back to the frame handler). Repeating `a=f`
+    // or the image id on a continuation makes kitty treat it as a fresh frame
+    // command and the accumulated buffer finalizes empty -> the edit is
+    // dropped. So continuation chunks carry only `m=1`/`m=0`.
     let mut out = Vec::new();
     let mut offset = 0usize;
     let mut first = true;
@@ -100,7 +108,7 @@ pub fn chunked_transmit(
         let end = (offset + bytes_per_chunk).min(payload.len());
         let chunk = &payload[offset..end];
         let is_last = end == payload.len();
-        let mut control: Vec<(char, String)> = Vec::with_capacity(extra_control.len() + 3);
+        let mut control: Vec<(char, String)> = Vec::with_capacity(extra_control.len() + 4);
         if first {
             control.append(&mut extra_control);
             if compressed_payload {
@@ -191,6 +199,36 @@ mod tests {
         let last = String::from_utf8(chunks.last().unwrap().clone()).unwrap();
         assert!(last.contains("m=0"));
         assert!(!last.contains("f=32"));
+    }
+
+    #[test]
+    fn frame_edit_continuation_chunks_carry_no_action_key() {
+        // Kitty keys continuation chunks off the started load, so a
+        // continuation chunk must not carry `a=f` or the image id (that would
+        // start a fresh frame and drop the accumulated edit). Only the first
+        // chunk carries `a=f` + id; later chunks carry just `m=`.
+        let payload = vec![9u8; 12288]; // -> 4 chunks
+        let chunks = chunked_transmit(
+            32,
+            vec![
+                ('a', "f".into()),
+                ('i', "1".into()),
+                ('x', "0".into()),
+                ('y', "0".into()),
+            ],
+            &payload,
+            false,
+        );
+        assert_eq!(chunks.len(), 4);
+        let s0 = String::from_utf8(chunks[0].clone()).unwrap();
+        assert!(s0.contains("a=f"), "first chunk starts the frame edit: {s0}");
+        assert!(s0.contains("i=1"), "first chunk carries the image id: {s0}");
+        for ch in &chunks[1..] {
+            let s = String::from_utf8(ch.clone()).unwrap();
+            assert!(!s.contains("a=f"), "continuation must not repeat a=f: {s}");
+            assert!(!s.contains("i="), "continuation must not repeat image id: {s}");
+            assert!(s.contains("m="), "continuation must carry more/end flag: {s}");
+        }
     }
 
     #[test]
