@@ -98,12 +98,13 @@ struct Cli {
     #[arg(long, value_name = "N", default_value_t = 0)]
     blocks: u32,
 
-    /// With --blocks, the number of resolution levels on each block's ladder
-    /// (default 4). A changed block repaints at the coarsest level and sharpens
-    /// one rung per static frame up to the block's ceiling; 1 disables the
-    /// ladder (always full res).
-    #[arg(long, value_name = "LEVELS", default_value_t = 0)]
-    res_levels: u32,
+    /// With --blocks, the downscale factor applied to the *loading* layer — a
+    /// coarse copy of the canvas stacked in front (z=1) of the full-res sharp
+    /// layer (z=0). A changing block is shown coarse here; once it settles its
+    /// rect is cleared to transparent so the sharp layer shows through. `0`
+    /// (default) disables the loading layer (single-layer animation backend).
+    #[arg(long, value_name = "SCALE", default_value_t = 0)]
+    loading_scale: u32,
 
     /// With --blocks, enable detail-adaptive resolution ceilings (on by default).
     /// Each block's largest neighbor color difference picks its ceiling on a
@@ -224,7 +225,7 @@ async fn main() -> Result<()> {
         png: !cli.no_png,
         color_bits: cli.color_bits,
         blocks_per_side,
-        res_levels: cli.res_levels,
+        loading_scale: cli.loading_scale,
         detail,
         debug_lod: cli.debug_lod,
         debug_blocks: cli.debug_blocks,

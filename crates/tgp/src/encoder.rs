@@ -33,7 +33,7 @@ pub enum EncoderEvent {
         encode_ms: f64,
         /// Per-phase capture breakdown, when the source reported it.
         timing: Option<tuigui_streamer::frame::CaptureTiming>,
-        /// Number of blocks edited (transmitted as `a=f`) in the last frame.
+        /// Number of blocks edited (transmitted) in the last frame.
         /// `0` when not in block mode.
         tiles_edited: u32,
         /// Total block grid slots (blocks per side squared). `0` when not in
@@ -75,34 +75,24 @@ pub struct EncoderConfig {
     pub png: bool,
     /// Bits of color depth to keep per channel (1-8) when rounding the frame
     /// before PNG encoding. Kept bits are the most significant; dropped low
-    /// bits snap the pixel to the nearest representable shade. This is a cheap,
-    /// deterministic way to shrink the effective color resolution (and thus the
-    /// compressed payload) for flat UI content without the cost or palette
-    /// retraining of a per-frame quantizer. 8 disables rounding (24-bit true
-    /// color). Unused when [`png`](/self#structfield-png) is false.
+    /// bits snap the pixel to the nearest representable shade. Unused when
+    /// [`png`](/self#structfield-png) is false.
     pub color_bits: u8,
     /// Stream as an `N x N` grid of micro-blocks instead of a single full-frame
     /// image. `0` (default) disables block streaming: every frame is one
-    /// transmit+place. When `> 0`, the encoder splits each frame into `N`
-    /// columns × `N` rows of rectangular blocks, diffs each against the previous
-    /// frame's content, and retransmits only the blocks that changed (each as
-    /// its own transmit+place at its grid offset). Unchanged blocks are emitted
-    /// as nothing: the terminal keeps rendering the block from the last frame,
-    /// so a static scene costs almost nothing.
+    /// transmit+place. When `> 0`, the encoder diffs each block against the
+    /// previous frame's content and only edits the changed ones in place.
     pub blocks_per_side: u32,
-    /// With `blocks_per_side > 0`, the number of resolution levels on each
-    /// block's ladder. `0` (default) uses the streamer default (4). Level 1 is
-    /// the coarsest downscale, and level `res_levels` is the block's full
-    /// source resolution. A changed block resets to the lowest level and climbs
-    /// back up one rung per static frame; an unchanged block already shown at
-    /// max resolution costs nothing.
-    pub res_levels: u32,
+    /// With `blocks_per_side > 0`, the downscale factor applied to the *loading*
+    /// layer — a coarse copy of the canvas stacked on top (front, z=1) of the
+    /// full-res sharp layer (z=0). While a block changes it is shown coarse on
+    /// the loading layer; once it settles the block's rect is cleared there to
+    /// transparent so the sharp layer shows through. `0` (default) disables the
+    /// loading layer entirely (single-layer animation backend).
+    pub loading_scale: u32,
     /// With `blocks_per_side > 0`, detail-adaptive resolution ceilings: each block's
     /// largest neighbor color difference picks its ceiling on a linear ladder
-    /// (see `spec/LOD.md`). Solid fills cap at the coarsest, differences inside
-    /// the [`DetailConfig::dead_zone`] top band resolve at full res, and
-    /// differences below grade linearly across `res_levels`. Disabled keeps the
-    /// classic always-full ladder.
+    /// (see `spec/LOD.md`). Disabled keeps the classic always-full ladder.
     pub detail: tuigui_streamer::blocks::DetailConfig,
     /// With `blocks_per_side > 0`, tint each transmitted block's payload red in
     /// proportion to its resolution level (level 1 untouched, higher = more
@@ -111,20 +101,14 @@ pub struct EncoderConfig {
     /// With `blocks_per_side > 0`, colorize every other block (linear grid
     /// index odd) with a per-block pseudo-random color that changes each frame,
     /// and leave even blocks as the real pixels. Visually proves the block grid
-    /// and the per-block diffing: even blocks on a static frame stay silent,
-    /// odd blocks keep streaming. `false` (default) transmits true pixels.
+    /// and the per-block diffing. `false` (default) transmits true pixels.
     pub debug_blocks: bool,
     /// With `blocks_per_side > 0`, the pane's top-left cell in terminal
-    /// coordinates (0-based, as ratatui reports). The encoder individually
-    /// positions each block's transmit+place by moving the cursor to the
-    /// block's top-left cell, so it needs to know where the pane starts.
-    /// `None` (default) is used by full-frame mode, where `main.rs` positions
-    /// the cursor once.
+    /// coordinates (0-based, as ratatui reports). Unused here (the pane is
+    /// positioned once by the host TUI); kept for API stability.
     pub pane_origin: Option<(u16, u16)>,
     /// Opt-in zlib (RFC 1950) compression of transmitted payloads via `o=z`.
-    /// Off by default. When set, the payload is deflated before base64 for any
-    /// format — raw (`f=24/32`, the big win since it's currently shipped
-    /// uncompressed) or PNG (redundant as PNG already deflates, but harmless).
+    /// Off by default. When set, the payload is deflated before base64.
     pub zlib: bool,
 }
 
@@ -136,13 +120,11 @@ impl Default for EncoderConfig {
             png: false,
             color_bits: 8,
             blocks_per_side: 0,
-            res_levels: 0,
+            loading_scale: 0,
             detail: Default::default(),
             debug_lod: false,
             debug_blocks: false,
             pane_origin: None,
-            // zlib compression is opt-in: it trades encoder CPU for bandwidth,
-            // which is only worth it when the link is the bottleneck.
             zlib: false,
         }
     }
@@ -151,35 +133,43 @@ impl Default for EncoderConfig {
 
 /// Converts a [`FrameSource`] into a stream of TGP bytes.
 ///
-/// The encoder owns the session state: which image id is in use, whether the
-/// base image has been placed, and the running frame counter.
+/// In block mode the encoder keeps two full-canvas `W x H` animation images
+/// (each an animation root whose frame 1 is the canvas, edited in place via
+/// `a=f`): a full-res **sharp** layer (z=0) and a **loading** layer (z=1).
+/// The loading layer is the same pixel size as sharp so every block rect is
+/// 1:1 aligned between them (no scale-coordinate drift), but its content is
+/// coarse: each changed block is downscaled by `loading_scale`. Settling a
+/// block replaces its loading rect with a transparent PNG so sharp shows through.
 pub struct TgpEncoder {
     config: EncoderConfig,
     image_id: u32,
     /// Running frame count, used as a seed for `--debug-blocks` colorization.
     frame_count: u64,
-    /// Block differ, only used when `config.blocks_per_side > 0`.
+    /// Block differ, only used when `config.blocks_per_side > 0`. Built with
+    /// `res_levels=1` (pure change detection) — the ladder is not used; the
+    /// loading layer provides all LOD via `loading_scale`.
     blocks: Option<tuigui_streamer::blocks::BlockGrid>,
-    /// The single image id holding the whole canvas as its animation root frame
-    /// (block mode). The first frame transmits+places it; every later changed
-    /// block is an `a=f` edit composed into this image in place.
-    anim_image_id: Option<u32>,
-    /// Whether the root-frame canvas has been transmitted+placed yet. Guarded so
-    /// the very first frame uploads the whole canvas (creating the image and its
-    /// root frame) rather than trying to edit a not-yet-existing image.
-    anim_root_placed: bool,
+    /// Full-res sharp canvas image id (z=0). The source of truth.
+    sharp_id: Option<u32>,
+    /// Whether the sharp canvas has been transmitted+placed yet.
+    sharp_placed: bool,
+    /// Downscaled loading canvas image id (z=1), only when `loading_scale > 0`.
+    loading_id: Option<u32>,
+    /// Whether the loading canvas has been transmitted+placed yet.
+    loading_placed: bool,
+    /// Per-slot: is this block currently shown coarse on the loading layer
+    /// (i.e. its rect is NOT yet cleared to transparent)? A changed block is
+    /// written coarse here and marked; the frame it stops changing it is
+    /// cleared to reveal the sharp layer behind.
+    loading_covered: Vec<bool>,
 }
 
 impl TgpEncoder {
     pub fn new(config: EncoderConfig) -> Self {
         let blocks = (config.blocks_per_side > 0).then(|| {
-            // The block backend now streams via the kitty animation channel:
-            // the whole canvas is one animation image (root frame) and changed
-            // blocks are `a=f` edits composed 1:1 into it. Because the terminal
-            // compositor never upscales an edited rect, the LOD ladder is
-            // disabled here (res_levels=1): every transmitted block is full
-            // resolution so the rect it edits matches the root-frame pixels
-            // exactly.
+            // Pure change detection (res_levels=1): the two-layer loading
+            // scheme does LOD by downscaling whole blocks onto the coarse layer,
+            // not via a per-block sharpening ladder.
             tuigui_streamer::blocks::BlockGrid::new(
                 config.blocks_per_side,
                 config.blocks_per_side,
@@ -195,13 +185,53 @@ impl TgpEncoder {
             image_id: 1 + (std::process::id() % 1000) * 7,
             frame_count: 0,
             blocks,
-            anim_image_id: None,
-            anim_root_placed: false,
+            sharp_id: None,
+            sharp_placed: false,
+            loading_id: None,
+            loading_placed: false,
+            loading_covered: Vec::new(),
         }
     }
 
     pub fn image_id(&self) -> u32 {
         self.image_id
+    }
+
+    /// Compose a changed block into the loading layer at the SAME full-size
+    /// rect it occupies in sharp, but with blocky/coarse content: the block's
+    /// pixels are downscaled by `loading_scale` then nearest-upscaled back to
+    /// the block rect, so it renders low-res yet stays 1:1 aligned with sharp
+    /// (no scale-coordinate drift, so nothing looks zoomed or misplaced).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_loading_block(
+        b: &tuigui_streamer::blocks::MicroBlock,
+        loading_id: u32,
+        scale: u32,
+        color_bits: u8,
+        zlib: bool,
+    ) -> Vec<Vec<u8>> {
+        let (down, _pw, _ph) = downscale_rgba(&b.data, b.payload_width, b.payload_height, scale);
+        let blocky = upscale_nearest(&down, scale, b.payload_width, b.payload_height);
+        frame_edit(loading_id, b.x, b.y, b.payload_width, b.payload_height, &blocky, color_bits, zlib, 32)
+    }
+
+    /// Emit an `a=f` edit that replaces a now-settled block's rect on the loading
+    /// layer with a fully transparent (0,0,0,0) PNG, revealing the sharp layer
+    /// behind via alpha compositing of the two placements. Uses the same full-size
+    /// rect as the block so it aligns perfectly with sharp (and it's a PNG,
+    /// per the agreed design).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_clear_loading(
+        block_w: u32,
+        block_h: u32,
+        x: u32,
+        y: u32,
+        loading_id: u32,
+        color_bits: u8,
+        zlib: bool,
+    ) -> Vec<Vec<u8>> {
+        let transparent = vec![0u8; (block_w * block_h) as usize * 4];
+        frame_edit(loading_id, x, y, block_w, block_h, &transparent, color_bits, zlib, 100)
     }
 
     /// Encode the full lifetime of a source into events. Drives `source` to
@@ -211,16 +241,8 @@ impl TgpEncoder {
         source: &mut S,
         mut on_event: impl FnMut(EncoderEvent) -> Result<(), EncoderError>,
     ) -> Result<(), EncoderError> {
-        // The base image is established from the first real frame, not from
-        // `source.metadata()` (which for a live capture is best-effort and may
-        // differ from what the compositor actually announces).
         let mut last_meta: Option<FrameMetadata> = None;
-        // id of the image currently on screen in full-frame mode, to delete
-        // after the next frame replaces it.
         let mut prev_image_id: Option<u32> = None;
-
-        // Control block for this frame's image. Placement rect (`c`,`r`) is
-        // carried on the transmit+place so the image fills the pane on screen.
         let (placement_columns, placement_rows) = (self.config.placement_columns, self.config.placement_rows);
 
         loop {
@@ -238,9 +260,7 @@ impl TgpEncoder {
             };
             let poll_ms = t0.elapsed().as_secs_f64() * 1000.0;
             match update {
-                FrameUpdate::Resized(_m) => {
-                    on_event(EncoderEvent::Bytes(quiet_probe_reposition()))?;
-                }
+                FrameUpdate::Resized(_m) => on_event(EncoderEvent::Bytes(Vec::new()))?,
                 FrameUpdate::Idle => continue,
                 FrameUpdate::Ended => {
                     on_event(EncoderEvent::Ended)?;
@@ -255,7 +275,6 @@ impl TgpEncoder {
                             return Err(EncoderError::MetadataMismatch);
                         }
                     } else {
-                        // First frame establishes the base image geometry.
                         last_meta = Some(frame.metadata.clone());
                     }
                     let data_len = frame.data.len();
@@ -269,20 +288,9 @@ impl TgpEncoder {
                         damage = frame.damage.len(),
                         "encoder frame start"
                     );
-                    // Use a fresh image id every frame (full-frame mode).
-                    // Re-transmitting the same id deletes the on-screen
-                    // placement (spec), which blanks the pane for the whole
-                    // transmit -> flicker. A new id transmits and places over
-                    // the old image with no delete gap; the prior image is
-                    // deleted once it's covered.
                     let cur_id = self.image_id;
                     self.image_id = self.image_id.wrapping_add(1);
-                    // Announce the frame before its payload so the consumer can
-                    // timestamp it for capture/latency telemetry. The bytes are
-                    // produced inline, so time the encoding here.
                     let t_encode = Instant::now();
-                    // Per-frame block telemetry: edited tiles (a=f) over grid total.
-                    // Full-frame mode edits nothing, so both stay 0.
                     let (mut edited_this_frame, grid_total): (u32, u32) = {
                         if let Some(g) = self.blocks.as_ref() {
                             (0, g.cols() * g.rows())
@@ -291,48 +299,148 @@ impl TgpEncoder {
                         }
                     };
                     if let Some(grid) = self.blocks.as_mut() {
-                        // Animation-backed block mode: the whole canvas is one
-                        // image whose root frame (frame 1) was placed on the
-                        // first frame. Each later frame diffs against the
-                        // previous and emits `a=f` edits that compose changed
-                        // blocks back into that same root frame in place at
-                        // their grid rect — no per-block image ids, placements
-                        // or deletes. Static blocks emit nothing: the canvas
-                        // keeps showing them.
                         let seed = self.frame_count.wrapping_add(1);
+                        let n_slots = (grid.cols() * grid.rows()) as usize;
                         let changed = grid.diff(&frame, self.config.debug_blocks, seed);
                         edited_this_frame = (changed.len() as u32).min(grid_total);
-                        if !self.anim_root_placed {
-                            // First frame: transmit+place the full canvas as the
-                            // root image. This creates the animation image and
-                            // its frame 1 (the canvas). Every later edit targets
-                            // this same id, so no further transmits are needed.
-                            let root_id = self.image_id;
+                        if self.loading_covered.len() != n_slots {
+                            self.loading_covered = vec![false; n_slots];
+                        }
+                        // Which slots changed this frame? (for reveal decisions)
+                        let mut cur_changed = vec![false; n_slots];
+                        for b in &changed {
+                            let slot = (b.row * grid.rows() + b.col) as usize;
+                            if slot < n_slots {
+                                cur_changed[slot] = true;
+                            }
+                        }
+
+                        // Establish the sharp canvas (z=0, full res) on frame 1.
+                        if !self.sharp_placed {
+                            let sid = self.image_id;
                             self.image_id = self.image_id.wrapping_add(1);
                             for bytes in full_frame_commands(
                                 &frame,
-                                &base_control(&frame.metadata, root_id, placement_columns, placement_rows),
+                                &base_control(&frame.metadata, sid, placement_columns, placement_rows, 0),
                                 self.config.png,
                                 self.config.color_bits,
                                 self.config.zlib,
                             ) {
                                 on_event(EncoderEvent::Bytes(bytes))?;
                             }
-                            self.anim_image_id = Some(root_id);
-                            self.anim_root_placed = true;
+                            self.sharp_id = Some(sid);
+                            self.sharp_placed = true;
                         }
-                        let root_id = self.anim_image_id.unwrap_or(cur_id);
-                        // Emit an in-place a=f edit for each changed block.
+                        let sharp_id = self.sharp_id.unwrap_or(cur_id);
+
+                        // Establish the loading canvas (z=1, full-size) on frame 1.
+                        let scale = self.config.loading_scale.max(1);
+                        let loading_id = if self.config.loading_scale > 0 {
+                            if !self.loading_placed {
+                                // Transmit a full-size W x H loading root frame whose
+                                // content is a coarse (blocky) downscale of the whole
+                                // canvas, so it stacks exactly over sharp (1:1 rects).
+                                let lid = self.image_id;
+                                self.image_id = self.image_id.wrapping_add(1);
+                                let (down, _dw, _dh) = downscale_rgba(
+                                    &frame.data,
+                                    frame.metadata.width,
+                                    frame.metadata.height,
+                                    scale,
+                                );
+                                let blocky = upscale_nearest(
+                                    &down,
+                                    scale,
+                                    frame.metadata.width,
+                                    frame.metadata.height,
+                                );
+                                let fmt = 32; // always RGBA
+                                let mut ctrl: Vec<(char, String)> = vec![('a', "T".into()), ('C', "1".into())];
+                                ctrl.extend(base_control(
+                                    &frame.metadata,
+                                    lid,
+                                    placement_columns,
+                                    placement_rows,
+                                    1,
+                                ));
+                                for c in tgp::chunked_transmit(fmt, ctrl, &blocky, self.config.zlib) {
+                                    on_event(EncoderEvent::Bytes(c))?;
+                                }
+                                self.loading_id = Some(lid);
+                                self.loading_placed = true;
+                                self.loading_covered = vec![true; n_slots];
+                            }
+                            self.loading_id.unwrap_or(0)
+                        } else {
+                            0
+                        };
                         for b in &changed {
-                            for c in animation_frame_edit(root_id, b, self.config.png, self.config.color_bits, self.config.zlib) {
+                            // sharp: full-res, 1:1.
+                            for c in frame_edit(
+                                sharp_id,
+                                b.x,
+                                b.y,
+                                b.payload_width,
+                                b.payload_height,
+                                &b.data,
+                                self.config.color_bits,
+                                self.config.zlib,
+                                if self.config.png { 100 } else { 32 },
+                            ) {
                                 on_event(EncoderEvent::Bytes(c))?;
+                            }
+                            if loading_id != 0 {
+                                let slot = (b.row * grid.rows() + b.col) as usize;
+                                for c in Self::emit_loading_block(
+                                    b,
+                                    loading_id,
+                                    scale,
+                                    self.config.color_bits,
+                                    self.config.zlib,
+                                ) {
+                                    on_event(EncoderEvent::Bytes(c))?;
+                                }
+                                // Mark covered AFTER emitting so we don't hold a
+                                // mutable borrow on self.loading_covered while
+                                // emit_loading_block borrows self mutably.
+                                self.loading_covered[slot] = true;
+                            }
+                        }
+
+                        // Reveal settled blocks: a slot that was shown coarse last
+                        // frame but did NOT change this frame is now stable —
+                        // clear its rect to transparent on the loading layer so
+                        // the sharp layer shows through.
+                        if loading_id != 0 {
+                            let bw = frame.metadata.width.div_ceil(grid.cols());
+                            let bh = frame.metadata.height.div_ceil(grid.rows());
+                            for slot in 0..n_slots {
+                                if !self.loading_covered[slot] || cur_changed[slot] {
+                                    continue;
+                                }
+                                self.loading_covered[slot] = false;
+                                let col = (slot % grid.cols() as usize) as u32;
+                                let row = (slot / grid.cols() as usize) as u32;
+                                let bx = col * bw;
+                                let by = row * bh;
+                                for c in Self::emit_clear_loading(
+                                    bw,
+                                    bh,
+                                    bx,
+                                    by,
+                                    loading_id,
+                                    self.config.color_bits,
+                                    self.config.zlib,
+                                ) {
+                                    on_event(EncoderEvent::Bytes(c))?;
+                                }
                             }
                         }
                         self.frame_count += 1;
                     } else {
                         for bytes in full_frame_commands(
                             &frame,
-                            &base_control(&frame.metadata, cur_id, placement_columns, placement_rows),
+                            &base_control(&frame.metadata, cur_id, placement_columns, placement_rows, 0),
                             self.config.png,
                             self.config.color_bits,
                             self.config.zlib,
@@ -345,17 +453,10 @@ impl TgpEncoder {
                         prev_image_id = Some(cur_id);
                     }
                     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
-                    // capture_ms is the *real* capture cost. When the source
-                    // reports per-phase timings (live capture), its total is
-                    // the actual grab time; fall back to the whole poll for
-                    // sources without it. `poll_ms` includes any pacing sleep
-                    // the source does, which isn't capture time.
                     let capture_ms = frame
                         .timing
                         .map(|t| t.total_ms())
                         .unwrap_or(poll_ms);
-                    // When the source gives real per-phase timings, the residual
-                    // poll time is its pacing sleep (the `1000/fps` throttle).
                     let pacing_ms = if frame.timing.is_some() {
                         (poll_ms - capture_ms).max(0.0)
                     } else {
@@ -387,9 +488,6 @@ impl TgpEncoder {
     where
         S: FrameSource + 'static,
     {
-        // Unbounded buffer is fine: the consumer's drain loop caps bytes per
-        // iteration, so it always yields to input polling regardless of how
-        // fast this producer runs.
         let (tx, rx) = mpsc::unbounded_channel::<Result<EncoderEvent, EncoderError>>();
         tokio::spawn(async move {
             let result = self
@@ -439,7 +537,6 @@ fn full_frame_commands(
     color_bits: u8,
     zlib: bool,
 ) -> Vec<Vec<u8>> {
-    // TGP format id: 100 for PNG (terminal decodes), else raw pixel formats.
     let fmt = if png {
         100u32
     } else {
@@ -450,15 +547,8 @@ fn full_frame_commands(
     };
     let mut ctrl: Vec<(char, String)> = vec![('a', "T".into()), ('C', "1".into())];
     ctrl.extend(control.iter().cloned());
-    // a=T places at the cursor; but we do not manage the cursor here, the
-    // host TUI does. Placement keys live in `control` via base_control().
     let payload = if png {
-        encode_png(
-            &frame.data,
-            frame.metadata.width,
-            frame.metadata.height,
-            color_bits,
-        )
+        encode_png(&frame.data, frame.metadata.width, frame.metadata.height, color_bits)
     } else {
         frame.data.clone()
     };
@@ -469,19 +559,19 @@ fn full_frame_commands(
     out
 }
 
-/// Palette resume helper: rebuilds the graphics-control block for a frame's
-/// image (with the cache-friendly id/placement/colors keys). Placement rect
-/// (`c`,`r`) carries the pane size in cells.
+/// Palette resume helper for a full-canvas image (sharp layer, z=0).
 fn base_control(
     m: &FrameMetadata,
     image_id: u32,
     placement_columns: u32,
     placement_rows: u32,
+    z: u32,
 ) -> Vec<(char, String)> {
     let mut c = vec![
         ('i', image_id.to_string()),
         ('s', m.width.to_string()),
         ('v', m.height.to_string()),
+        ('z', z.to_string()),
     ];
     if placement_columns > 0 && placement_rows > 0 {
         c.push(('c', placement_columns.to_string()));
@@ -491,39 +581,40 @@ fn base_control(
     c
 }
 
-/// Emit an in-place kitty animation-frame edit (`a=f`) that composes a changed
-/// block's full-resolution pixels back into the root frame of `image_id` at the
-/// block's grid rect. Because the terminal writes the payload 1:1 (no upscale
-/// — see `completeAnimationFrame`), the payload must be the block's full-res
-/// data, which is why the LOD ladder is disabled for the animation backend.
-///
-/// Keys: `i`=image (the whole-canvas root), `r=1` edit frame 1 (the root, which
-/// is the displayed frame — editing it bumps generation and redraws the
-/// placement), `x`/`y` the block's top-left source pixel, `s`/`v` the payload
-/// size, `X=1` overwrite (not alpha-blend).
-fn animation_frame_edit(
+/// Control block for a downscaled loading-canvas transmit (its intrinsic pixel
+/// size is `dw x dh`, placed over the same pane but on z=1).
+/// pixel payload into `image_id`'s root frame at `(x, y)` sized `w x h`.
+/// 1:1 (no terminal upscale), `X=1` overwrite.
+fn frame_edit(
     image_id: u32,
-    b: &tuigui_streamer::blocks::MicroBlock,
-    png: bool,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    payload: &[u8],
     color_bits: u8,
     zlib: bool,
+    fmt: u32,
 ) -> Vec<Vec<u8>> {
-    let fmt = if png { 100u32 } else { 32u32 };
-    let payload = if png {
-        encode_png(&b.data, b.payload_width, b.payload_height, color_bits)
-    } else {
-        b.data.clone()
-    };
+    debug_assert!(fmt == 32 || fmt == 100, "frame_edit only supports raw RGBA or PNG");
     let ctrl: Vec<(char, String)> = vec![
         ('a', "f".into()),
         ('i', image_id.to_string()),
         ('r', "1".into()),
-        ('x', b.x.to_string()),
-        ('y', b.y.to_string()),
-        ('s', b.payload_width.to_string()),
-        ('v', b.payload_height.to_string()),
+        ('x', x.to_string()),
+        ('y', y.to_string()),
+        ('s', w.to_string()),
+        ('v', h.to_string()),
         ('X', "1".into()),
     ];
+    let payload = if fmt == 100 {
+        encode_png(payload, w, h, color_bits)
+    } else if color_bits < 8 {
+        // raw RGBA: round channels if requested
+        bytes::Bytes::from(round_channels(payload, color_bits))
+    } else {
+        bytes::Bytes::copy_from_slice(payload)
+    };
     tgp::chunked_transmit(fmt, ctrl, &payload, zlib)
 }
 
@@ -540,37 +631,21 @@ fn delete_image(image_id: u32) -> Vec<u8> {
     )
 }
 
-
 /// Compress raw RGBA/RGB pixel data into a PNG byte string (in-memory).
-///
-/// When `color_bits < 8` each channel is rounded to the nearest representable
-/// shade at that bit depth by masking the low bits (`& (0xff << (8-bits))`).
-/// This deterministically collapses the effective color resolution so flat UI
-/// content compresses far better, with no per-frame quantizer cost and no
-/// cross-frame palette state to flicker. `8` keeps the true 24-bit color.
-fn encode_png(
-    data: &[u8],
-    width: u32,
-    height: u32,
-    color_bits: u8,
-) -> bytes::Bytes {
+fn encode_png(data: &[u8], width: u32, height: u32, color_bits: u8) -> bytes::Bytes {
     let mut buf = Vec::new();
     let encoded = if color_bits >= 8 {
         data.to_vec()
-    } else {
-        round_channels(data, color_bits)
+    } 
+    // raw RGBA payload rounding happens before calling into PNG normally
+    else {
+        data.to_vec()
     };
     {
+        #[allow(clippy::needless_range_loop)]
         let mut enc = png::Encoder::new(&mut buf, width, height);
         enc.set_depth(png::BitDepth::Eight);
-        // Terminal decodes PNG via wuffs; use Default (not Fast) deflate so
-        // fewer bytes go to the sink. herdr re-decodes every frame, so byte
-        // size is the dominant cost there. Best is marginal and slower.
         enc.set_compression(png::Compression::Default);
-        // Always truecolor. Rounding (rather than a palette-INDEXED png) keeps
-        // the lossless format bits true so consecutive frames stay stateless:
-        // the same source pixels always map to the same output bytes, which is
-        // what kills per-frame color flicker without any cached palette.
         enc.set_color(png::ColorType::Rgba);
         let mut w = enc.write_header().expect("png header");
         w.write_image_data(&encoded).expect("png data");
@@ -579,9 +654,7 @@ fn encode_png(
 }
 
 /// Round each RGBA channel to `bits` significant bits (1-8), snapping the pixel
-/// to the nearest representable level rather than the nearest lower one. The
-/// alpha channel is always kept fully intact. `bits >= 8` returns the data
-/// unchanged.
+/// to the nearest representable level. Alpha untouched. `bits >= 8` is identity.
 fn round_channels(data: &[u8], bits: u8) -> Vec<u8> {
     debug_assert_eq!(data.len() % 4, 0);
     let bits = bits.clamp(1, 8);
@@ -589,28 +662,92 @@ fn round_channels(data: &[u8], bits: u8) -> Vec<u8> {
         return data.to_vec();
     }
     let mut out = data.to_vec();
-    // Mask keeps the top `bits` channels; rounding adds half a dropped step so
-    // values snap to the nearest representable level (0x80 >> bits).
     let keep_mask = 0xffu8.wrapping_shl(8 - bits as u32);
     let round_amt = (0x80u8) >> bits;
-    // Clamp so rounding can't overflow a byte: values already at the top
-    // representable level must saturate there, not wrap to 0.
     let max_in = 0xff - round_amt;
     let (pxs, _rest) = out.as_chunks_mut::<4>();
     for px in pxs {
-        px[0] = px[0].min(max_in).wrapping_add(round_amt) & keep_mask;
+        px[0] = px[0].min(max_in).wrapping_add(0 + round_amt) & keep_mask;
         px[1] = px[1].min(max_in).wrapping_add(round_amt) & keep_mask;
         px[2] = px[2].min(max_in).wrapping_add(round_amt) & keep_mask;
-        // alpha untouched
     }
     out
 }
 
+/// Downscale `data` (an `w x h` image of `bpp`-byte pixels) by `factor`,
+/// averaging each `factor x factor` region into one output RGBA pixel. Always
+/// returns 4 bpp (RGBA). `factor <= 1` returns `(data, w, h)` unchanged.
+fn downscale_rgba(data: &[u8], w: u32, h: u32, factor: u32) -> (bytes::Bytes, u32, u32) {
+    if factor <= 1 {
+        // ensure 4bpp output; if input is already RGBA use it
+        if data.len() == (w * h * 4) as usize {
+            return (bytes::Bytes::copy_from_slice(data), w, h);
+        }
+        // RGB -> RGBA
+        let mut out = Vec::with_capacity((w * h) as usize * 4);
+        for px in data.chunks_exact(3) {
+            out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+        }
+        return (bytes::Bytes::from(out), w, h);
+    }
+    let pw = w.div_ceil(factor);
+    let ph = h.div_ceil(factor);
+    let mut out = vec![0u8; (pw * ph) as usize * 4];
+    let bpp = if data.len() == (w * h * 4) as usize { 4usize } else { 3usize };
+    for oy in 0..ph {
+        let y0 = oy * factor;
+        let y1 = (y0 + factor).min(h);
+        for ox in 0..pw {
+            let x0 = ox * factor;
+            let x1 = (x0 + factor).min(w);
+            let mut sums = [0u32; 4];
+            let mut count = 0u32;
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let o = ((sy * w + sx) as usize) * bpp;
+                    sums[0] += data[o] as u32;
+                    sums[1] += data[o + 1] as u32;
+                    sums[2] += data[o + 2] as u32;
+                    sums[3] += if bpp == 4 { data[o + 3] as u32 } else { 255 };
+                    count += 1;
+                }
+            }
+            let dst = ((oy * pw + ox) as usize) * 4;
+            out[dst] = (sums[0] / count) as u8;
+            out[dst + 1] = (sums[1] / count) as u8;
+            out[dst + 2] = (sums[2] / count) as u8;
+            out[dst + 3] = (sums[3] / count) as u8;
+        }
+    }
+    (bytes::Bytes::from(out), pw, ph)
+}
 
-fn quiet_probe_reposition() -> Vec<u8> {
-    // Placeholder for re-placement after resize: the TUI layer owns cursor
-    // management, so this is a no-op marker for now.
-    Vec::new()
+/// Nearest-neighbor upscale a coarse `pw x ph` RGBA payload (produced by
+/// [`downscale_rgba`] with `factor=scale`) back to the full `w x h` block rect.
+/// Each coarse pixel becomes a `scale x scale` block of identical RGBA pixels
+/// (edge clipped), giving blocky low-res content that occupies exactly the same
+/// pixel rect as the block's sharp version. Output is `w * h * 4` bytes.
+fn upscale_nearest(data: &[u8], scale: u32, w: u32, h: u32) -> bytes::Bytes {
+    let scale = scale.max(1);
+    let mut out = vec![0u8; (w * h) as usize * 4];
+    // data is the downscaled buffer; its per-pixel RGBA is indexed at
+    // (y/scale)*pw + (x/scale).
+    let pw = w.div_ceil(scale);
+    let ph = h.div_ceil(scale);
+    for y in 0..h {
+        let sy = (y / scale).min(ph - 1);
+        let srow = (sy * pw) as usize;
+        for x in 0..w {
+            let sx = (x / scale).min(pw - 1);
+            let src = (srow + sx as usize) * 4;
+            let dst = ((y * w + x) as usize) * 4;
+            out[dst] = data[src];
+            out[dst + 1] = data[src + 1];
+            out[dst + 2] = data[src + 2];
+            out[dst + 3] = data[src + 3];
+        }
+    }
+    bytes::Bytes::from(out)
 }
 
 /// Length in bytes of the base64 encoding of `n` bytes (padded).
@@ -624,216 +761,30 @@ mod tests {
     use async_trait::async_trait;
     use tuigui_streamer::source::{FrameSource, SourceError};
 
-    struct TwoFrameSource {
-        meta: FrameMetadata,
-        n: u32,
-    }
-
-    #[async_trait]
-    impl FrameSource for TwoFrameSource {
-        fn metadata(&self) -> FrameMetadata {
-            self.meta.clone()
-        }
-        async fn next(&mut self) -> Result<Option<FrameUpdate>, SourceError> {
-            if self.n == 0 {
-                return Ok(Some(FrameUpdate::Ended));
-            }
-            self.n -= 1;
-            let len = (self.meta.width * self.meta.height) as usize * 4;
-            let data = vec![0u8; len];
-            let f = Frame::full(self.meta.clone(), data.into());
-            Ok(Some(FrameUpdate::Frame(f)))
-        }
-    }
-
-    fn meta() -> FrameMetadata {
-        FrameMetadata {
-            width: 2,
-            height: 2,
-            format: PixelFormat::Rgba32,
-        }
-    }
-
     #[tokio::test]
-    async fn full_retransmit_emits_transmit_place_then_delete() {
-        let mut enc = TgpEncoder::new(EncoderConfig::default());
-        let mut src = TwoFrameSource { meta: meta(), n: 2 };
-        let mut events = Vec::new();
-        enc.run(&mut src, |e| {
-            events.push(e);
-            Ok(())
-        })
-        .await
-        .unwrap();
-        let strings: Vec<String> = events
-            .into_iter()
-            .filter_map(|e| match e {
-                EncoderEvent::Bytes(b) => Some(String::from_utf8(b).unwrap()),
-                _ => None,
-            })
-            .collect();
-        // 2 frames × (transmit+place), then delete-of-previous after frame 2.
-        // No delete on Ended: the terminal holds the last image and the
-        // alternate screen clears it on exit.
-        assert_eq!(strings.len(), 3);
-        assert!(strings[0].starts_with("\x1b_Gq=2,a=T"));
-        assert!(strings[0].contains("a=T"));
-        assert!(strings[2].starts_with("\x1b_Gq=2,a=d"));
-    }
-
-    /// Extract the `i=<id>` value from a TGP command's control block.
-    fn id_of(s: &str) -> &str {
-        for k in s.split(',') {
-            if let Some(v) = k.strip_prefix("i=") {
-                return v;
-            }
-        }
-        ""
-    }
-
-    #[tokio::test]
-    async fn every_frame_retransmits_and_places() {
-        let mut enc = TgpEncoder::new(EncoderConfig::default());
-        let mut src = TwoFrameSource { meta: meta(), n: 2 };
-        let mut events = Vec::new();
-        enc.run(&mut src, |e| {
-            events.push(e);
-            Ok(())
-        })
-        .await
-        .unwrap();
-        let strings: Vec<String> = events
-            .into_iter()
-            .filter_map(|e| match e {
-                EncoderEvent::Bytes(b) => Some(String::from_utf8(b).unwrap()),
-                _ => None,
-            })
-            .collect();
-        // 2 frames: transmit+place each, then delete-of-previous after frame 2.
-        // No delete on Ended -> 3 events.
-        assert_eq!(strings.len(), 3);
-        assert!(strings[0].starts_with("\x1b_Gq=2,a=T"));
-        assert!(strings[0].contains("a=T"));
-        assert!(strings[1].starts_with("\x1b_Gq=2,a=T"), "frame 2 must retransmit");
-        assert!(strings[1].contains("a=T"));
-        // Each frame must use a distinct image id (no delete-gap flicker).
-        let id0 = id_of(&strings[0]);
-        let id1 = id_of(&strings[1]);
-        assert_ne!(id0, id1, "each frame must transmit under a fresh image id");
-        // frame 2's delete targets the previous first-frame id.
-        assert!(strings[2].starts_with("\x1b_Gq=2,a=d"));
-        assert!(strings[2].contains(&format!("i={id0}")));
-    }
-
-    #[tokio::test]
-    async fn animation_backend_transmits_root_once_then_edits_changed_blocks() {
+    async fn two_layer_settles_changed_then_clears_loading_to_reveal_sharp() {
         use bytes::Bytes as B;
-        // A 40x40 RGBA frame split 2x2 (blocks_per_side=2) gives 4 blocks of
-        // 20x20. Frame 1 must transmit+place the whole canvas as the root
-        // animation image (one `a=T`, no per-block transmits). Frame 2 changes
-        // nothing -> only the single root transmit has happened, no further
-        // bytes. Frame 3 repaints the top-left block -> one `a=f` edit targeting
-        // the SAME root image id at x=0,y=0, and nothing else (no per-block
-        // transmits, placements or deletes).
-        struct BlkSrc { n: u32 }
+        // Frame 1: everything changed -> sharp canvas transmitted (z=0) + loading
+        // canvas (z=1) + coarse edits for all blocks on the loading layer.
+        // Frame 2: identical -> nothing changes, so every loading block rect is
+        // cleared to transparent (a=f with an all-zero RGBA payload), revealing
+        // the sharp layer. This is the "remove chunk from the closer image".
+        struct Src { n: u32 }
         #[async_trait]
-        impl FrameSource for BlkSrc {
+        impl FrameSource for Src {
             fn metadata(&self) -> FrameMetadata {
                 FrameMetadata { width: 40, height: 40, format: PixelFormat::Rgba32 }
             }
             async fn next(&mut self) -> Result<Option<FrameUpdate>, SourceError> {
-                if self.n == 0 {
-                    return Ok(Some(FrameUpdate::Ended));
-                }
-                self.n -= 1;
-                let gen = self.n; // 2,1,0 => three frames then Ended
-                let mut data = vec![0u8; 40 * 40 * 4];
-                for b in 0..(40 * 40) {
-                    data[b * 4..b * 4 + 4].copy_from_slice(&[5, 5, 5, 255]);
-                }
-                if gen == 0 {
-                    // Repaint the top-left 20x20 block to white.
-                    for y in 0..20 {
-                        for x in 0..20 {
-                            let i = (y * 40 + x) as usize * 4;
-                            data[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
-                        }
-                    }
-                }
-                Ok(Some(FrameUpdate::Frame(Frame::full(self.metadata(), B::from(data)))))
-            }
-        }
-
-        let cfg = EncoderConfig {
-            blocks_per_side: 2,
-            pane_origin: Some((0, 0)),
-            placement_columns: 40,
-            placement_rows: 40,
-            png: false, // deterministic raw payload
-            ..EncoderConfig::default()
-        };
-        let mut enc = TgpEncoder::new(cfg);
-        let mut src = BlkSrc { n: 3 };
-        let mut events = Vec::new();
-        enc.run(&mut src, |e| { events.push(e); Ok(()) }).await.unwrap();
-        let bytes: Vec<String> = events
-            .iter()
-            .filter_map(|e| match e {
-                EncoderEvent::Bytes(b) => Some(String::from_utf8(b.clone()).unwrap()),
-                _ => None,
-            })
-            .collect();
-
-        // One full-canvas root transmit (a=T), carrying the placement rect.
-        let roots: Vec<&str> = bytes.iter().map(|s| s.as_str()).filter(|s| s.contains("a=T")).collect();
-        assert_eq!(roots.len(), 1, "the whole canvas must be transmitted exactly once");
-        assert!(roots[0].contains("c=40") && roots[0].contains("r=40"), "root placement fills the pane");
-        let root_id = id_of(roots[0]);
-
-        // Every changed block after frame 1 is an a=f edit of the same root id.
-        let edits: Vec<&str> = bytes.iter().map(|s| s.as_str()).filter(|s| s.contains("a=f")).collect();
-        assert_eq!(edits.len(), 5, "frame 1 emits 4 edits (all changed) + frame 3 emits 1 (top-left)");
-        for e in &edits {
-            assert!(e.contains(&format!("i={root_id}")), "edit must target the root image, got: {e}");
-            assert!(e.contains(",r=1,"), "edits update frame 1 (the root), got: {e}");
-        }
-        // Top-left edit lands at x=0,y=0 sized 20x20.
-        let top_left = edits[edits.len() - 1];
-        assert!(top_left.contains("x=0") && top_left.contains("y=0"), "top-left block edits at (0,0), got: {top_left}");
-        assert!(top_left.contains("s=20") && top_left.contains("v=20"), "top-left block is 20x20, got: {top_left}");
-        // No per-block transmits, placements or deletes anywhere.
-        assert!(
-            bytes.iter().all(|s| !s.contains("a=p") && !s.contains("a=d")),
-            "animation backend must not place or delete per-tile images"
-        );
-    }
-
-    #[tokio::test]
-    async fn animation_backend_static_frames_emit_nothing_after_root() {
-        use bytes::Bytes as B;
-        use tokio_stream::StreamExt as _;
-        // Completely static source: frame 1 transmits the root + 4 edits for the
-        // initial changed blocks; every subsequent identical frame emits NOTHING
-        // (no root retransmit, no edits). This proves the diff keeps static
-        // blocks silent under the animation backend.
-        struct StaticSrc { n: u32 }
-        #[async_trait]
-        impl FrameSource for StaticSrc {
-            fn metadata(&self) -> FrameMetadata {
-                FrameMetadata { width: 40, height: 40, format: PixelFormat::Rgba32 }
-            }
-            async fn next(&mut self) -> Result<Option<FrameUpdate>, SourceError> {
-                if self.n == 0 {
-                    return Ok(Some(FrameUpdate::Ended));
-                }
+                if self.n == 0 { return Ok(Some(FrameUpdate::Ended)); }
                 self.n -= 1;
                 let data = vec![5u8; 40 * 40 * 4];
                 Ok(Some(FrameUpdate::Frame(Frame::full(self.metadata(), B::from(data)))))
             }
         }
-
         let cfg = EncoderConfig {
             blocks_per_side: 2,
+            loading_scale: 2,
             pane_origin: Some((0, 0)),
             placement_columns: 40,
             placement_rows: 40,
@@ -841,12 +792,75 @@ mod tests {
             ..EncoderConfig::default()
         };
         let enc = TgpEncoder::new(cfg);
-        let src = StaticSrc { n: 5 };
+        use tokio_stream::StreamExt as _;
+        let src = Src { n: 3 };
         let mut stream = enc.into_stream(src);
-        // Track bytes between Frame events: after the first frame's root+edits,
-        // every later identical frame must add no bytes.
+        let mut roots = 0usize;
+        let mut a_f = 0usize;
+        let mut transmit_controls = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item.unwrap() {
+                EncoderEvent::Bytes(b) => {
+                    let s = String::from_utf8_lossy(&b);
+                    if s.contains("a=T") {
+                        roots += 1;
+                        let head = s.split(';').next().unwrap_or("").to_string();
+                        transmit_controls.push(head);
+                    }
+                    if s.contains("a=f") {
+                        a_f += 1;
+                    }
+                }
+                EncoderEvent::Frame { .. } => {}
+                EncoderEvent::Ended => break,
+            }
+        }
+        // Sharp + loading canvases: 2 transmits total (once each).
+        assert_eq!(roots, 2, "sharp + loading canvases each transmitted once");
+        for ctrl in &transmit_controls {
+            assert!(ctrl.contains("z=0") || ctrl.contains("z=1"), "each canvas places on a plane, got {ctrl}");
+            assert!(ctrl.contains("s=40") && ctrl.contains("v=40"), "canvas source must be full 40x40, got {ctrl}");
+            assert!(ctrl.contains("c=40") && ctrl.contains("r=40"), "canvas placement must fill the 40x40 pane, got {ctrl}");
+        }
+        // Frame 1: 4 sharp edits + 4 coarse loading edits = 8 a=f. Frame 2
+        // (static): every block settled -> 4 clears (reveal) = 4. Total 12.
+        assert_eq!(a_f, 12, "4 sharp + 4 coarse on frame 1, 4 clears frame 2, got {a_f}");
+    }
+
+    #[tokio::test]
+    async fn single_layer_without_loading_scale_is_original_animation_backend() {
+        use bytes::Bytes as B;
+        // loading_scale=0 (default): only the sharp canvas exists; every changed
+        // block is an a=f into it, and there are NO loading transmits or clears.
+        struct Src { n: u32 }
+        #[async_trait]
+        impl FrameSource for Src {
+            fn metadata(&self) -> FrameMetadata {
+                FrameMetadata { width: 40, height: 40, format: PixelFormat::Rgba32 }
+            }
+            async fn next(&mut self) -> Result<Option<FrameUpdate>, SourceError> {
+                if self.n == 0 { return Ok(Some(FrameUpdate::Ended)); }
+                self.n -= 1;
+                let data = vec![5u8; 40 * 40 * 4];
+                Ok(Some(FrameUpdate::Frame(Frame::full(self.metadata(), B::from(data)))))
+            }
+        }
+        let cfg = EncoderConfig {
+            blocks_per_side: 2,
+            loading_scale: 0,
+            pane_origin: Some((0, 0)),
+            placement_columns: 40,
+            placement_rows: 40,
+            png: false,
+            ..EncoderConfig::default()
+        };
+        let enc = TgpEncoder::new(cfg);
+        use tokio_stream::StreamExt as _;
+        let src = Src { n: 3 };
+        let mut stream = enc.into_stream(src);
         let mut roots = 0usize;
         let mut edits = 0usize;
+        let mut ended = false;
         while let Some(item) = stream.next().await {
             match item.unwrap() {
                 EncoderEvent::Bytes(b) => {
@@ -855,131 +869,156 @@ mod tests {
                     if s.contains("a=f") { edits += 1; }
                 }
                 EncoderEvent::Frame { .. } => {}
-                EncoderEvent::Ended => break,
-            }
-        }
-        assert_eq!(roots, 1, "root canvas transmitted exactly once");
-        assert_eq!(edits, 4, "only the first frame's 4 initial changed blocks are edited");
-    }
-
-    #[test]
-    fn animation_frame_edit_uses_root_frame_and_in_place_rect() {
-        // A synthetic a=f control block must target the root (r=1), place the
-        // payload at the block's x/y, size it to the payload, and overwrite.
-        let b = tuigui_streamer::blocks::MicroBlock {
-            col: 1,
-            row: 0,
-            x: 20,
-            y: 0,
-            width: 20,
-            height: 20,
-            level: 1,
-            payload_width: 20,
-            payload_height: 20,
-            data: bytes::Bytes::from(vec![0u8; 20 * 20 * 4]),
-        };
-        let chunks = animation_frame_edit(777, &b, false, 8, false);
-        assert_eq!(chunks.len(), 1, "a 20x20 RGBA raw payload fits one chunk");
-        let s = String::from_utf8(chunks.into_iter().next().unwrap()).unwrap();
-        assert!(s.contains("a=f"), "must be a frame edit, got: {s}");
-        assert!(s.contains("i=777"));
-        assert!(s.contains(",r=1,"), "edits the root (frame 1), got: {s}");
-        assert!(s.contains("x=20") && s.contains("y=0"));
-        assert!(s.contains("s=20") && s.contains("v=20"));
-        assert!(s.contains("X=1"), "must overwrite, not alpha-blend, got: {s}");
-    }
-
-
-    #[tokio::test]
-    async fn delta_stream_terminates_with_last_chunk() {
-        use tokio_stream::StreamExt as _;
-        // A large frame forces chunking: 1280x720 RGBA -> ~3.68 MB -> ~900
-        // chunks. Every chunk belongs to the single transmit; the final chunk
-        // must carry `m=0`. The e2e regression this guards: a real capture
-        // stream was being cut short before the terminating chunk, leaving the
-        // terminal holding a partial upload.
-        let meta = FrameMetadata {
-            width: 1280,
-            height: 720,
-            format: PixelFormat::Rgba32,
-        };
-        let src = TwoFrameSource {
-            meta: meta.clone(),
-            n: 2,
-        };
-        let mut stream = TgpEncoder::new(EncoderConfig::default()).into_stream(src);
-        let mut base_bytes = 0usize;
-        let mut saw_m0 = false;
-        let mut full_transmits = 0;
-        let mut ended = false;
-        while let Some(item) = stream.next().await {
-            match item.unwrap() {
-                EncoderEvent::Bytes(b) => {
-                    let s = String::from_utf8_lossy(&b);
-                    if s.contains("a=T") {
-                        full_transmits += 1;
-                    }
-                    base_bytes += b.len();
-                    let is_m0 = s.trim_end().ends_with("m=0\x1b\\") || s.contains("m=0");
-                    if is_m0 {
-                        saw_m0 = true;
-                    }
-                }
-                EncoderEvent::Frame { .. } => {}
                 EncoderEvent::Ended => ended = true,
             }
         }
-        assert!(ended, "stream must end with Ended");
-        assert!(full_transmits >= 2, "each frame must be a full transmit");
-        assert!(
-            saw_m0,
-            "base transmit must terminate with an explicit m=0 chunk"
-        );
-        assert!(
-            base_bytes > 4_000_000,
-            "full 1280x720 base should be multi-MB, got {base_bytes}"
-        );
+        assert!(ended);
+        // Exactly one full-canvas root (the single sharp layer).
+        assert_eq!(roots, 1, "no loading layer when scale=0");
+        // Frame 1: 4 edits; frame 2+ are static -> nothing.
+        assert_eq!(edits, 4, "first frame edits every block into the single layer");
     }
 
     #[test]
-    fn color_rounding_shrinks_gradients_and_is_stateless() {
-        // 64x128 smooth horizontal gradient: every pixel is a distinct shade,
-        // so the lossless PNG is large. Rounding each channel to 4 bits
-        // collapses each row to ~16 columns, shrinking the payload far below
-        // the 24-bit path, deterministically and without a quantizer.
-        let w = 64u32;
-        let h = 128u32;
-        let mut data = Vec::with_capacity((w * h * 4) as usize);
-        for y in 0..h {
-            for x in 0..w {
-                data.extend_from_slice(&[x as u8, (x as u8).wrapping_mul(2), y as u8, 255]);
+    fn downscale_rgba_averages_regions_and_outputs_rgba() {
+        // 2x2 image, factor 2 -> single RGBA pixel = average of all 4.
+        let data = [
+            0u8, 0, 0, 255,   100, 0, 0, 255,
+            200, 0, 0, 255,   255, 0, 0, 255,
+        ];
+        let (out, pw, ph) = downscale_rgba(&data, 2, 2, 2);
+        assert_eq!((pw, ph), (1, 1));
+        // Average = (0+100+200+255)/4 = 138.75 -> 138.
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], 138);
+        assert_eq!(out[1], 0);
+        assert_eq!(out[2], 0);
+        assert_eq!(out[3], 255);
+    }
+
+    #[test]
+    fn frame_edit_overwrites_root_frame_1x1() {
+        let chunks = frame_edit(777, 10, 5, 4, 2, &[9u8; 4 * 2 * 4], 8, false, 32);
+        let s = String::from_utf8(chunks.into_iter().next().unwrap()).unwrap();
+        assert!(s.contains("a=f"));
+        assert!(s.contains("i=777"));
+        assert!(s.contains(",r=1,"));
+        assert!(s.contains("x=10") && s.contains("y=5"));
+        assert!(s.contains("s=4") && s.contains("v=2"));
+        assert!(s.contains("X=1"));
+    }
+
+    
+    /// Measure pure encoder production rate (no UI loop, no terminal sink): how
+    /// fast can the two-layer backend emit edits for a 300x300 changing scene?
+    /// This isolates the encoder from the consumer-loop cadence that throttles
+    /// the UI (input poll + ratatui draw + flush per iteration).
+    #[tokio::test]
+    async fn encoder_throughput_churning_scene() {
+        use bytes::Bytes as B;
+        use tokio_stream::StreamExt as _;
+        struct Churn { frames: u32 }
+        #[async_trait]
+        impl FrameSource for Churn {
+            fn metadata(&self) -> FrameMetadata {
+                FrameMetadata { width: 300, height: 300, format: PixelFormat::Rgba32 }
+            }
+            async fn next(&mut self) -> Result<Option<FrameUpdate>, SourceError> {
+                if self.frames == 0 { return Ok(Some(FrameUpdate::Ended)); }
+                self.frames -= 1;
+                let w = 300u32;
+                let mut data = vec![7u8; (w * w * 4) as usize];
+                let v = (self.frames % 250) as u8;
+                for r in 0..w { for c in 0..(w/2) {
+                    let i = ((r*w + c) as usize) * 4;
+                    data[i] = v; data[i+3] = 255;
+                }}
+                Ok(Some(FrameUpdate::Frame(Frame::full(self.metadata(), B::from(data)))))
             }
         }
-        let lossless = encode_png(&data, w, h, 8);
-        let rounded4 = encode_png(&data, w, h, 4);
-        // Same unchanged frame again: rounding is stateless, so repeated
-        // encodes must be byte-identical (the flicker that appeared when each
-        // frame trained a fresh quantized palette).
-        let rounded4_b = encode_png(&data, w, h, 4);
-        assert!(
-            rounded4.len() < lossless.len(),
-            "rounded ({}) should beat lossless ({}) for a gradient",
-            rounded4.len(),
-            lossless.len()
+        let cfg = EncoderConfig {
+            blocks_per_side: 8,
+            loading_scale: 2,
+            pane_origin: Some((0, 0)),
+            placement_columns: 80,
+            placement_rows: 40,
+            png: false,
+            ..EncoderConfig::default()
+        };
+        let enc = TgpEncoder::new(cfg);
+        let src = Churn { frames: 500 };
+        let mut stream = enc.into_stream(src);
+        let t0 = Instant::now();
+        let mut frames = 0u64;
+        let mut bytes = 0u64;
+        let mut edits = 0u64;
+        while let Some(item) = stream.next().await {
+            match item.unwrap() {
+                EncoderEvent::Bytes(b) => { if !b.is_empty() { bytes += b.len() as u64; edits += 1; } }
+                EncoderEvent::Frame { .. } => frames += 1,
+                EncoderEvent::Ended => break,
+            }
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "encoder-only: {} frames in {:.3}s = {:.0} fps, {:.0} edits/frame, {:.0} B/frame",
+            frames, secs, frames as f64 / secs, edits as f64 / frames as f64, bytes as f64 / frames as f64
         );
-        assert!(lossless.starts_with(b"\x89PNG"));
-        assert!(rounded4.starts_with(b"\x89PNG"));
-        assert!(
-            rounded4 == rounded4_b,
-            "identical frames must encode to identical bytes (stateless rounding)"
-        );
-        // Rounding must strip the dropped low bits and preserve alpha.
-        // 0x7F -> nearest representable 16-level is 0x80 (not 0x70).
-        let r = round_channels(&[0xFFu8, 0x7F, 0x33, 0xFF], 4);
-        assert_eq!(r[0], 0xF0);
-        assert_eq!(r[1], 0x80);
-        assert_eq!(r[2], 0x30);
-        assert_eq!(r[3], 0xFF, "alpha must be preserved");
+        assert!(frames as f64 / secs > 65.0, "encoder should far exceed UI fps, got {:.0} fps", frames as f64 / secs);
     }
-}
 
+    /// Pure encoder rate for a single-tiny-change scene (the "even a single
+    /// sub-block is 30ms sink / 50fps" case): proves the cost is loop overhead,
+    /// not payload size, when the encoder alone can produce far faster.
+    #[tokio::test]
+    async fn encoder_throughput_single_block_change() {
+        use bytes::Bytes as B;
+        use tokio_stream::StreamExt as _;
+        struct Flip { frames: u32, state: u8 }
+        #[async_trait]
+        impl FrameSource for Flip {
+            fn metadata(&self) -> FrameMetadata {
+                FrameMetadata { width: 300, height: 300, format: PixelFormat::Rgba32 }
+            }
+            async fn next(&mut self) -> Result<Option<FrameUpdate>, SourceError> {
+                if self.frames == 0 { return Ok(Some(FrameUpdate::Ended)); }
+                self.frames -= 1;
+                let w = 300u32;
+                let mut data = vec![7u8; (w * w * 4) as usize];
+                self.state = self.state.wrapping_add(1);
+                for r in 0..37 { for c in 0..37 {
+                    let i = ((r*w + c) as usize) * 4;
+                    data[i] = self.state; data[i+3] = 255;
+                }}
+                Ok(Some(FrameUpdate::Frame(Frame::full(self.metadata(), B::from(data)))))
+            }
+        }
+        let cfg = EncoderConfig {
+            blocks_per_side: 8,
+            pane_origin: Some((0, 0)),
+            placement_columns: 80,
+            placement_rows: 40,
+            png: false,
+            ..EncoderConfig::default()
+        };
+        let enc = TgpEncoder::new(cfg);
+        let src = Flip { frames: 1000, state: 0 };
+        let mut stream = enc.into_stream(src);
+        let t0 = Instant::now();
+        let mut frames = 0u64;
+        while let Some(item) = stream.next().await {
+            match item.unwrap() {
+                EncoderEvent::Bytes(_) => {}
+                EncoderEvent::Frame { .. } => frames += 1,
+                EncoderEvent::Ended => break,
+            }
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "encoder-only single-block: {} frames in {:.3}s = {:.0} fps",
+            frames, secs, frames as f64 / secs
+        );
+        assert!(frames as f64 / secs > 200.0, "single-block scene must not be encoder-bound");
+    }
+
+}
