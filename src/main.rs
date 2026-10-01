@@ -13,7 +13,7 @@ use clap::Parser;
 use futures::{Stream, StreamExt};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
-use tuigui_cage::{KeyEvent, KeyState, PointerEvent};
+use tuigui_comp::tui::{KeyEvent, KeyState, PointerEvent};
 use tuigui_comp::Compositor;
 use tuigui_streamer::{FrameSource, Mp4VideoSource, PinkFrameSource};
 use tuigui_tgp::proto as tgp;
@@ -98,6 +98,10 @@ struct Cli {
     #[arg(long, default_value_t = 1.0)]
     capture_interval: f64,
 
+    /// Don't draw the software cursor overlay on captured frames.
+    #[arg(long)]
+    no_cursor: bool,
+
     /// Split the canvas into an NxN block grid and stream changes via the
     /// kitty animation backend (`a=f` rect edits into one root frame).
     /// `10` (default) = 10x10 grid (100 blocks). The transmit+place backend
@@ -155,10 +159,19 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Route tracing to a file (not stderr): the TUI's alternate screen is on
+    // the terminal, and any stray log line (a WARN on spawn/drop, an Xwayland
+    // notice) would corrupt the live drawing. Diagnostics land in the log file.
+    let log_path = std::env::temp_dir().join(format!(
+        "tuigui-{}.log",
+        std::process::id()
+    ));
+    let file = std::fs::File::create(&log_path)?;
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "debug".into()),
         )
+        .with_writer(std::sync::Mutex::new(file))
         .init();
 
     install_terminal_panic_hook();
@@ -204,7 +217,14 @@ async fn main() -> Result<()> {
     // 1. Launch the in-process compositor and spawn the app into it. `Client`
     //    is the handle for capture + input; `Compositor` stays alive for the
     //    session and shuts the headless thread down on drop.
-    let compositor = Compositor::init((cw, ch), ui_scale as f64).context("starting compositor")?;
+    let compositor = Compositor::init_with_options(
+        (cw, ch),
+        ui_scale as f64,
+        tuigui_comp::CompositorOptions {
+            show_cursor: !cli.no_cursor,
+        },
+    )
+    .context("starting compositor")?;
     tracing::info!(socket = %compositor.wayland_socket().display(), "compositor up");
     let client = compositor
         .spawn(&app_path, (cw, ch))
@@ -937,7 +957,14 @@ async fn run_capture_png(cli: &Cli) -> Result<()> {
     let app_path = cli.app.clone().unwrap();
     let (tcols, trows) = terminal_pixel_size()?;
 
-    let compositor = Compositor::init((tcols, trows), 1.0).context("starting compositor")?;
+    let compositor = Compositor::init_with_options(
+        (tcols, trows),
+        1.0,
+        tuigui_comp::CompositorOptions {
+            show_cursor: !cli.no_cursor,
+        },
+    )
+    .context("starting compositor")?;
     let client = compositor
         .spawn(&app_path, (tcols, trows))
         .context("spawning app into compositor")?;

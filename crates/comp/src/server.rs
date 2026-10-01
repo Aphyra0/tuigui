@@ -89,6 +89,13 @@ pub struct Server {
     /// `Some(n)` means `DISPLAY=:n` should be set for spawned clients.
     /// Shared with the `Compositor`/`Client` API so `spawn` reads it.
     pub x11_display: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    /// Set true once XWayland is known to be unavailable (spawn failed or the
+    /// WM failed to start). Lets `spawn()`'s display wait give up deterministically
+    /// instead of racing an arbitrary timeout.
+    pub x11_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether captures should draw the software cursor overlay. Disabled with
+    /// `--no-cursor` (e.g. for clean pixel-exact screenshots).
+    pub show_cursor: bool,
 }
 
 impl Server {
@@ -105,6 +112,7 @@ impl Server {
         size: (u32, u32),
         client_scale: f64,
         runtime_dir: &std::path::Path,
+        show_cursor: bool,
     ) -> Result<Self, CompError> {
         let display = Display::new().map_err(|e| CompError::Server(e.to_string()))?;
         // Pick a free name and bind the socket under the private runtime dir.
@@ -160,6 +168,8 @@ impl Server {
             size,
             client_scale,
             x11_display: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            x11_failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            show_cursor,
         })
     }
 

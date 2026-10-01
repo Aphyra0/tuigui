@@ -152,8 +152,7 @@
               # libs the comp crate (in-process smithay compositor) links against
               pkgs.pixman
               pkgs.libxkbcommon
-              # runtime for the cage head + demo apps to stream + TGP test terminals
-              pkgs.cage
+              # demo apps to stream + TGP test terminals
               pkgs.foot
               pkgs.kitty
               # wayland-native demo clients (weston-flower, weston-editor,

@@ -132,6 +132,8 @@ pub struct CompState {
     client_scale: f64,
     /// Set false when the control channel closes to wind the loop down.
     serve: bool,
+    /// Whether capture draws the software cursor overlay (from `--no-cursor`).
+    show_cursor: bool,
 }
 
 impl CompState {
@@ -175,12 +177,12 @@ impl CompositorHandler for CompState {
         // on_commit_buffer_handler — we don't run a GPU renderer.)
         let out_size = self.server_size;
         let Some(win) = self.window.as_ref() else { return };
-        let is_window_surface = win.shared.surface == *surface;
-        let is_child = !is_window_surface
+        let is_win = win.shared.surface == *surface;
+        let is_kid = !is_win
             && smithay::wayland::compositor::get_parent(surface)
                 .map(|p| p == win.shared.surface)
                 .unwrap_or(false);
-        if !(is_window_surface || is_child) {
+        if !(is_win || is_kid) {
             return;
         }
 
@@ -193,7 +195,8 @@ impl CompositorHandler for CompState {
             let mut attrs = states.cached_state.get::<SurfaceAttributes>();
             if let Some(BufferAssignment::NewBuffer(buffer)) = &attrs.current().buffer {
                 let mut px = win.pixels.lock().unwrap();
-                if map_rgba(buffer, &mut px, out_size).is_ok() {
+                let copied = map_rgba(buffer, &mut px, out_size).is_ok();
+                if copied {
                     any_pixels = true;
                     release = Some(buffer.clone());
                 }
@@ -352,9 +355,6 @@ impl CompState {
         let Some(win) = self.window.as_ref() else {
             return Err(CompError::NotReady);
         };
-        if !win.shared.committed.load(Ordering::SeqCst) {
-            return Err(CompError::NotReady);
-        }
         if win.shared.dead.load(Ordering::SeqCst) {
             return Err(CompError::WindowGone);
         }
@@ -362,11 +362,21 @@ impl CompState {
         if pixels.is_empty() {
             return Err(CompError::NotReady);
         }
+        // We accept a frame once we have pixels, even if `committed` briefly
+        // reads false (e.g. the XWayland window was just replaced/remapped and
+        // its first new commit hasn't landed yet). Returning the last good
+        // pixels keeps the stream alive instead of idling on a fresh-slot flap.
+        if !win.shared.committed.load(Ordering::SeqCst) && pixels.iter().all(|&b| b == 0) {
+            return Err(CompError::NotReady);
+        }
         let (w, h) = self.server_size;
         let mut rgba = pixels;
         // Overlay a software cursor so the position is visible in captures:
-        // a red disc of radius 3 at the pointer's location.
-        draw_cursor(&mut rgba, w, h, self.pointer_loc);
+        // a red disc of radius 3 at the pointer's location. Skipped with
+        // `--no-cursor`.
+        if self.show_cursor {
+            draw_cursor(&mut rgba, w, h, self.pointer_loc);
+        }
         let damage = std::mem::take(&mut *win.damage.lock().unwrap());
         Ok(crate::Frame {
             width: w,
@@ -530,18 +540,22 @@ fn spawn_xwayland(
         [] as [(&str, &str); 0],
         true,
         std::process::Stdio::null(),
-        std::io::stderr(),
+        // Discard Xwayland's own stderr (xkbcomp warnings, glamor notices):
+        // it would otherwise flood the TUI's alternate screen.
+        std::process::Stdio::null(),
         |_| {},
     ) {
         Ok((xwayland, client)) => (xwayland, client),
         Err(e) => {
             tracing::warn!("xwayland: could not spawn Xwayland (X11 apps disabled): {e}");
+            server.x11_failed.store(true, std::sync::atomic::Ordering::Release);
             return Ok(());
         }
     };
     let (xwayland, client) = xwayland;
 
     let x11_display = server.x11_display.clone();
+    let x11_failed = server.x11_failed.clone();
     let wm_handle = handle.clone();
     handle
         .insert_source(xwayland, move |event, _, state: &mut CompState| {
@@ -557,12 +571,10 @@ fn spawn_xwayland(
                     match smithay::xwayland::X11Wm::start_wm(wm_handle.clone(), x11_socket, client.clone()) {
                         Ok(wm) => {
                             state.x11_wm = Some(wm);
-                            // Only now is a client that sets `DISPLAY=:n` able
-                            // to actually open a window: XWayland accepts
-                            // connections as soon as the X server is up, but no
-                            // client is served until the WM holds `WM_S0`.
-                            // Advertising the display before this point has a
-                            // client spawn, try to connect, and die.
+                            // Only once the WM holds `WM_S0` is `DISPLAY=:n`
+                            // advertised and `Compositor::spawn` unblocks. This
+                            // guarantees the X11 client is never launched before
+                            // XWayland can serve it.
                             if let Ok(mut guard) = x11_display.write() {
                                 *guard = Some(format!(":{display_number}"));
                             }
@@ -570,11 +582,13 @@ fn spawn_xwayland(
                         }
                         Err(e) => {
                             tracing::error!("xwayland: failed to start X11 WM: {e}");
+                            x11_failed.store(true, std::sync::atomic::Ordering::Release);
                         }
                     }
                 }
                 smithay::xwayland::XWaylandEvent::Error => {
                     tracing::warn!("xwayland: X server exited unexpectedly during startup");
+                    x11_failed.store(true, std::sync::atomic::Ordering::Release);
                 }
             }
         })
@@ -613,6 +627,7 @@ pub fn run_thread(
     let handle = event_loop.handle();
 
     let mut state = init_state(&mut server)?;
+    state.show_cursor = server.show_cursor;
 
     // Advertise the output global.
     let _output_global = server
@@ -790,6 +805,7 @@ fn init_state(server: &mut Server) -> Result<CompState, CompError> {
         serial: 0,
         client_scale: server.client_scale,
         serve: true,
+        show_cursor: false,
     };
     seat.add_keyboard(XkbConfig::default(), 200, 25)
         .map_err(|e| CompError::Server(format!("keyboard init: {e}")))?;

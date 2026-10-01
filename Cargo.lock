@@ -1490,34 +1490,10 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
- "tuigui-cage",
  "tuigui-comp",
  "tuigui-core",
  "tuigui-streamer",
  "tuigui-tgp",
-]
-
-[[package]]
-name = "tuigui-cage"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "futures-core",
- "libc",
- "memmap2",
- "png",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "tuigui-streamer",
- "tuigui-tgp",
- "wayland-backend",
- "wayland-client",
- "wayland-protocols",
- "wayland-protocols-wlr",
 ]
 
 [[package]]
@@ -1714,7 +1690,6 @@ checksum = "eb04e52f7836d7c7976c78ca0250d61e33873c34156a2a1fc9474828ec268234"
 dependencies = [
  "bitflags 2.13.2",
  "wayland-backend",
- "wayland-client",
  "wayland-protocols",
  "wayland-scanner",
  "wayland-server",

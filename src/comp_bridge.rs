@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
-use tuigui_cage::PointerEvent;
+use tuigui_comp::tui::PointerEvent;
 use tuigui_comp::{Client, Rect, ScrollDelta};
 use tuigui_streamer::{
     Cadence, Frame, FrameMetadata, FrameSource, FrameUpdate, PixelFormat, SourceError,
@@ -170,12 +170,18 @@ impl FrameSource for CompFrameSource {
                 return Ok(Some(FrameUpdate::Idle));
             }
         }
+        // If the spawned app process has exited, end the stream instead of
+        // looping on stale pixels forever.
+        if !self.client.is_running() {
+            tracing::warn!("captured app process exited; ending stream");
+            return Ok(Some(FrameUpdate::Ended));
+        }
         self.seen_content = true;
         Ok(Some(FrameUpdate::Frame(streamer_frame)))
     }
 }
 
-/// Convert a cage `KeyEvent` (evdev code + state) into a `tuigui-comp` `Key`.
+/// Convert a terminal `KeyEvent` (evdev code + state) into a `tuigui-comp` `Key`.
 /// Returns `None` for keys the comp client can't represent yet.
 pub fn comp_key_from_evdev(code: u32, pressed: bool) -> Option<(tuigui_comp::Key, tuigui_comp::KeyState)> {
     use tuigui_comp::Key;
@@ -248,7 +254,7 @@ pub fn input_writer_loop(client: &Client, mut rx: mpsc::UnboundedReceiver<InputM
             match msg {
                 InputMsg::Key(kev) => {
                     // Discrete event: dispatch immediately, don't batch it.
-                    let pressed = kev.state == tuigui_cage::KeyState::Press;
+                    let pressed = kev.state == tuigui_comp::tui::KeyState::Press;
                     if let Some((key, state)) = comp_key_from_evdev(kev.code, pressed) {
                         if let Err(e) = client.key(key, state) {
                             tracing::warn!(err = %e, "comp key failed");
@@ -299,7 +305,7 @@ fn comp_pointer(client: &Client, ev: PointerEvent) {
             // `Client::click` already sends press+release. Only act on the
             // Press half of a real click; the matching Release is redundant
             // (forwarding both would make one physical click fire twice).
-            if state != tuigui_cage::KeyState::Press {
+            if state != tuigui_comp::tui::KeyState::Press {
                 return;
             }
             let button = match code {

@@ -25,9 +25,10 @@
 mod server;
 mod state;
 mod surface;
+pub mod tui;
 mod xwm;
 
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
@@ -276,6 +277,19 @@ pub enum CompError {
 /// Result alias used across the crate.
 pub type Result<T, E = CompError> = std::result::Result<T, E>;
 
+/// Tunables for [`Compositor::init_with_options`].
+#[derive(Debug, Clone, Copy)]
+pub struct CompositorOptions {
+    /// Draw a software cursor overlay on captured frames. Defaults to true.
+    pub show_cursor: bool,
+}
+
+impl Default for CompositorOptions {
+    fn default() -> Self {
+        CompositorOptions { show_cursor: true }
+    }
+}
+
 /// The compositor: owns the headless session on a dedicated thread.
 pub struct Compositor {
     tx: calloop_channel::Sender<server::Request>,
@@ -294,6 +308,9 @@ pub struct Compositor {
     /// X11 display number for the XWayland server, once it starts. Read at
     /// `spawn` time to set `DISPLAY` for X11-routed clients.
     x11_display: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    /// Whether XWayland is known to be unavailable; `spawn`'s display wait
+    /// gives up deterministically when this is set instead of racing a timeout.
+    x11_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Compositor {
@@ -306,6 +323,15 @@ impl Compositor {
     /// the window (buffer sizes are unaffected). The wl_output scale itself
     /// stays 1.0 so the window always fills the full output.
     pub fn init(size: (u32, u32), client_scale: f64) -> Result<Self, CompError> {
+        Self::init_with_options(size, client_scale, CompositorOptions::default())
+    }
+
+    /// Start the headless session with explicit options. See [`Compositor::init`].
+    pub fn init_with_options(
+        size: (u32, u32),
+        client_scale: f64,
+        options: CompositorOptions,
+    ) -> Result<Self, CompError> {
         // A private runtime dir, isolated from the caller's (Hyprland's).
         // The child gets this as XDG_RUNTIME_DIR so the only Wayland socket it
         // can auto-discover is ours; the host compositor simply isn't there.
@@ -319,11 +345,12 @@ impl Compositor {
         ));
         std::fs::create_dir_all(&runtime_dir)
             .map_err(|e| CompError::Server(format!("create runtime dir: {e}")))?;
-        let srv = server::Server::new(size, client_scale, &runtime_dir)?;
+        let srv = server::Server::new(size, client_scale, &runtime_dir, options.show_cursor)?;
         // Query the socket name before handing the server (and its socket) to
         // the compositor thread.
         let socket = srv.socket_name();
         let x11_display = srv.x11_display.clone();
+        let x11_failed = srv.x11_failed.clone();
         let (tx, rx) = calloop_channel::channel::<server::Request>();
         let (win_tx, win_rx) = std::sync::mpsc::channel::<std::os::unix::net::UnixStream>();
         let _ = &win_tx; // accepted on the wl thread via pending_windows
@@ -343,6 +370,7 @@ impl Compositor {
             size,
             client_scale,
             x11_display,
+            x11_failed,
         })
     }
 
@@ -367,42 +395,53 @@ impl Compositor {
                 self.size
             )));
         }
-        tracing::info!(path = %path.as_ref().display(), socket = %self.socket.display(), "spawning client");
-        // Launch the child confined to *our* compositor. The inherited host env
-        // (Hyprland) would let the client fall back out of our minimal Wayland
-        // compositor and open a real window on the host WM — via X11/XWayland
-        // (the ambient DISPLAY) or by auto-discovering the host's socket. Scope
-        // the env so the client can only reach what we provide:
-        //   - WAYLAND_DISPLAY -> our private socket (only real escape that stays
-        //     connected to us),
-        //   - WAYLAND_SOCKET  -> removed (would bypass WAYLAND_DISPLAY),
-        //   - DISPLAY -> our own XWayland instance (if it came up), never the
-        //     host's ambient DISPLAY,
-        //   - XDG_RUNTIME_DIR -> our private dir, so the only `wayland-*`
-        //     socket the client can discover is ours,
-        //   - GDK_BACKEND / QT_QPA_PLATFORM -> pinned to Wayland, so a toolkit
-        //     that would otherwise silently choose X11 must talk to us (Wayland
-        //     apps keep using Wayland; only pure-X11 apps like glxgears use
-        //     `DISPLAY`),
+        tracing::info!(path = %path.as_ref().display(), "spawning client");
+        // Launch the child forced onto the *X11* path (DISPLAY -> our own
+        // XWayland). We remove `WAYLAND_DISPLAY` and `WAYLAND_SOCKET` so the
+        // client cannot reach our Wayland socket (nor any host one); it must use
+        // X11. Scrub the env so it can only reach what we provide:
+        //   - WAYLAND_DISPLAY / WAYLAND_SOCKET -> removed, force X11,
+        //   - DISPLAY -> our own XWayland instance (set once its WM is up), never
+        //     the host's ambient DISPLAY,
+        //   - XDG_RUNTIME_DIR -> our private dir, so any `wayland-*` socket the
+        //     client auto-discovers is never a host compositor's,
+        //   - GDK_BACKEND / QT_QPA_PLATFORM -> removed so toolkits that default
+        //     to X11 when no Wayland is present actually pick our XWayland,
         //   - HYPRLAND_INSTANCE_SIGNATURE -> removed, so hyprland-specific
         //     autodiscovery (e.g. the drop-in `wayland-*` socket path) fails.
         let mut child = std::process::Command::new(path.as_ref());
         child
-            .env("WAYLAND_DISPLAY", &self.socket)
+            .env_remove("WAYLAND_DISPLAY")
             .env_remove("WAYLAND_SOCKET")
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
-            .env("GDK_BACKEND", "wayland")
-            .env("QT_QPA_PLATFORM", "wayland")
+            .env_remove("GDK_BACKEND")
+            .env_remove("QT_QPA_PLATFORM")
             .env_remove("HYPRLAND_INSTANCE_SIGNATURE");
         // If XWayland is running, point `DISPLAY` at it. Wait a short, bounded
         // beat for it to become ready so a pure-X11 app (glxgears) launched
         // right after init doesn't miss its display.
-        set_display_env(&self.x11_display, &mut child);
+        set_display_env(&self.x11_display, &self.x11_failed, &mut child);
         let mut child = child
-            .stdout(std::process::Stdio::inherit())
+            // Pipe (not inherit) the child's stdout: a GUI app's own terminal
+            // writes (glxgears prints FPS to stdout) would otherwise bleed into
+            // the TUI and corrupt the live display. stderr is drained into a
+            // tail for diagnostics.
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| CompError::Spawn(format!("{}: {e}", path.as_ref().display())))?;
+
+        // Discard the child's stdout: we don't need it and it must not reach
+        // the terminal (which is showing the TUI).
+        if let Some(mut out) = child.stdout.take() {
+            std::thread::Builder::new()
+                .name("tuigui-comp-stdout".into())
+                .spawn(move || {
+                    let mut tmp = [0u8; 2048];
+                    while out.read(&mut tmp).is_ok() {}
+                })
+                .ok();
+        }
 
         // Drain the child's stderr on a reader thread into a bounded tail so we
         // can surface *why* a headless client refused us (e.g. GTK's "The
@@ -415,11 +454,28 @@ impl Compositor {
             std::thread::Builder::new()
                 .name("tuigui-comp-stderr".into())
                 .spawn(move || {
+                    // Diagnostic: also persist the child's stderr to a file so
+                    // a headless client's error output survives after shutdown.
+                    let trace_path = std::path::PathBuf::from(format!(
+                        "/tmp/comp_child_stderr-{}.log",
+                        std::process::id()
+                    ));
                     let mut tmp = [0u8; 2048];
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&trace_path)
+                        .ok();
                     loop {
                         match er.read(&mut tmp) {
                             Ok(0) => break,
-                            Ok(n) => stderr_buf.push(&tmp[..n]),
+                            Ok(n) => {
+                                stderr_buf.push(&tmp[..n]);
+                                if let Some(f) = file.as_mut() {
+                                    let _ = std::io::Write::write_all(f, &tmp[..n]);
+                                    let _ = f.flush();
+                                }
+                            }
                             Err(_) => break,
                         }
                     }
@@ -514,49 +570,64 @@ fn recv_reply<T>(reply_rx: std::sync::mpsc::Receiver<T>) -> Result<T, CompError>
 /// The compositor thread fills `x11_display` only once the X11 window manager
 /// is actually running (not merely when the X server listens), because a
 /// client that connects before the WM holds `WM_S0` dies with "Can't open
-/// display". That WM startup can take ~10s, so we poll with a generous bound
-/// so a pure-X11 app spawned right after `init()` still sees its display. If
-/// XWayland never comes up we leave `DISPLAY` unset (the host's ambient
-/// display is intentionally never inherited).
+/// display". WM startup is normally milliseconds, but can take longer on a
+/// cold NixOS first-init (glamor -> swrast fallback), so we wait — bounded
+/// only by either the display appearing (win) or `x11_failed` being set
+/// (XWayland deterministically unavailable). An arbitrary deadline that races
+/// the WM would set `DISPLAY` too early and break X11 apps.
 ///
-/// Tradeoff: because every session launches XWayland (see `spawn_xwayland`),
-/// a pure-Wayland app's first `spawn()` also waits here until the (background)
-/// WM is ready. That's a one-time ~10s startup tax, not a per-frame cost.
+/// If XWayland is unavailable we leave `DISPLAY` unset (the host's ambient
+/// display is intentionally never inherited).
 fn set_display_env(
     x11_display: &std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    x11_failed: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     child: &mut std::process::Command,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    use std::sync::atomic::Ordering;
+    // Wait until the XWayland WM is fully up and has published DISPLAY before
+    // returning, so the caller only spawns the X11 client once the display is
+    // genuinely available. Give up only when XWayland is deterministically
+    // unavailable.
     loop {
-        if let Ok(guard) = x11_display.read() {
-            match guard.as_ref() {
+        match x11_display.read() {
+            Ok(guard) => match guard.as_ref() {
                 Some(d) => {
                     child.env("DISPLAY", d.clone());
                     return;
                 }
-                None if Instant::now() < deadline => {
+                None => {
+                    if x11_failed.load(Ordering::Acquire) {
+                        child.env_remove("DISPLAY");
+                        return;
+                    }
                     std::thread::sleep(Duration::from_millis(10));
-                    continue;
                 }
-                _ => {
-                    child.env_remove("DISPLAY");
-                    return;
-                }
+            },
+            Err(_) => {
+                child.env_remove("DISPLAY");
+                return;
             }
-        } else {
-            child.env_remove("DISPLAY");
-            return;
         }
     }
 }
 
 /// A running client window: capture + input injection.
-#[derive(Clone)]
 pub struct Client {
     tx: calloop_channel::Sender<server::Request>,
     child: Arc<Mutex<Option<Child>>>,
     stderr: StderrTail,
     size: (u32, u32),
+}
+
+impl Clone for Client {
+    fn clone(&self) -> Self {
+        Client {
+            tx: self.tx.clone(),
+            child: self.child.clone(),
+            stderr: self.stderr.clone(),
+            size: self.size,
+        }
+    }
 }
 
 impl Client {
@@ -669,6 +740,12 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
+        // Only kill the child when the last Client clone drops. A transient
+        // clone (e.g. the per-frame one in the capture source) must not tear
+        // the app down while other clones still own it.
+        if Arc::strong_count(&self.child) != 1 {
+            return;
+        }
         let mut guard = self.child.lock().unwrap();
         if let Some(child) = guard.take() {
             let mut child = child;

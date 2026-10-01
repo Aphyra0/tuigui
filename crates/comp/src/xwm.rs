@@ -45,13 +45,12 @@ impl XwmHandler for crate::state::CompState {
 
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
         tracing::debug!(window = window.window_id(), "x11: map request");
-        // Keep the window filling the full output and grant the mapping. The
-        // window's own requested geometry may be smaller than our output; the
-        // X11 client renders at whatever size we configure, so pin it to the
-        // output so capture sees the whole thing.
-        let (w, h) = self.server_size;
-        let full = Rectangle::<i32, Logical>::from_size((w as i32, h as i32).into());
-        let _ = window.configure(full);
+        // Grant the mapping first (the client draws at the size it requested),
+        // then admit. We do NOT force a full-screen configure at map time:
+        // X11 clients like glxgears draw at the size they asked for and can
+        // withdraw+recreate the window if a WM slams a different size on them
+        // before they've presented. The output-size override happens only on
+        // an explicit `configure_request`.
         let _ = window.set_mapped(true);
         self.admit_x11(&window);
     }
@@ -60,10 +59,17 @@ impl XwmHandler for crate::state::CompState {
 
     fn unmapped_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
 
-    fn destroyed_window(&mut self, _xwm: XwmId, _window: X11Surface) {
-        // The window is gone; drop the slot so a later app could be admitted.
-        self.window = None;
-        self.pending_x11 = None;
+    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        // Only drop the slot if the window actually being destroyed is the one
+        // we admitted. XWayland regularly creates and destroys helper windows
+        // (tooltips, override-redirect, transient bookkeeping) that share the
+        // same client; clearing `self.window` for those would wipe the live
+        // capture surface mid-session.
+        if window.wl_surface() == self.window.as_ref().map(|w| w.shared.surface.clone()) {
+            self.window = None;
+            self.pending_x11 = None;
+            tracing::debug!("x11: admitted window destroyed; dropping slot");
+        }
     }
 
     fn configure_request(
