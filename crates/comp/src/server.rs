@@ -90,8 +90,13 @@ impl Server {
     /// scaling is done per-client via `client_scale`.
     pub fn new(size: (u32, u32), client_scale: f64) -> Result<Self, CompError> {
         let display = Display::new().map_err(|e| CompError::Server(e.to_string()))?;
-        let socket = ListeningSocket::bind("tuigui-comp")
-            .map_err(|e| CompError::Server(format!("bind socket: {e}")))?;
+        // Bind a fresh auto-named socket (`tuigui-comp-N`) so multiple
+        // compositor sessions can run concurrently in one process tree and a
+        // stale socket from a dead session never blocks startup. The client is
+        // pointed at whatever name we bound via `WAYLAND_DISPLAY`.
+        let socket =
+            ListeningSocket::bind_auto("tuigui-comp", 1..64)
+                .map_err(|e| CompError::Server(format!("bind socket: {e}")))?;
         let socket_name: PathBuf = socket
             .socket_name()
             .ok_or_else(|| CompError::Server("listening socket has no name".into()))?

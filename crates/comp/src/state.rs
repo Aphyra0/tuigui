@@ -97,6 +97,10 @@ pub struct CompState {
     pub shm_state: ShmState,
     pub seat_state: SeatState<Self>,
     pub output_state: OutputManagerState,
+    /// The single present output. Used to send `wl_surface.enter` so committed
+    /// surfaces know an output is attached (Firefox waits for this before the
+    /// WebRender presents content).
+    pub output: smithay::output::Output,
     pub seat: Seat<Self>,
     pub display_handle: DisplayHandle,
     pub server_size: (u32, u32),
@@ -156,16 +160,26 @@ impl CompositorHandler for CompState {
 
         let mut any_pixels = false;
         let mut damage: Vec<crate::Rect> = Vec::new();
+        // Buffer consumed this commit; we `memcpy` its contents in `map_rgba`,
+        // so it can be released back to the client as soon as we're done.
+        let mut release: Option<smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer> = None;
         smithay::wayland::compositor::with_states(surface, |states| {
             let mut attrs = states.cached_state.get::<SurfaceAttributes>();
             if let Some(BufferAssignment::NewBuffer(buffer)) = &attrs.current().buffer {
                 let mut px = win.pixels.lock().unwrap();
                 if map_rgba(buffer, &mut px, out_size).is_ok() {
                     any_pixels = true;
+                    release = Some(buffer.clone());
                 }
             }
             commit_damage(&attrs.current(), out_size, &mut damage);
         });
+        // Return the consumed buffer to the client. Firefox's buffer pools wait
+        // for `wl_buffer.release` before reusing/allocating; never sending it
+        // starves the pool and the surface paints white.
+        if let Some(buf) = release {
+            buf.release();
+        }
 
         {
             let mut dmg = win.damage.lock().unwrap();
@@ -236,6 +250,12 @@ impl XdgShellHandler for CompState {
         surface.send_configure();
         *win.last_configure_serial.lock().unwrap() = Some(u32::from(serial) as u64);
         data.admitted.store(true, Ordering::SeqCst);
+
+        // The window now "fills" the single output. Send `wl_surface.enter` so
+        // the client knows an output is attached and can start presenting.
+        // Clients like Firefox's WebRender withhold content until they see this.
+        self.output.enter(surface.wl_surface());
+
         self.window = Some(win);
     }
 
@@ -608,6 +628,7 @@ fn init_state(server: &mut Server) -> Result<CompState, CompError> {
         ),
         seat_state,
         output_state: OutputManagerState::new_with_xdg_output::<CompState>(&dh),
+        output: server.output.clone(),
         seat: seat.clone(),
         display_handle: dh.clone(),
         server_size: server.size,

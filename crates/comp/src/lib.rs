@@ -284,9 +284,25 @@ impl Compositor {
             )));
         }
         tracing::info!(path = %path.as_ref().display(), socket = %self.socket.display(), "spawning client");
-        let mut child = std::process::Command::new(path.as_ref())
+        // Launch the child confined to *our* compositor. The inherited host env
+        // (Hyprland) would let the client fall back out of our minimal Wayland
+        // compositor and open a real window on the host WM — via X11/XWayland
+        // (the ambient DISPLAY) or by auto-discovering the host's socket. Scrub
+        // the env so those escape hatches are closed:
+        //   - WAYLAND_DISPLAY -> our private socket (only real escape that stays
+        //     connected to us),
+        //   - WAYLAND_SOCKET  -> removed (would bypass WAYLAND_DISPLAY),
+        //   - DISPLAY         -> unset, so no X11/XWayland server is reachable,
+        //   - GDK_BACKEND / QT_QPA_PLATFORM -> pinned to Wayland, so a toolkit
+        //     that would otherwise silently choose X11 must talk to us.
+        let mut child = std::process::Command::new(path.as_ref());
+        child
             .env("WAYLAND_DISPLAY", &self.socket)
             .env_remove("WAYLAND_SOCKET")
+            .env_remove("DISPLAY")
+            .env("GDK_BACKEND", "wayland")
+            .env("QT_QPA_PLATFORM", "wayland");
+        let mut child = child
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .spawn()
