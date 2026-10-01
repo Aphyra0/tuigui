@@ -19,6 +19,10 @@ use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
+use smithay::wayland::selection::data_device::{
+    ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+};
+use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::shm::ShmHandler;
 use smithay::wayland::shm::ShmState;
 
@@ -95,6 +99,9 @@ pub struct CompState {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
     pub shm_state: ShmState,
+    /// Clipboard / drag-and-drop. Required by GTK: it refuses to open a
+    /// Wayland display entirely if `wl_data_device_manager` is absent.
+    pub data_device_state: DataDeviceState,
     pub seat_state: SeatState<Self>,
     pub output_state: OutputManagerState,
     /// The single present output. Used to send `wl_surface.enter` so committed
@@ -297,6 +304,21 @@ impl SeatHandler for CompState {
 }
 
 impl smithay::wayland::output::OutputHandler for CompState {}
+
+// `wl_data_device_manager` (clipboard + drag-and-drop). The handler is what
+// makes GTK apps (nautilus, etc.) actually open our Wayland display: GTK's
+// `_gdk_wayland_display_open` bails with "not using Wayland display" unless a
+// data device manager global (plus an xdg/zxdg shell) is present.
+impl SelectionHandler for CompState {
+    type SelectionUserData = ();
+}
+impl ClientDndGrabHandler for CompState {}
+impl ServerDndGrabHandler for CompState {}
+impl DataDeviceHandler for CompState {
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self.data_device_state
+    }
+}
 
 /// Request handlers (run on the wl thread, between event-loop turns).
 impl CompState {
@@ -626,6 +648,7 @@ fn init_state(server: &mut Server) -> Result<CompState, CompError> {
                 smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb8888,
             ],
         ),
+        data_device_state: DataDeviceState::new::<CompState>(&dh),
         seat_state,
         output_state: OutputManagerState::new_with_xdg_output::<CompState>(&dh),
         output: server.output.clone(),
@@ -647,6 +670,7 @@ fn init_state(server: &mut Server) -> Result<CompState, CompError> {
 // Delegate macros: one per protocol global we run.
 smithay::delegate_compositor!(CompState);
 smithay::delegate_shm!(CompState);
-smithay::delegate_xdg_shell!(CompState);
 smithay::delegate_seat!(CompState);
+smithay::delegate_data_device!(CompState);
+smithay::delegate_xdg_shell!(CompState);
 smithay::delegate_output!(CompState);
