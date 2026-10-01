@@ -105,6 +105,10 @@ pub struct CompState {
     /// Last pointer position (output logical space).
     pub pointer_loc: Point<f64, smithay::utils::Logical>,
     serial: u64,
+    /// Client content scale applied via `ClientHandle::set_client_scale` on
+    /// admission (`--ui-scale / --scale`). Buffer sizes unaffected, so the
+    /// window stays full-output.
+    client_scale: f64,
     /// Set false when the control channel closes to wind the loop down.
     serve: bool,
 }
@@ -210,6 +214,12 @@ impl XdgShellHandler for CompState {
             .lock()
             .unwrap()
             .get_or_insert(self.server_size);
+
+        // Scale the client's content (`--ui-scale / --scale`) independently of
+        // the window size: smithay maps this into the client's logical space
+        // without changing its buffer size, so content stays a constant
+        // on-screen size while the window keeps filling the full output.
+        data.compositor_state.set_client_scale(self.client_scale);
 
         let shared = Arc::new(WindowShared {
             toplevel: surface.clone(),
@@ -604,6 +614,7 @@ fn init_state(server: &mut Server) -> Result<CompState, CompError> {
         window: None,
         pointer_loc: Point::new(0.0, 0.0),
         serial: 0,
+        client_scale: server.client_scale,
         serve: true,
     };
     seat.add_keyboard(XkbConfig::default(), 200, 25)

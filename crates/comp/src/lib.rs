@@ -33,6 +33,13 @@ use std::time::{Duration, Instant};
 
 use smithay::reexports::calloop::channel as calloop_channel;
 
+/// Bound on a [`Client`]/[`Compositor`] control round-trip through the wl
+/// thread. Real-time discipline: no call waits forever, so a stalled compositor
+/// thread can never wedge the caller (or, at startup, starve every tokio worker
+/// and freeze the UI). A caller that hits this should retry; the request is
+/// simply not serviced within budget.
+const RPC_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// A single captured frame.
 pub struct Frame {
     /// Width in pixels.
@@ -201,6 +208,8 @@ pub enum CompError {
     Spawn(String),
     #[error("capture failed: {0}")]
     Capture(String),
+    #[error("control round-trip timed out (compositor thread stalled)")]
+    Timeout,
 }
 
 /// Result alias used across the crate.
@@ -212,13 +221,24 @@ pub struct Compositor {
     thread: std::thread::JoinHandle<()>,
     socket: PathBuf,
     size: (u32, u32),
+    /// Client content scale (`--ui-scale / --scale`). Applied to each admission
+    /// via `ClientHandle::set_client_scale`, so content stays a constant on-screen
+    /// size when the `--scale` resolution divisor changes. Buffer sizes are
+    /// unaffected (the window still fills the full output).
+    client_scale: f64,
 }
 
 impl Compositor {
     /// Start the headless session. The output resolution is the single
     /// window's size (MVP: every spawn uses the same fixed resolution).
-    pub fn init(size: (u32, u32)) -> Result<Self, CompError> {
-        let srv = server::Server::new(size)?;
+    ///
+    /// `client_scale` (`--ui-scale / --scale`) is applied to clients via
+    /// `ClientHandle::set_client_scale`, so content stays a constant on-screen
+    /// size when the `--scale` resolution divisor changes — without shrinking
+    /// the window (buffer sizes are unaffected). The wl_output scale itself
+    /// stays 1.0 so the window always fills the full output.
+    pub fn init(size: (u32, u32), client_scale: f64) -> Result<Self, CompError> {
+        let srv = server::Server::new(size, client_scale)?;
         // Query the socket name before handing the server (and its socket) to
         // the compositor thread.
         let socket = srv.socket_name();
@@ -238,6 +258,7 @@ impl Compositor {
             thread,
             socket,
             size,
+            client_scale,
         })
     }
 
@@ -277,7 +298,9 @@ impl Compositor {
         loop {
             match self.try_capture() {
                 Ok(_) => break,
-                Err(CompError::NotReady) => {
+                // Transient: not committed yet, or the wl thread was too busy
+                // to answer within the round-trip budget. Keep polling.
+                Err(CompError::NotReady) | Err(CompError::Timeout) => {
                     if !Self::child_ok(&mut child) {
                         return Err(CompError::Spawn("client process exited early".into()));
                     }
@@ -314,9 +337,7 @@ impl Compositor {
         self.tx
             .send(server::Request::Capture { reply: reply_tx })
             .map_err(|_| CompError::Thread("compositor thread stopped".into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| CompError::Thread("compositor thread stopped".into()))?
+        recv_reply(reply_rx)?
     }
 
     /// Shut the session down (joins the thread).
@@ -324,6 +345,14 @@ impl Compositor {
         drop(self.tx);
         let _ = self.thread.join();
     }
+}
+
+/// Receive a control-channel reply with a hard [`RPC_TIMEOUT`] deadline so no
+/// API call ever blocks forever on a stalled wl thread.
+fn recv_reply<T>(reply_rx: std::sync::mpsc::Receiver<T>) -> Result<T, CompError> {
+    reply_rx
+        .recv_timeout(RPC_TIMEOUT)
+        .map_err(|_| CompError::Timeout)
 }
 
 /// A running client window: capture + input injection.
@@ -344,9 +373,7 @@ impl Client {
         self.tx
             .send(server::Request::Capture { reply: reply_tx })
             .map_err(|_| CompError::Thread("compositor thread stopped".into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| CompError::Thread("compositor thread stopped".into()))?
+        recv_reply(reply_rx)?
     }
 
     /// Send a key press + release pair.
@@ -365,9 +392,7 @@ impl Client {
                 reply: reply_tx,
             })
             .map_err(|_| CompError::Thread("compositor thread stopped".into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| CompError::Thread("compositor thread stopped".into()))?
+        recv_reply(reply_rx)?
     }
 
     /// Move the pointer to an absolute position inside the window.
@@ -380,9 +405,7 @@ impl Client {
                 reply: reply_tx,
             })
             .map_err(|_| CompError::Thread("compositor thread stopped".into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| CompError::Thread("compositor thread stopped".into()))?
+        recv_reply(reply_rx)?
     }
 
     /// Click a button at the current pointer position.
@@ -394,9 +417,7 @@ impl Client {
                 reply: reply_tx,
             })
             .map_err(|_| CompError::Thread("compositor thread stopped".into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| CompError::Thread("compositor thread stopped".into()))?
+        recv_reply(reply_rx)?
     }
 
     /// Scroll by discrete wheel steps (positive = down / right).
@@ -408,9 +429,7 @@ impl Client {
                 reply: reply_tx,
             })
             .map_err(|_| CompError::Thread("compositor thread stopped".into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| CompError::Thread("compositor thread stopped".into()))?
+        recv_reply(reply_rx)?
     }
 
     /// The client-facing window size.

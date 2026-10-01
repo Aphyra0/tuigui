@@ -12,7 +12,7 @@ use tuigui_comp::{Button, Compositor, Key, ScrollDelta};
 
 #[test]
 fn spawn_capture_and_input() {
-    let comp = Compositor::init((320, 240)).expect("init compositor");
+    let comp = Compositor::init((320, 240), 1.0).expect("init compositor");
     let client = comp
         .spawn(env!("CARGO_BIN_EXE_tuigui-comp-smoke"), (320, 240))
         .expect("spawn smoke client");

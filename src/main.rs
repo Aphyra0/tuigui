@@ -72,11 +72,18 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     max_fps: u32,
 
-    /// Scale down the headless output resolution (1.0–4.0). The terminal's
-    /// pixel size is divided by this to lower the capture resolution, shrinking
-    /// per-frame bytes. 1.0 keeps the full resolution.
+    /// Scale down the headless output resolution (1.0–10.0). The terminal's
+    /// pixel size is divided by this to lower the client's render resolution,
+    /// shrinking per-frame bytes. 1.0 keeps the full resolution.
     #[arg(long, default_value_t = 1.0)]
     scale: f32,
+
+    /// Relative DPI for the client's content, independent of the render
+    /// resolution (`--scale`). Compensates for `--scale` stretching the canvas
+    /// to the pane: `ui_scale / scale` is set as the client's content scale so
+    /// the app's UI stays a constant on-screen size. 1.5 is a 1.5x DPI hint.
+    #[arg(long, default_value_t = 0.001)]
+    ui_scale: f32,
 
     /// Capture a live screenshot of the caged session to a PNG file every
     /// interval (overwriting), for inspecting the rendered app headlessly.
@@ -183,14 +190,21 @@ async fn main() -> Result<()> {
     // resolution directly (the client is created at the smaller size), so no
     // post-capture downscale work is needed.
     let (tcols, trows) = terminal_pixel_size()?;
-    let scale = cli.scale.clamp(1.0, 4.0);
+    let scale = cli.scale.clamp(1.0, 10.0);
     let (cw, ch) = scaled_size(tcols, trows, scale);
     let (pc, pr) = pane_placement()?;
+    // UI scale hint passed to the client. The smaller `--scale` canvas is
+    // stretched to fill the same pane, so to keep the UI a constant physical
+    // size the client must render proportionally smaller content: the hint is
+    // `--ui-scale / --scale`. The compositor does NOT set a fractional wl_output
+    // scale (that shrinks the window); it passes this via the TUIGUI_UI_SCALE
+    // env var instead. A neutral output scale keeps the window full-screen.
+    let ui_scale = cli.ui_scale.clamp(1.0, 4.0) / scale.max(1.0);
 
     // 1. Launch the in-process compositor and spawn the app into it. `Client`
     //    is the handle for capture + input; `Compositor` stays alive for the
     //    session and shuts the headless thread down on drop.
-    let compositor = Compositor::init((cw, ch)).context("starting compositor")?;
+    let compositor = Compositor::init((cw, ch), ui_scale as f64).context("starting compositor")?;
     tracing::info!(socket = %compositor.wayland_socket().display(), "compositor up");
     let client = compositor
         .spawn(&app_path, (cw, ch))
@@ -254,7 +268,7 @@ async fn main() -> Result<()> {
         })
         .context("spawning input writer thread")?;
 
-    let res = run_ui(terminal, &mut tgp_stream, &app_path, (tcols, trows), tx).await;
+    let res = run_ui(terminal, &mut tgp_stream, &app_path, (cw, ch), tx).await;
     // Drop tx is handled inside run_ui; the input thread observes the channel
     // close and exits. Shut the compositor thread down now that streaming is
     // over.
@@ -528,6 +542,28 @@ async fn run_ui(
     let mut pane: Option<ratatui::layout::Rect> = None;
     let mut quit = false;
 
+    // Input listening runs on its own thread so the render loop never blocks
+    // on `crossterm::event::poll`/`read`. The thread blocks in read() forever
+    // (raw mode is on) and pushes crossterm events into a channel; the loop
+    // below drains it with a non-blocking try_recv, removing the ~4ms poll
+    // toll per frame. It defines the `q` key, forwarded to the main loop.
+    let (input_tx, input_rx) = std::sync::mpsc::channel::<crossterm::event::Event>();
+    let inputs_thread = std::thread::Builder::new()
+        .name("inputs_thread".into())
+        .spawn(move || {
+            loop {
+                match crossterm::event::read() {
+                    Ok(ev) => {
+                        if input_tx.send(ev).is_err() {
+                            break; // render loop gone
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .context("spawning inputs_thread")?;
+
     // Metrics for the status bar.
     // Seed the resolution from the terminal's pixel size we sized the headless
     // output to, so the footer shows it even before the first frame event (and
@@ -549,12 +585,15 @@ async fn run_ui(
     let mut setup_accum = 0f64;
     let mut copy_accum = 0f64;
     let mut readout_accum = 0f64;
+    let mut draw_ms_accum = 0f64;
 
     while !quit {
         // Draw the shell; capture the pane's inner rect where the image lands.
+        let draw_t0 = std::time::Instant::now();
         terminal.draw(|f| {
             pane = Some(ui::draw(f, app_path, &last_event, &stats));
         })?;
+        draw_ms_accum += draw_t0.elapsed().as_secs_f64() * 1000.0;
 
         // Drain encoder output without blocking the UI loop. The whole batch
         // this iteration belongs to one pane region, so park the cursor at the
@@ -581,12 +620,13 @@ async fn run_ui(
         let mut batch_tiles_edited: u32 = 0;
         let mut batch_tiles_total: u32 = 0;
         let mut written_bytes = 0usize;
-        // `Sink:` mirrors the stress binary's write stage: the total wall
-        // clock spent pushing the drained bytes to the terminal — buffered
-        // writes plus the final flush, which is where the PTY handoff blocks
-        // and waits for the terminal to consume the data. Chunks are timed
-        // individually so the idle await on the encoder stream (the 4ms
-        // timeout) never pollutes the number.
+        // `Sink:` measures the handoff of this batch to the terminal: from the
+        // moment the first byte is written to when the flush hands the whole
+        // batch to the PTY and blocks until the terminal consumes it. One timer
+        // spans the entire drain + flush, so userspace buffering in the
+        // BufWriter isn't over-counted per chunk and terminal backpressure
+        // after the flush is fully included.
+        let mut sink_t0: Option<std::time::Instant> = None;
         // Bail out after this many bytes per frame so the UI loop always
         // yields to redraw + key polling, even when a fast encoder floods the
         // (now bounded) channel every iteration.
@@ -606,9 +646,11 @@ async fn run_ui(
                 Ok(Some(Ok(EncoderEvent::Bytes(b)))) if !b.is_empty() => {
                     written_chunks += 1;
                     written_bytes += b.len();
-                    let w0 = std::time::Instant::now();
+                    // Start the batch's sink timer on the first byte written.
+                    if sink_t0.is_none() {
+                        sink_t0 = Some(std::time::Instant::now());
+                    }
                     out.write_all(&b)?;
-                    write_ms_accum += w0.elapsed().as_secs_f64() * 1000.0;
                 }
                 // Empty batch means nothing more to drain right now; stop and
                 // return control to the UI loop so keys/mouse stay responsive
@@ -652,13 +694,14 @@ async fn run_ui(
         // Fold this batch's peak tile-edit fraction into displayed stats.
         stats.tiles_edited = batch_tiles_edited;
         stats.tiles_total = batch_tiles_total;
-        let flush_t0 = std::time::Instant::now();
         out.flush()?;
-        // The flush is the dominant half of the send: it hands the buffered
-        // batch to the PTY and blocks until the terminal consumes it. Fold it
-        // into the same `Sink:` total as the chunk writes, exactly like the
-        // stress binary's write stage (write_all loop + flush, one timer).
-        write_ms_accum += flush_t0.elapsed().as_secs_f64() * 1000.0;
+        // The flush is the handoff: it pushes the buffered batch to the PTY
+        // and blocks until the terminal consumes it. Measure the whole batch
+        // (first write through flush) so userspace buffering doesn't inflate
+        // per-chunk writes and terminal backpressure is included.
+        if let Some(t0) = sink_t0 {
+            write_ms_accum += t0.elapsed().as_secs_f64() * 1000.0;
+        }
 
         // Accrue this iteration's transmitted bytes into the rolling window.
         frame_bytes_accum += written_bytes;
@@ -680,6 +723,7 @@ async fn run_ui(
             stats.setup_ms = setup_accum / n;
             stats.copy_ms = copy_accum / n;
             stats.readout_ms = readout_accum / n;
+            stats.draw_ms = draw_ms_accum / n;
             t_prev = now;
             frame_count_accum = 0;
             frame_bytes_accum = 0;
@@ -692,6 +736,7 @@ async fn run_ui(
             setup_accum = 0.0;
             copy_accum = 0.0;
             readout_accum = 0.0;
+            draw_ms_accum = 0.0;
         }
         tracing::info!(
             pane = ?pane.map(|r| (r.x, r.y, r.width, r.height)),
@@ -701,16 +746,11 @@ async fn run_ui(
             "ui drain iteration"
         );
 
-        // Forward input: keys and mouse to the session's input sink (if any).
-        // The pane is the live-capture region; convert cursor cell coords to
-        // the virtual frame's pixels before injecting. The sink appears on a
-        // background task once its Wayland connection is ready; the render
-        // loop only ever does a non-blocking `tx.send`, so flooding mouse
-        // events can never stall the stream. Events are also capped per
-        // iteration so `q` and the render loop always get a slice of the loop,
-        // even under continuous mouse motion.
-        while crossterm::event::poll(std::time::Duration::from_millis(4))? {
-            let ev = crossterm::event::read()?;
+        // Forward input: read whatever the inputs_thread already parsed and
+        // push it to the session's input sink. Non-blocking try_recv — the
+        // polling happens on `inputs_thread`, so this loop iteration never
+        // stalls waiting for a key or mouse event.
+        while let Ok(ev) = input_rx.try_recv() {
             match ev {
                 crossterm::event::Event::Key(k) => {
                     if k.kind == crossterm::event::KeyEventKind::Press
@@ -737,6 +777,10 @@ async fn run_ui(
     // Close the input channel so the writer task's recv() returns None and it
     // exits; otherwise the runtime waits on it forever and the binary hangs.
     drop(tx);
+    // Drop the receiver so the inputs_thread's send breaks; it also can't be
+    // joined cleanly (it blocks in read() until raw mode drops, then exits).
+    drop(input_rx);
+    let _ = inputs_thread;
     Ok(())
 }
 
@@ -874,7 +918,7 @@ async fn run_capture_png(cli: &Cli) -> Result<()> {
     let app_path = cli.app.clone().unwrap();
     let (tcols, trows) = terminal_pixel_size()?;
 
-    let compositor = Compositor::init((tcols, trows)).context("starting compositor")?;
+    let compositor = Compositor::init((tcols, trows), 1.0).context("starting compositor")?;
     let client = compositor
         .spawn(&app_path, (tcols, trows))
         .context("spawning app into compositor")?;

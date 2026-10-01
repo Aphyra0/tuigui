@@ -34,6 +34,9 @@ pub struct Stats {
     pub setup_ms: f64,
     pub copy_ms: f64,
     pub readout_ms: f64,
+    /// Wall-clock cost of the ratatui shell redraw (footer diff + write),
+    /// per frame (1s rolling average).
+    pub draw_ms: f64,
     /// Tiles edited (a=f) in the last frame, over the total block grid slots.
     pub tiles_edited: u32,
     pub tiles_total: u32,
@@ -41,7 +44,7 @@ pub struct Stats {
 
 /// Render the shell and return the area the TGP image should be placed into —
 /// the full body above three status footer rows (no header, no border).
-pub fn draw(f: &mut Frame, app: &str, status: &str, stats: &Stats) -> Rect {
+pub fn draw(f: &mut Frame, _app: &str, _status: &str, stats: &Stats) -> Rect {
     let [body, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(f.area());
 
@@ -61,14 +64,13 @@ pub fn draw(f: &mut Frame, app: &str, status: &str, stats: &Stats) -> Rect {
         String::new()
     };
     let line1 = format!(
-        " {status} · {app}  ·  FPS: {:.0}  ·  Bw: {:.1} MiB/s  ·  Cap: {:.1} ms  ·  Pace: {:.1} ms  ·  Enc: {:.1} ms  ·  Scale: {:.1} ms  ·  Sink: {:.1} ms  ·  {rw}x{rh}{phases}{tiles}  ·  q to quit",
+        " FPS: {:.0}  ·  Bw: {:.1} MiB/s  ·  Cap: {:.1} ms  ·  Enc: {:.1} ms  ·  Sink: {:.1} ms  ·  Draw: {:.1} ms  ·  {rw}x{rh}{phases}{tiles}",
         stats.fps,
         stats.bandwidth / (1024.0 * 1024.0),
         stats.capture_ms,
-        stats.pacing_ms,
         stats.encode_ms,
-        stats.downscale_ms,
         stats.sink_ms,
+        stats.draw_ms,
     );
 
     f.render_widget(

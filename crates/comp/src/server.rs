@@ -10,12 +10,11 @@
 //!   owned RGBA8 image (only wl_shm buffers in the MVP).
 //! - the `crates/comp` root wires the public `Compositor`/`Client` API.
 
-use crate::state::{CompState, ClientState};
+use crate::state::CompState;
 use crate::{Button, CompError, Frame, Key, KeyState, Rect, ScrollDelta};
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::{Display, ListeningSocket};
@@ -77,13 +76,19 @@ pub struct Server {
     pub socket_name: PathBuf,
     /// The single output presenting the one window.
     pub output: Output,
-    /// Global render dimensions (physical == logical, scale 1).
+    /// Global render dimensions (physical pixels); the output scale is fixed
+    /// at 1.0 so the window always covers the full output.
     pub size: (u32, u32),
+    /// Client content scale (`--ui-scale / --scale`) applied via
+    /// `ClientHandle::set_client_scale` on admission.
+    pub client_scale: f64,
 }
 
 impl Server {
-    /// Create the display, private socket, and the single output.
-    pub fn new(size: (u32, u32)) -> Result<Self, CompError> {
+    /// Create the display, private socket, and the single output. The wl_output
+    /// scale stays 1.0 (neutral) so the window always fills the output; content
+    /// scaling is done per-client via `client_scale`.
+    pub fn new(size: (u32, u32), client_scale: f64) -> Result<Self, CompError> {
         let display = Display::new().map_err(|e| CompError::Server(e.to_string()))?;
         let socket = ListeningSocket::bind("tuigui-comp")
             .map_err(|e| CompError::Server(format!("bind socket: {e}")))?;
@@ -115,20 +120,8 @@ impl Server {
             socket_name,
             output,
             size,
+            client_scale,
         })
-    }
-
-    /// Accept a pending connection and register it with the display.
-    pub fn accept_client(
-        &mut self,
-        stream: std::os::unix::net::UnixStream,
-        data: Arc<ClientState>,
-    ) -> Result<(), CompError> {
-        self.display
-            .handle()
-            .insert_client(stream, data)
-            .map_err(|e| CompError::Server(format!("insert client: {e}")))?;
-        Ok(())
     }
 
     pub fn dispatch(&mut self, state: &mut CompState) -> Result<(), CompError> {
@@ -147,10 +140,7 @@ impl Server {
 }
 
 /// Clamp a logical-space rect to the output and normalize to pixel-space u32.
-pub fn clamp_rect(
-    rect: Rectangle<i32, smithay::utils::Logical>,
-    size: (u32, u32),
-) -> Option<Rect> {
+pub fn clamp_rect(rect: Rectangle<i32, smithay::utils::Logical>, size: (u32, u32)) -> Option<Rect> {
     let (ow, oh) = (size.0 as i32, size.1 as i32);
     let x0 = rect.loc.x.max(0);
     let y0 = rect.loc.y.max(0);

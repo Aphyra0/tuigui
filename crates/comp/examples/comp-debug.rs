@@ -1,5 +1,5 @@
 fn main() {
-    let comp = tuigui_comp::Compositor::init((320, 240)).unwrap();
+    let comp = tuigui_comp::Compositor::init((320, 240), 1.0).unwrap();
     println!("socket: {:?}", comp.wayland_socket());
     let smoke = std::env::args().nth(1).expect("usage: comp-debug <smoke-bin>");
     let client = comp.spawn(&smoke, (320, 240)).expect("spawn");

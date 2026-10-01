@@ -145,6 +145,7 @@
                 ];
               })
               pkgs.pkg-config
+              pkgs.rust-analyzer
               pkgs.wayland
               pkgs.wayland-protocols
               pkgs.wayland-scanner

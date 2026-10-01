@@ -99,15 +99,49 @@ impl FrameSource for CompFrameSource {
                 tokio::time::sleep(interval - elapsed).await;
             }
         }
-        let frame = match self.client.capture() {
-            Ok(f) => f,
-            Err(e) => {
+
+        // Real-time frame budget: a frame that takes longer than this to be
+        // captured/composited is dropped instead of blocking the stream. The
+        // caller (TGP encoder) keeps running, so a slow first frame at startup
+        // can't starve every tokio worker and freeze the UI.
+        const FRAME_BUDGET: Duration = Duration::from_millis(500);
+        // Run the blocking capture round-trip on the blocking pool so it never
+        // ties up a token-driven worker thread, then apply the budget as a
+        // hard timeout. A saturated wl thread can legitimately exceed the
+        // budget; dropping beats wedging the runtime.
+        let client = self.client.clone();
+        // Time the whole capture round-trip: the blocking pool handoff plus the
+        // wl-thread read. This is where a headless capture's wall-clock lives.
+        let t0 = std::time::Instant::now();
+        let capture = tokio::time::timeout(FRAME_BUDGET, tokio::task::spawn_blocking(move || {
+            client.capture()
+        }))
+        .await;
+        let capture_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let frame = match capture {
+            Ok(Ok(Ok(f))) => f,
+            Ok(Ok(Err(e))) => {
                 tracing::warn!(err = %e, "comp capture failed; treating as idle");
+                self.prev_emit = Some(Instant::now());
+                return Ok(Some(FrameUpdate::Idle));
+            }
+            // Budget exceeded (or the blocking task was cancelled): drop the
+            // frame rather than let it stall the stream.
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!("comp capture exceeded {}ms frame budget; dropping", FRAME_BUDGET.as_millis());
                 self.prev_emit = Some(Instant::now());
                 return Ok(Some(FrameUpdate::Idle));
             }
         };
         self.prev_emit = Some(Instant::now());
+
+        let timing = tuigui_streamer::frame::CaptureTiming {
+            announce_ms: 0.0,
+            setup_ms: 0.0,
+            copy_ms: capture_ms,
+            readout_ms: 0.0,
+            downscale_ms: 0.0,
+        };
 
         // The client is created at the scaled resolution in main.rs, so the
         // captured frame is already the size we stream — no resample needed.
@@ -123,7 +157,7 @@ impl FrameSource for CompFrameSource {
             },
             data,
             presentation_timestamp: None,
-            timing: None,
+            timing: Some(timing),
             damage: to_streamer_damage(frame.damage),
         };
 
