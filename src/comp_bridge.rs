@@ -220,26 +220,77 @@ fn to_printable_key(code: u32) -> Option<(tuigui_comp::Key, tuigui_comp::KeyStat
 
 /// Drain an `mpsc::UnboundedReceiver<InputMsg>` on a dedicated std thread and
 /// forward each event into the `Client`. Returns when the channel closes.
+///
+/// Motion is coalesced so a mouse flick (which can burst dozens of motion
+/// events per drag through the terminal) collapses into a single `move_mouse`
+/// round-trip per drain; discrete events (keys, clicks, scrolls) are dispatched
+/// immediately as received rather than queued behind the motion flood. Without
+/// this, a fast drag starves the discrete events behind many blocking
+/// `move_mouse` calls and the app feels unresponsive to clicks/scrolling.
 pub fn input_writer_loop(client: &Client, mut rx: mpsc::UnboundedReceiver<InputMsg>) {
-    while let Some(msg) = rx.blocking_recv() {
-        match msg {
-            InputMsg::Key(kev) => {
-                let pressed = kev.state == tuigui_cage::KeyState::Press;
-                if let Some((key, state)) = comp_key_from_evdev(kev.code, pressed) {
-                    if let Err(e) = client.key(key, state) {
-                        tracing::warn!(err = %e, "comp key failed");
+    // Latest pending pointer position for the current batch (None = none queued).
+    let mut pending_pos: Option<(f64, f64)> = None;
+
+    loop {
+        let msg = match rx.blocking_recv() {
+            Some(m) => m,
+            None => return, // channel closed
+        };
+
+        // Handle the first message, then drain whatever else is already queued
+        // (non-blocking) into the same batch so we can coalesce motion and keep
+        // discrete events snappy.
+        let mut batch = vec![msg];
+        while let Ok(m) = rx.try_recv() {
+            batch.push(m);
+        }
+        for msg in batch {
+            match msg {
+                InputMsg::Key(kev) => {
+                    // Discrete event: dispatch immediately, don't batch it.
+                    let pressed = kev.state == tuigui_cage::KeyState::Press;
+                    if let Some((key, state)) = comp_key_from_evdev(kev.code, pressed) {
+                        if let Err(e) = client.key(key, state) {
+                            tracing::warn!(err = %e, "comp key failed");
+                        }
                     }
                 }
+                InputMsg::Pointer(PointerEvent::Motion { x, y }) => {
+                    // Coalesce: keep only the latest position this batch.
+                    pending_pos = Some((x, y));
+                }
+                InputMsg::Pointer(ev) => {
+                    // Discrete pointer event (button/axis): the click/scroll is
+                    // delivered at the *last flushed* position, so push the
+                    // coalesced motion first so `pointer_loc` is current before
+                    // the click lands — otherwise clicks lag a drag behind.
+                    if let Some((x, y)) = pending_pos.take() {
+                        if let Err(e) = client.move_mouse(x, y) {
+                            tracing::warn!(err = %e, "comp mouse move failed");
+                        }
+                    }
+                    comp_pointer(client, ev);
+                }
             }
-            InputMsg::Pointer(pev) => comp_pointer(client, pev),
+        }
+
+        // Flush the coalesced motion once at the end of the batch.
+        if let Some((x, y)) = pending_pos.take() {
+            if let Err(e) = client.move_mouse(x, y) {
+                tracing::warn!(err = %e, "comp mouse move failed");
+            }
         }
     }
 }
 
-/// Translate a [`PointerEvent`] into blocking `Client` calls.
+/// Translate a discrete [`PointerEvent`] (button, axis) into blocking `Client`
+/// calls. Motion is handled separately by the writer loop's coalescing logic.
 fn comp_pointer(client: &Client, ev: PointerEvent) {
     match ev {
         PointerEvent::Motion { x, y } => {
+            // Motion is coalesced by the writer loop's batch logic and should
+            // never reach here; handle defensively so dropping it can't leave
+            // the pointer stuck.
             if let Err(e) = client.move_mouse(x, y) {
                 tracing::warn!(err = %e, "comp mouse move failed");
             }
