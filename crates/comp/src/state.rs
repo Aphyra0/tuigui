@@ -25,6 +25,8 @@ use smithay::wayland::selection::data_device::{
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::shm::ShmHandler;
 use smithay::wayland::shm::ShmState;
+use smithay::wayland::xwayland_shell::XWaylandShellState;
+use smithay::xwayland::xwm::X11Wm;
 
 use crate::server::{Request, Server, WindowShared};
 use crate::surface::{commit_damage, map_rgba, Window};
@@ -102,6 +104,12 @@ pub struct CompState {
     /// Clipboard / drag-and-drop. Required by GTK: it refuses to open a
     /// Wayland display entirely if `wl_data_device_manager` is absent.
     pub data_device_state: DataDeviceState,
+    /// X11 surface association (the `xwayland_shell` global).
+    pub xwayland_shell_state: XWaylandShellState,
+    /// The running X11 window manager, once XWayland is ready.
+    pub x11_wm: Option<X11Wm>,
+    /// The pending X11 window candidate for the one-window slot.
+    pub pending_x11: Option<smithay::xwayland::X11Surface>,
     pub seat_state: SeatState<Self>,
     pub output_state: OutputManagerState,
     /// The single present output. Used to send `wl_surface.enter` so committed
@@ -115,6 +123,8 @@ pub struct CompState {
     pub window: Option<Arc<Window>>,
     /// Last pointer position (output logical space).
     pub pointer_loc: Point<f64, smithay::utils::Logical>,
+    /// Number of currently held pointer buttons (from click press/release).
+    pub buttons: u32,
     serial: u64,
     /// Client content scale applied via `ClientHandle::set_client_scale` on
     /// admission (`--ui-scale / --scale`). Buffer sizes unaffected, so the
@@ -131,9 +141,7 @@ impl CompState {
     }
 
     fn focus_surface(&self) -> Option<WlSurface> {
-        self.window
-            .as_ref()
-            .map(|w| w.shared.toplevel.wl_surface().clone())
+        self.window.as_ref().map(|w| w.shared.surface.clone())
     }
 }
 
@@ -147,7 +155,18 @@ impl CompositorHandler for CompState {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().unwrap().compositor_state
+        // XWayland's client carries `XWaylandClientData` (not our `ClientState`)
+        // with its own compositor state; our admitted clients carry `ClientState`.
+        // Both must be resolved so commit processing works for either.
+        if let Some(data) = client.get_data::<crate::state::ClientState>() {
+            return &data.compositor_state;
+        }
+        if let Some(data) = client.get_data::<smithay::xwayland::XWaylandClientData>() {
+            return &data.compositor_state;
+        }
+        // Fall back to a temporary default won't work (cannot return ref to
+        // temp); treat as fatal. This is a programming error.
+        panic!("client has neither ClientState nor XWaylandClientData");
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -156,10 +175,10 @@ impl CompositorHandler for CompState {
         // on_commit_buffer_handler — we don't run a GPU renderer.)
         let out_size = self.server_size;
         let Some(win) = self.window.as_ref() else { return };
-        let is_window_surface = win.shared.toplevel.wl_surface() == surface;
+        let is_window_surface = win.shared.surface == *surface;
         let is_child = !is_window_surface
             && smithay::wayland::compositor::get_parent(surface)
-                .map(|p| p == *win.shared.toplevel.wl_surface())
+                .map(|p| p == win.shared.surface)
                 .unwrap_or(false);
         if !(is_window_surface || is_child) {
             return;
@@ -243,7 +262,7 @@ impl XdgShellHandler for CompState {
         data.compositor_state.set_client_scale(self.client_scale);
 
         let shared = Arc::new(WindowShared {
-            toplevel: surface.clone(),
+            surface: surface.wl_surface().clone(),
             size,
             dead: AtomicBool::new(false),
             committed: AtomicBool::new(false),
@@ -420,6 +439,15 @@ impl CompState {
         let time = server_time();
         let code = button.evdev_code();
         let press_serial = self.next_serial();
+        self.buttons = self.buttons.saturating_add(1);
+        // Establish the keyboard focus on press, like anvil's
+        // `on_pointer_button`: a real client routes clicks/hover through the
+        // active window, and without a prior key event it never became active.
+        if let (Some(surface), Some(kbd)) = (self.focus_surface(), self.seat.get_keyboard()) {
+            if !kbd.is_focused() {
+                kbd.set_focus(self, Some(surface), press_serial);
+            }
+        }
         pointer.button(
             self,
             &smithay::input::pointer::ButtonEvent {
@@ -431,6 +459,7 @@ impl CompState {
         );
         pointer.frame(self);
         let release_serial = self.next_serial();
+        self.buttons = self.buttons.saturating_sub(1);
         pointer.button(
             self,
             &smithay::input::pointer::ButtonEvent {
@@ -471,6 +500,87 @@ impl CompState {
         pointer.frame(self);
         Ok(())
     }
+
+    pub fn handle_pointer_state(&self) -> crate::PointerState {
+        let (x, y) = (self.pointer_loc.x, self.pointer_loc.y);
+        crate::PointerState {
+            x,
+            y,
+            button_down: self.buttons > 0,
+        }
+    }
+}
+
+/// Spawn the XWayland server and register it as an event source on `handle`.
+///
+/// The `XWayland` handle is owned by the event loop (as the inserted source),
+/// keeping the X server alive for the thread's lifetime. On `Ready` we start
+/// the X11 WM and advertise `DISPLAY` so spawned clients can reach it.
+///
+/// No-op if `Xwayland` cannot be spawned; X11 support is best-effort and must
+/// never take the headless session down.
+fn spawn_xwayland(
+    server: &Server,
+    handle: smithay::reexports::calloop::LoopHandle<'static, CompState>,
+) -> Result<(), CompError> {
+    let xwayland = match smithay::xwayland::XWayland::spawn(
+        &server.display.handle(),
+        None,
+        // Sleep between discrete display slots? Let smithay pick a free one.
+        [] as [(&str, &str); 0],
+        true,
+        std::process::Stdio::null(),
+        std::io::stderr(),
+        |_| {},
+    ) {
+        Ok((xwayland, client)) => (xwayland, client),
+        Err(e) => {
+            tracing::warn!("xwayland: could not spawn Xwayland (X11 apps disabled): {e}");
+            return Ok(());
+        }
+    };
+    let (xwayland, client) = xwayland;
+
+    let x11_display = server.x11_display.clone();
+    let wm_handle = handle.clone();
+    handle
+        .insert_source(xwayland, move |event, _, state: &mut CompState| {
+            match event {
+                smithay::xwayland::XWaylandEvent::Ready {
+                    x11_socket,
+                    display_number,
+                } => {
+                    tracing::info!(display_number, "xwayland: X server ready");
+                    // Start the X11 window manager. It drives window mapping
+                    // and funnels every window's drawing to a wl_surface that
+                    // our normal commit/capture path sees.
+                    match smithay::xwayland::X11Wm::start_wm(wm_handle.clone(), x11_socket, client.clone()) {
+                        Ok(wm) => {
+                            state.x11_wm = Some(wm);
+                            // Only now is a client that sets `DISPLAY=:n` able
+                            // to actually open a window: XWayland accepts
+                            // connections as soon as the X server is up, but no
+                            // client is served until the WM holds `WM_S0`.
+                            // Advertising the display before this point has a
+                            // client spawn, try to connect, and die.
+                            if let Ok(mut guard) = x11_display.write() {
+                                *guard = Some(format!(":{display_number}"));
+                            }
+                            tracing::info!("xwayland: X11 window manager started; display :{display_number} available");
+                        }
+                        Err(e) => {
+                            tracing::error!("xwayland: failed to start X11 WM: {e}");
+                        }
+                    }
+                }
+                smithay::xwayland::XWaylandEvent::Error => {
+                    tracing::warn!("xwayland: X server exited unexpectedly during startup");
+                }
+            }
+        })
+        .map_err(|e| CompError::Server(format!("xwayland event source: {e}")))?;
+
+    Ok(())
 }
 
 /// Fire all pending frame callbacks on the window's surface tree.
@@ -498,7 +608,7 @@ pub fn run_thread(
     rx: channel::Channel<Request>,
     pending_windows: std::sync::mpsc::Receiver<std::os::unix::net::UnixStream>,
 ) -> Result<(), CompError> {
-    let mut event_loop: EventLoop<'_, CompState> =
+    let mut event_loop: EventLoop<'static, CompState> =
         EventLoop::try_new().map_err(|e| CompError::Server(e.to_string()))?;
     let handle = event_loop.handle();
 
@@ -508,6 +618,16 @@ pub fn run_thread(
     let _output_global = server
         .output
         .create_global::<CompState>(&server.display.handle());
+
+    // Advertise the xwayland_shell global (created in init_state) so XWayland
+    // can associate X11 windows with wl_surfaces. XWaylandShellState::new
+    // already created the global on the display handle.
+
+    // Spawn the XWayland server, if available. X11-only apps (glxgears,
+    // xterm, old toolkits) reach it through `DISPLAY`; its rendering is
+    // redirected onto wl_surfaces that flow through our normal capture path.
+    let xwayland = spawn_xwayland(&server, handle.clone())?;
+    let _ = xwayland;
 
     // Accept new wayland clients from the listening socket. calloop needs an
     // owned source, so the whole Server lives in an Arc<Mutex> shared between
@@ -577,6 +697,9 @@ pub fn run_thread(
             Request::Scroll { delta, reply } => {
                 let _ = reply.send(state.handle_scroll(delta));
             }
+            Request::PointerState { reply } => {
+                let _ = reply.send(Ok(state.handle_pointer_state()));
+            }
             }
         })
         .map_err(|e| CompError::Server(e.to_string()))?;
@@ -613,7 +736,7 @@ pub fn run_thread(
         // 3. Frame-callback emulator: fire pending done() events each turn.
         if let Some(win) = &state.window {
             if !win.shared.dead.load(Ordering::SeqCst) {
-                fire_frame_callbacks(win.shared.toplevel.wl_surface());
+                fire_frame_callbacks(&win.shared.surface);
                 let shared = shared_server.clone();
                 let mut server = shared.lock().unwrap();
                 display_dispatch(&mut server, &mut state)?;
@@ -649,6 +772,12 @@ fn init_state(server: &mut Server) -> Result<CompState, CompError> {
             ],
         ),
         data_device_state: DataDeviceState::new::<CompState>(&dh),
+        // The xwayland_shell global is what lets X11 apps (routed through
+        // XWayland) hand us their surfaces. Its global is created here; the
+        // XWayland server and the X11 WM are spawned from `run_thread`.
+        xwayland_shell_state: XWaylandShellState::new::<CompState>(&dh),
+        x11_wm: None,
+        pending_x11: None,
         seat_state,
         output_state: OutputManagerState::new_with_xdg_output::<CompState>(&dh),
         output: server.output.clone(),
@@ -657,6 +786,7 @@ fn init_state(server: &mut Server) -> Result<CompState, CompError> {
         server_size: server.size,
         window: None,
         pointer_loc: Point::new(0.0, 0.0),
+        buttons: 0,
         serial: 0,
         client_scale: server.client_scale,
         serve: true,
@@ -674,3 +804,4 @@ smithay::delegate_seat!(CompState);
 smithay::delegate_data_device!(CompState);
 smithay::delegate_xdg_shell!(CompState);
 smithay::delegate_output!(CompState);
+smithay::delegate_xwayland_shell!(CompState);

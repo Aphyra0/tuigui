@@ -19,7 +19,6 @@ use std::sync::atomic::AtomicBool;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::{BindError, Display, ListeningSocket};
 use smithay::utils::Rectangle;
-use smithay::wayland::shell::xdg::ToplevelSurface;
 
 /// Requests sent from the `Compositor`/`Client` API to the wl thread.
 pub enum Request {
@@ -49,12 +48,16 @@ pub enum Request {
         delta: ScrollDelta,
         reply: std::sync::mpsc::Sender<Result<(), CompError>>,
     },
+    /// Query the current pointer position and button state.
+    PointerState {
+        reply: std::sync::mpsc::Sender<Result<crate::PointerState, CompError>>,
+    },
 }
 
 /// State shared between the wl thread and the `Client` handle.
 pub struct WindowShared {
-    /// The admitted toplevel surface.
-    pub toplevel: ToplevelSurface,
+    /// The admitted surface (tl xdg toplevel or an X11 window's wl_surface).
+    pub surface: smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     /// The client-facing window size (from spawn's resolution).
     pub size: (u32, u32),
     /// Set when the window is gone (client closed it or died).
@@ -82,6 +85,10 @@ pub struct Server {
     /// Client content scale (`--ui-scale / --scale`) applied via
     /// `ClientHandle::set_client_scale` on admission.
     pub client_scale: f64,
+    /// X11 display number for the XWayland server, once it starts.
+    /// `Some(n)` means `DISPLAY=:n` should be set for spawned clients.
+    /// Shared with the `Compositor`/`Client` API so `spawn` reads it.
+    pub x11_display: std::sync::Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl Server {
@@ -152,6 +159,7 @@ impl Server {
             output,
             size,
             client_scale,
+            x11_display: std::sync::Arc::new(std::sync::RwLock::new(None)),
         })
     }
 

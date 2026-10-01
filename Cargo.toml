@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/streamer", "crates/tgp", "crates/cage", "crates/comp"]
+members = ["crates/streamer", "crates/tgp", "crates/cage", "crates/comp", "crates/tuigui_core"]
 
 [workspace.package]
 version = "0.1.0"
@@ -40,6 +40,7 @@ tuigui-streamer = { path = "crates/streamer" }
 tuigui-tgp = { path = "crates/tgp" }
 tuigui-comp = { path = "crates/comp" }
 tuigui-cage = { path = "crates/cage" }
+tuigui-core = { path = "crates/tuigui_core" }
 
 [package]
 name = "tuigui"
@@ -61,6 +62,7 @@ tuigui-streamer = { workspace = true }
 tuigui-tgp = { workspace = true }
 tuigui-cage = { workspace = true }
 tuigui-comp = { workspace = true }
+tuigui-core = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }

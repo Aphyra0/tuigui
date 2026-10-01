@@ -40,6 +40,11 @@ pub struct Stats {
     /// Tiles edited (a=f) in the last frame, over the total block grid slots.
     pub tiles_edited: u32,
     pub tiles_total: u32,
+    /// Last pointer position the render loop sent to the compositor (output
+    /// pixels), and the most recent input kind (motion/click/scroll/key/none).
+    pub cursor_x: f64,
+    pub cursor_y: f64,
+    pub input_state: &'static str,
 }
 
 /// Render the shell and return the area the TGP image should be placed into —
@@ -64,13 +69,16 @@ pub fn draw(f: &mut Frame, _app: &str, _status: &str, stats: &Stats) -> Rect {
         String::new()
     };
     let line1 = format!(
-        " FPS: {:.0}  ·  Bw: {:.1} MiB/s  ·  Cap: {:.1} ms  ·  Enc: {:.1} ms  ·  Sink: {:.1} ms  ·  Draw: {:.1} ms  ·  {rw}x{rh}{phases}{tiles}",
+        " FPS: {:.0}  ·  Bw: {:.1} MiB/s  ·  Cap: {:.1} ms  ·  Enc: {:.1} ms  ·  Sink: {:.1} ms  ·  Draw: {:.1} ms  ·  {rw}x{rh}{phases}{tiles}  ·  Mouse: ({:.0},{:.0}) {}",
         stats.fps,
         stats.bandwidth / (1024.0 * 1024.0),
         stats.capture_ms,
         stats.encode_ms,
         stats.sink_ms,
         stats.draw_ms,
+        stats.cursor_x,
+        stats.cursor_y,
+        stats.input_state,
     );
 
     f.render_widget(

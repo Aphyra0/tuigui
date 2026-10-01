@@ -759,12 +759,31 @@ async fn run_ui(
                         quit = true;
                     }
                     if let Some(kev) = crossterm_key_to_key(k) {
+                        stats.input_state = "key";
                         let _ = tx.send(InputMsg::Key(kev));
                     }
                 }
                 crossterm::event::Event::Mouse(m) => {
-                    for pev in mouse_to_pointer(m, pane, output_px) {
-                        let _ = tx.send(InputMsg::Pointer(pev));
+                    let pevs = mouse_to_pointer(m, pane, output_px);
+                    for pev in &pevs {
+                        match pev {
+                            PointerEvent::Motion { x, y } => {
+                                stats.cursor_x = *x;
+                                stats.cursor_y = *y;
+                                stats.input_state = "motion";
+                            }
+                            PointerEvent::Button { state, .. } => {
+                                stats.input_state = if *state == KeyState::Press {
+                                    "click"
+                                } else {
+                                    "click-released"
+                                };
+                            }
+                            PointerEvent::Axis { .. } => {
+                                stats.input_state = "scroll";
+                            }
+                        }
+                        let _ = tx.send(InputMsg::Pointer(pev.clone()));
                     }
                 }
                 _ => {}

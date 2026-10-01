@@ -25,14 +25,24 @@
 mod server;
 mod state;
 mod surface;
+mod xwm;
 
-use std::path::PathBuf;
 use std::io::Read as _;
+use std::path::PathBuf;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use smithay::reexports::calloop::channel as calloop_channel;
+use tuigui_core::TGCompositor;
+
+// pub struct Comp {}
+
+// impl TGCompositor for Comp {
+//     fn spawn(command: std::process::Command) -> impl tuigui_core::TGClient {
+//         todo!()
+//     }
+// }
 
 /// Bound on a [`Client`]/[`Compositor`] control round-trip through the wl
 /// thread. Real-time discipline: no call waits forever, so a stalled compositor
@@ -71,7 +81,11 @@ impl StderrTail {
     /// The last non-empty stderr line, or empty if nothing captured.
     fn last_line(&self) -> String {
         let s = self.as_string();
-        s.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_string()
+        s.lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .to_string()
     }
 }
 
@@ -228,6 +242,18 @@ impl ScrollDelta {
     }
 }
 
+/// The compositor's current pointer position and button state, queried via
+/// [`Client::pointer_state`]. Used by the terminal shell to show where the
+/// pointer is while debugging input delivery to a headless client.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PointerState {
+    /// Pointer position in output pixels.
+    pub x: f64,
+    pub y: f64,
+    /// True if any button is currently held.
+    pub button_down: bool,
+}
+
 /// Crate-level error.
 #[derive(Debug, thiserror::Error)]
 pub enum CompError {
@@ -265,6 +291,9 @@ pub struct Compositor {
     /// size when the `--scale` resolution divisor changes. Buffer sizes are
     /// unaffected (the window still fills the full output).
     client_scale: f64,
+    /// X11 display number for the XWayland server, once it starts. Read at
+    /// `spawn` time to set `DISPLAY` for X11-routed clients.
+    x11_display: std::sync::Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl Compositor {
@@ -294,6 +323,7 @@ impl Compositor {
         // Query the socket name before handing the server (and its socket) to
         // the compositor thread.
         let socket = srv.socket_name();
+        let x11_display = srv.x11_display.clone();
         let (tx, rx) = calloop_channel::channel::<server::Request>();
         let (win_tx, win_rx) = std::sync::mpsc::channel::<std::os::unix::net::UnixStream>();
         let _ = &win_tx; // accepted on the wl thread via pending_windows
@@ -312,6 +342,7 @@ impl Compositor {
             runtime_dir,
             size,
             client_scale,
+            x11_display,
         })
     }
 
@@ -340,27 +371,33 @@ impl Compositor {
         // Launch the child confined to *our* compositor. The inherited host env
         // (Hyprland) would let the client fall back out of our minimal Wayland
         // compositor and open a real window on the host WM — via X11/XWayland
-        // (the ambient DISPLAY) or by auto-discovering the host's socket. Scrub
-        // the env so those escape hatches are closed:
+        // (the ambient DISPLAY) or by auto-discovering the host's socket. Scope
+        // the env so the client can only reach what we provide:
         //   - WAYLAND_DISPLAY -> our private socket (only real escape that stays
         //     connected to us),
         //   - WAYLAND_SOCKET  -> removed (would bypass WAYLAND_DISPLAY),
-        //   - DISPLAY -> unset, so no X11/XWayland server is reachable,
+        //   - DISPLAY -> our own XWayland instance (if it came up), never the
+        //     host's ambient DISPLAY,
         //   - XDG_RUNTIME_DIR -> our private dir, so the only `wayland-*`
         //     socket the client can discover is ours,
         //   - GDK_BACKEND / QT_QPA_PLATFORM -> pinned to Wayland, so a toolkit
-        //     that would otherwise silently choose X11 must talk to us,
+        //     that would otherwise silently choose X11 must talk to us (Wayland
+        //     apps keep using Wayland; only pure-X11 apps like glxgears use
+        //     `DISPLAY`),
         //   - HYPRLAND_INSTANCE_SIGNATURE -> removed, so hyprland-specific
         //     autodiscovery (e.g. the drop-in `wayland-*` socket path) fails.
         let mut child = std::process::Command::new(path.as_ref());
         child
             .env("WAYLAND_DISPLAY", &self.socket)
             .env_remove("WAYLAND_SOCKET")
-            .env_remove("DISPLAY")
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
             .env("GDK_BACKEND", "wayland")
             .env("QT_QPA_PLATFORM", "wayland")
             .env_remove("HYPRLAND_INSTANCE_SIGNATURE");
+        // If XWayland is running, point `DISPLAY` at it. Wait a short, bounded
+        // beat for it to become ready so a pure-X11 app (glxgears) launched
+        // right after init doesn't miss its display.
+        set_display_env(&self.x11_display, &mut child);
         let mut child = child
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::piped())
@@ -472,6 +509,47 @@ fn recv_reply<T>(reply_rx: std::sync::mpsc::Receiver<T>) -> Result<T, CompError>
         .map_err(|_| CompError::Timeout)
 }
 
+/// Set (or clear) `DISPLAY` on a child command from the XWayland display slot.
+///
+/// The compositor thread fills `x11_display` only once the X11 window manager
+/// is actually running (not merely when the X server listens), because a
+/// client that connects before the WM holds `WM_S0` dies with "Can't open
+/// display". That WM startup can take ~10s, so we poll with a generous bound
+/// so a pure-X11 app spawned right after `init()` still sees its display. If
+/// XWayland never comes up we leave `DISPLAY` unset (the host's ambient
+/// display is intentionally never inherited).
+///
+/// Tradeoff: because every session launches XWayland (see `spawn_xwayland`),
+/// a pure-Wayland app's first `spawn()` also waits here until the (background)
+/// WM is ready. That's a one-time ~10s startup tax, not a per-frame cost.
+fn set_display_env(
+    x11_display: &std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    child: &mut std::process::Command,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(guard) = x11_display.read() {
+            match guard.as_ref() {
+                Some(d) => {
+                    child.env("DISPLAY", d.clone());
+                    return;
+                }
+                None if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                _ => {
+                    child.env_remove("DISPLAY");
+                    return;
+                }
+            }
+        } else {
+            child.env_remove("DISPLAY");
+            return;
+        }
+    }
+}
+
 /// A running client window: capture + input injection.
 #[derive(Clone)]
 pub struct Client {
@@ -552,6 +630,15 @@ impl Client {
                 delta,
                 reply: reply_tx,
             })
+            .map_err(|_| CompError::Thread("compositor thread stopped".into()))?;
+        recv_reply(reply_rx)?
+    }
+
+    /// The compositor's current pointer position and button state.
+    pub fn pointer_state(&self) -> Result<PointerState, CompError> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(server::Request::PointerState { reply: reply_tx })
             .map_err(|_| CompError::Thread("compositor thread stopped".into()))?;
         recv_reply(reply_rx)?
     }

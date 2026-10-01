@@ -46,11 +46,14 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for Smoke {
     fn event(
         _: &mut Self,
         _: &wl_registry::WlRegistry,
-        _: wl_registry::Event,
+        event: wl_registry::Event,
         _: &GlobalListContents,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if let wl_registry::Event::Global { name, interface, version } = event {
+            eprintln!("SMOKE GLOBAL {name}: {interface} v{version}");
+        }
     }
 }
 
@@ -269,6 +272,12 @@ fn main() {
     let (globals, mut event_queue) =
         wayland_client::globals::registry_queue_init::<Smoke>(&conn).expect("registry init");
     let qh = event_queue.handle();
+    {
+        let list = globals.contents().clone_list();
+        for g in list {
+            eprintln!("SMOKE GLOBAL {}: {} v{}", g.name, g.interface, g.version);
+        }
+    }
 
     let compositor = globals
         .bind::<wl_compositor::WlCompositor, Smoke, _>(&qh, 1..=6, ())
