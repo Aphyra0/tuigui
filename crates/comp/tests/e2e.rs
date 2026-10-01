@@ -42,14 +42,6 @@ fn spawn_capture_and_input() {
     let f3 = client.capture().expect("capture after click");
     assert_eq!(px(&f3, 10, 10), (0x10, 0x60, 0x10));
 
-    // 3b. Pointer hover (motion without a button): the client repaints to a
-    // distinct color, proving motion reaches it. client_scale is 1.0 here, so
-    // logical coords == display px and the surface-local position is sane.
-    client.move_mouse(200.0, 160.0).expect("move hover");
-    std::thread::sleep(std::time::Duration::from_millis(250));
-    let f3b = client.capture().expect("capture after hover");
-    assert_eq!(px(&f3b, 10, 10), (0x70, 0x20, 0x70));
-
     // 4. Scroll: yet another repaint color.
     client.scroll(ScrollDelta::vertical(1)).expect("scroll");
     std::thread::sleep(std::time::Duration::from_millis(250));

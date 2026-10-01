@@ -390,27 +390,18 @@ impl CompState {
             return Err(CompError::NotReady);
         };
         let (w, h) = self.server_size;
-        // Clamp to the visible output, in display pixels.
         let x = x.clamp(0.0, w.max(2) as f64 - 1.0);
         let y = y.clamp(0.0, h.max(2) as f64 - 1.0);
-        // Physical (== output logical at scale 1.0) position; used for the
-        // captured cursor and for click/scroll defaulting.
         let loc = Point::new(x, y);
         self.pointer_loc = loc;
         let pointer = self.seat.get_pointer().ok_or(CompError::NotReady)?;
         let serial = self.next_serial();
         let time = server_time();
-        // smithay reports `wl_pointer` coords in the client's *logical* space,
-        // scaling our submitted `location` by client_scale (--ui-scale/--scale).
-        // We track the pointer in display pixels, so submit logical =
-        // display/client_scale so the client sees coords matching its buffer.
-        let scale = self.client_scale.max(1e-3);
-        let logical_loc = Point::new(x / scale, y / scale);
         pointer.motion(
             self,
             Some((surface, Point::new(0.0, 0.0))),
             &smithay::input::pointer::MotionEvent {
-                location: logical_loc,
+                location: loc,
                 serial,
                 time,
             },
@@ -463,22 +454,16 @@ impl CompState {
         let time = server_time();
         let mut frame = smithay::input::pointer::AxisFrame::new(time)
             .source(smithay::backend::input::AxisSource::Wheel);
-        // smithay scales axis values by client_scale on the wire (matches
-        // motion), so undo that so the client sees the logical amount.
-        let scale = self.client_scale.max(1e-3);
         if steps_v != 0 {
             frame = frame
-                .value(
-                    smithay::backend::input::Axis::Vertical,
-                    steps_v as f64 * 10.0 / scale,
-                )
+                .value(smithay::backend::input::Axis::Vertical, steps_v as f64 * 10.0)
                 .v120(smithay::backend::input::Axis::Vertical, steps_v);
         }
         if steps_h != 0 {
             frame = frame
                 .value(
                     smithay::backend::input::Axis::Horizontal,
-                    steps_h as f64 * 10.0 / scale,
+                    steps_h as f64 * 10.0,
                 )
                 .v120(smithay::backend::input::Axis::Horizontal, steps_h);
         }
