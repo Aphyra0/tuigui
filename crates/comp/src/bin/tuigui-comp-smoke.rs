@@ -23,6 +23,7 @@ enum Scene {
     Key,
     Click,
     Scroll,
+    Hover,
 }
 
 fn scene_color(scene: Scene) -> [u8; 3] {
@@ -31,12 +32,14 @@ fn scene_color(scene: Scene) -> [u8; 3] {
         Scene::Key => [0x40, 0x20, 0x10],
         Scene::Click => [0x10, 0x60, 0x10],
         Scene::Scroll => [0x60, 0x60, 0x10],
+        Scene::Hover => [0x70, 0x20, 0x70],
     }
 }
 
 #[derive(Default)]
 struct Smoke {
     scene: Scene,
+    hover: Option<(f64, f64)>,
     needs_repaint: bool,
     configured: bool,
     last_serial: u32,
@@ -161,6 +164,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Smoke {
         _: &QueueHandle<Self>,
     ) {
         match event {
+            wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
+                // Hover: repaint so a test can observe that motion reached the
+                // client and record where it thinks the pointer is.
+                state.scene = Scene::Hover;
+                state.hover = Some((surface_x, surface_y));
+                state.needs_repaint = true;
+            }
             wl_pointer::Event::Button {
                 state: WEnum::Value(s),
                 ..
