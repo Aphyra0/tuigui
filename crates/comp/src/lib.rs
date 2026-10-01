@@ -27,6 +27,7 @@ mod state;
 mod surface;
 
 use std::path::PathBuf;
+use std::io::Read as _;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,6 +40,40 @@ use smithay::reexports::calloop::channel as calloop_channel;
 /// and freeze the UI). A caller that hits this should retry; the request is
 /// simply not serviced within budget.
 const RPC_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How many bytes of the child's stderr to retain for diagnostics. Bounded so
+/// a chatty client can't grow memory without limit.
+const STDERR_TAIL_CAP: usize = 32 * 1024;
+
+/// Synchronized tail of a spawned child's stderr (most recent bytes). Populated
+/// by a dedicated reader thread so we never block on the child's pipe; surfaced
+/// in errors and via [`Client::stderr_tail`] for troubleshooting headless
+/// clients that refuse our minimal compositor.
+#[derive(Clone)]
+struct StderrTail(Arc<Mutex<Vec<u8>>>);
+
+impl StderrTail {
+    fn new() -> Self {
+        StderrTail(Arc::new(Mutex::new(Vec::new())))
+    }
+    fn push(&self, bytes: &[u8]) {
+        let mut buf = self.0.lock().unwrap();
+        buf.extend_from_slice(bytes);
+        if buf.len() > STDERR_TAIL_CAP {
+            let surplus = buf.len() - STDERR_TAIL_CAP;
+            buf.drain(..surplus);
+        }
+    }
+    fn as_string(&self) -> String {
+        let buf = self.0.lock().unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+    /// The last non-empty stderr line, or empty if nothing captured.
+    fn last_line(&self) -> String {
+        let s = self.as_string();
+        s.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_string()
+    }
+}
 
 /// A single captured frame.
 pub struct Frame {
@@ -220,6 +255,10 @@ pub struct Compositor {
     tx: calloop_channel::Sender<server::Request>,
     thread: std::thread::JoinHandle<()>,
     socket: PathBuf,
+    /// Private per-session runtime dir holding our socket. The child's
+    /// `XDG_RUNTIME_DIR` points here so it can only discover our socket, never
+    /// the host compositor's. Removed on drop.
+    runtime_dir: std::path::PathBuf,
     size: (u32, u32),
     /// Client content scale (`--ui-scale / --scale`). Applied to each admission
     /// via `ClientHandle::set_client_scale`, so content stays a constant on-screen
@@ -238,7 +277,20 @@ impl Compositor {
     /// the window (buffer sizes are unaffected). The wl_output scale itself
     /// stays 1.0 so the window always fills the full output.
     pub fn init(size: (u32, u32), client_scale: f64) -> Result<Self, CompError> {
-        let srv = server::Server::new(size, client_scale)?;
+        // A private runtime dir, isolated from the caller's (Hyprland's).
+        // The child gets this as XDG_RUNTIME_DIR so the only Wayland socket it
+        // can auto-discover is ours; the host compositor simply isn't there.
+        let runtime_dir = std::env::temp_dir().join(format!(
+            "tuigui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&runtime_dir)
+            .map_err(|e| CompError::Server(format!("create runtime dir: {e}")))?;
+        let srv = server::Server::new(size, client_scale, &runtime_dir)?;
         // Query the socket name before handing the server (and its socket) to
         // the compositor thread.
         let socket = srv.socket_name();
@@ -257,6 +309,7 @@ impl Compositor {
             tx,
             thread,
             socket,
+            runtime_dir,
             size,
             client_scale,
         })
@@ -292,21 +345,50 @@ impl Compositor {
         //   - WAYLAND_DISPLAY -> our private socket (only real escape that stays
         //     connected to us),
         //   - WAYLAND_SOCKET  -> removed (would bypass WAYLAND_DISPLAY),
-        //   - DISPLAY         -> unset, so no X11/XWayland server is reachable,
+        //   - DISPLAY -> unset, so no X11/XWayland server is reachable,
+        //   - XDG_RUNTIME_DIR -> our private dir, so the only `wayland-*`
+        //     socket the client can discover is ours,
         //   - GDK_BACKEND / QT_QPA_PLATFORM -> pinned to Wayland, so a toolkit
-        //     that would otherwise silently choose X11 must talk to us.
+        //     that would otherwise silently choose X11 must talk to us,
+        //   - HYPRLAND_INSTANCE_SIGNATURE -> removed, so hyprland-specific
+        //     autodiscovery (e.g. the drop-in `wayland-*` socket path) fails.
         let mut child = std::process::Command::new(path.as_ref());
         child
             .env("WAYLAND_DISPLAY", &self.socket)
             .env_remove("WAYLAND_SOCKET")
             .env_remove("DISPLAY")
+            .env("XDG_RUNTIME_DIR", &self.runtime_dir)
             .env("GDK_BACKEND", "wayland")
-            .env("QT_QPA_PLATFORM", "wayland");
+            .env("QT_QPA_PLATFORM", "wayland")
+            .env_remove("HYPRLAND_INSTANCE_SIGNATURE");
         let mut child = child
             .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| CompError::Spawn(format!("{}: {e}", path.as_ref().display())))?;
+
+        // Drain the child's stderr on a reader thread into a bounded tail so we
+        // can surface *why* a headless client refused us (e.g. GTK's "The
+        // Wayland compositor does not provide one or more of the required
+        // interfaces") instead of a bare "spawn failed". Non-blocking for us:
+        // we only read from the shared tail under a mutex.
+        let stderr = StderrTail::new();
+        let stderr_buf = stderr.clone();
+        if let Some(mut er) = child.stderr.take() {
+            std::thread::Builder::new()
+                .name("tuigui-comp-stderr".into())
+                .spawn(move || {
+                    let mut tmp = [0u8; 2048];
+                    loop {
+                        match er.read(&mut tmp) {
+                            Ok(0) => break,
+                            Ok(n) => stderr_buf.push(&tmp[..n]),
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .ok();
+        }
 
         // Window admission happens on the wl thread when the client's first
         // toplevel commits; poll capture readiness for the ack.
@@ -317,15 +399,32 @@ impl Compositor {
                 // Transient: not committed yet, or the wl thread was too busy
                 // to answer within the round-trip budget. Keep polling.
                 Err(CompError::NotReady) | Err(CompError::Timeout) => {
+                    // The child seems alive; give it a beat to finish starting.
                     if !Self::child_ok(&mut child) {
-                        return Err(CompError::Spawn("client process exited early".into()));
+                        // Include the client's own stderr tail so GTK/Qt
+                        // diagnostics (e.g. "not providing required interfaces")
+                        // are visible instead of a bare "exited early".
+                        let why = stderr.last_line();
+                        return Err(CompError::Spawn(if why.is_empty() {
+                            "client process exited early (captured no diagnostic output)".into()
+                        } else {
+                            format!("client process exited early: last stderr: {why}")
+                        }));
                     }
                     if Instant::now() > deadline {
                         let _ = child.kill();
-                        return Err(CompError::Spawn(format!(
-                            "client {} never committed a frame within 10s",
-                            path.as_ref().display()
-                        )));
+                        let why = stderr.last_line();
+                        return Err(CompError::Spawn(if why.is_empty() {
+                            format!(
+                                "client {} never committed a frame within 10s (no diagnostic output)",
+                                path.as_ref().display()
+                            )
+                        } else {
+                            format!(
+                                "client {} never committed a frame within 10s; last stderr: {why}",
+                                path.as_ref().display()
+                            )
+                        }));
                     }
                     std::thread::sleep(Duration::from_millis(15));
                 }
@@ -338,6 +437,7 @@ impl Compositor {
         Ok(Client {
             tx: self.tx.clone(),
             child: Arc::new(Mutex::new(Some(child))),
+            stderr: stderr.clone(),
             size: self.size,
         })
     }
@@ -360,6 +460,7 @@ impl Compositor {
     pub fn shutdown(self) {
         drop(self.tx);
         let _ = self.thread.join();
+        let _ = std::fs::remove_dir_all(&self.runtime_dir);
     }
 }
 
@@ -376,10 +477,17 @@ fn recv_reply<T>(reply_rx: std::sync::mpsc::Receiver<T>) -> Result<T, CompError>
 pub struct Client {
     tx: calloop_channel::Sender<server::Request>,
     child: Arc<Mutex<Option<Child>>>,
+    stderr: StderrTail,
     size: (u32, u32),
 }
 
 impl Client {
+    /// The tail of the client process's stderr (most recent bytes captured).
+    /// Useful for diagnosing why a headless client refused our compositor
+    /// (GTK/Qt print which Wayland interfaces they need here).
+    pub fn stderr_tail(&self) -> String {
+        self.stderr.as_string()
+    }
     /// Capture the window contents as RGBA8 + damage.
     ///
     /// This is the efficient path the crate exists for: the pixels are read

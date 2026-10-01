@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
-use smithay::reexports::wayland_server::{Display, ListeningSocket};
+use smithay::reexports::wayland_server::{BindError, Display, ListeningSocket};
 use smithay::utils::Rectangle;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
@@ -88,19 +88,45 @@ impl Server {
     /// Create the display, private socket, and the single output. The wl_output
     /// scale stays 1.0 (neutral) so the window always fills the output; content
     /// scaling is done per-client via `client_scale`.
-    pub fn new(size: (u32, u32), client_scale: f64) -> Result<Self, CompError> {
+    ///
+    /// `runtime_dir` is a private, per-session directory owned by this
+    /// compositor. The listening socket is bound *inside* it. Giving the child
+    /// this same `XDG_RUNTIME_DIR` means the only `wayland-*` socket it can
+    /// discover is ours — never Hyprland's — which is the whole point of having
+    /// a headless session.
+    pub fn new(
+        size: (u32, u32),
+        client_scale: f64,
+        runtime_dir: &std::path::Path,
+    ) -> Result<Self, CompError> {
         let display = Display::new().map_err(|e| CompError::Server(e.to_string()))?;
-        // Bind a fresh auto-named socket (`tuigui-comp-N`) so multiple
-        // compositor sessions can run concurrently in one process tree and a
-        // stale socket from a dead session never blocks startup. The client is
-        // pointed at whatever name we bound via `WAYLAND_DISPLAY`.
-        let socket =
-            ListeningSocket::bind_auto("tuigui-comp", 1..64)
-                .map_err(|e| CompError::Server(format!("bind socket: {e}")))?;
-        let socket_name: PathBuf = socket
-            .socket_name()
-            .ok_or_else(|| CompError::Server("listening socket has no name".into()))?
-            .into();
+        // Pick a free name and bind the socket under the private runtime dir.
+        let mut name = format!("wayland-{}", std::process::id());
+        let mut socket_path = runtime_dir.join(&name);
+        let mut attempts = 0u32;
+        let socket = loop {
+            match ListeningSocket::bind_absolute(socket_path.clone()) {
+                Ok(s) => break s,
+                Err(BindError::AlreadyInUse) => {
+                    attempts += 1;
+                    if attempts > 64 {
+                        return Err(CompError::Server(format!(
+                            "no free socket name under {}",
+                            runtime_dir.display()
+                        )));
+                    }
+                    // Some collision in our private dir; try the next suffix.
+                    name = format!("wayland-{}-{attempts}", std::process::id());
+                    socket_path = runtime_dir.join(&name);
+                }
+                Err(e) => {
+                    return Err(CompError::Server(format!("bind socket: {e}")));
+                }
+            }
+        };
+        // `bind_absolute` does not populate the auto-name (that's a `bind`/
+        // `bind_auto` convenience); the absolute path we bound is the socket.
+        let socket_name: PathBuf = socket_path;
 
         let (w, h) = (size.0 as i32, size.1 as i32);
         let mode = Mode {
