@@ -1,0 +1,22 @@
+[package]
+name = "easytgp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal graphics protocol (TGP) wire format encoder/decoder"
+
+[dependencies]
+gobo-core = { workspace = true }
+derive_builder = { workspace = true }
+rustix = { workspace = true }
+png = { workspace = true }
+image = { workspace = true }
+base64-turbo = { workspace = true }
+itertools = { workspace = true }
+idalloc = { workspace = true }
+static_init = { workspace = true }
+yscv-video = "0.2"
+
+[[example]]
+name = "image"
+path = "examples/image.rs"

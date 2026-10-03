@@ -1,0 +1,9 @@
+[package]
+name = "gobo-comp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-process headless Wayland compositor for capture and input injection"
+
+[dependencies]
+gobo-core = { workspace = true }

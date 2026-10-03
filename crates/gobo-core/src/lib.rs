@@ -1,4 +1,4 @@
-// This crate exposes primitives used by tuigui.
+//! Core types, traits and primitives shared across the gobo crates.
 
 /// Represents the source to be captured.
 pub trait TGCompositor {

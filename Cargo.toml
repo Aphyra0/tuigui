@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/streamer", "crates/tgp", "crates/comp", "crates/tuigui_core"]
+members = [
+    "crates/gobo-core",
+    "crates/gobo-comp",
+    "crates/gobo-widget",
+    "crates/easytgp",
+    "crates/gobo-tgp-renderer",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,70 +14,37 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net"] }
-tokio-stream = "0.1"
-futures = "0.3"
-futures-core = "0.3"
-async-trait = "0.1"
 thiserror = "2"
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-bytes = "1"
-bytemuck = { version = "1", features = ["derive"] }
-png = "0.17"
-flate2 = "1.0"
-
-# tui
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
-
-# cli
-clap = { version = "4", features = ["derive"] }
-
-# wayland (cage capture + input)
-wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
-memmap2 = "0.9"
-tempfile = "3"
+derive_builder = "0.20"
+rustix = { version = "1.1", features = ["fs", "termios", "process"] }
+png = "0.18"
+image = "0.25"
+base64-turbo = "0.5"
+itertools = "0.15"
+idalloc = "0.1"
+static_init = "1.0"
 
 # internal
-tuigui-streamer = { path = "crates/streamer" }
-tuigui-tgp = { path = "crates/tgp" }
-tuigui-comp = { path = "crates/comp" }
-tuigui-core = { path = "crates/tuigui_core" }
+gobo-core = { path = "crates/gobo-core" }
+gobo-comp = { path = "crates/gobo-comp" }
+gobo-widget = { path = "crates/gobo-widget" }
+easytgp = { path = "crates/easytgp" }
+gobo-tgp-renderer = { path = "crates/gobo-tgp-renderer" }
 
 [package]
-name = "tuigui"
+name = "gobo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "GUI app in the terminal"
 
 [[bin]]
-name = "tuigui"
+name = "gobo"
 path = "src/main.rs"
 
-[[bin]]
-name = "tuigui-stress"
-path = "src/stress.rs"
-
 [dependencies]
-tuigui-streamer = { workspace = true }
-tuigui-tgp = { workspace = true }
-tuigui-comp = { workspace = true }
-tuigui-core = { workspace = true }
-tokio = { workspace = true }
-tokio-stream = { workspace = true }
-futures = { workspace = true }
-futures-core = { workspace = true }
-anyhow = { workspace = true }
-png = { workspace = true }
-ratatui = { workspace = true }
-crossterm = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-clap = { workspace = true }
-async-trait = { workspace = true }
-bytes = { workspace = true }
-libc = "0.2"
+gobo-core = { workspace = true }
+gobo-comp = { workspace = true }
+gobo-widget = { workspace = true }
+easytgp = { workspace = true }
+gobo-tgp-renderer = { workspace = true }
