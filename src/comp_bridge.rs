@@ -8,7 +8,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use tuigui_comp::tui::PointerEvent;
-use tuigui_comp::{Client, Rect, ScrollDelta};
+use tuigui_comp::{Client, ScrollDelta};
+use tuigui_core::TGClient as _;
 use tuigui_streamer::{
     Cadence, Frame, FrameMetadata, FrameSource, FrameUpdate, PixelFormat, SourceError,
 };
@@ -17,7 +18,7 @@ use tokio::sync::mpsc;
 use crate::InputMsg;
 
 /// A [`FrameSource`] that pulls frames from a `tuigui-comp` [`Client`] by
-/// blocking `capture()` round-trips, paced to `max_fps`. The client is created
+/// blocking `snapshot()` round-trips, paced to `max_fps`. The client is created
 /// at the scaled resolution upstream, so captured frames need no downscale.
 pub struct CompFrameSource {
     client: Client,
@@ -39,19 +40,6 @@ impl CompFrameSource {
             boot_start: Instant::now(),
         }
     }
-}
-
-/// Convert `tuigui-comp::Rect` (pixel damage) into `tuigui-streamer::Rect`.
-fn to_streamer_damage(damage: Vec<Rect>) -> Vec<tuigui_streamer::Rect> {
-    damage
-        .into_iter()
-        .map(|r| tuigui_streamer::Rect {
-            x: r.x,
-            y: r.y,
-            width: r.width,
-            height: r.height,
-        })
-        .collect()
 }
 
 /// True when a frame is entirely (or almost entirely) black — the signature of
@@ -114,7 +102,7 @@ impl FrameSource for CompFrameSource {
         // wl-thread read. This is where a headless capture's wall-clock lives.
         let t0 = std::time::Instant::now();
         let capture = tokio::time::timeout(FRAME_BUDGET, tokio::task::spawn_blocking(move || {
-            client.capture()
+            client.snapshot()
         }))
         .await;
         let capture_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -145,10 +133,12 @@ impl FrameSource for CompFrameSource {
 
         // The client is created at the scaled resolution in main.rs, so the
         // captured frame is already the size we stream — no resample needed.
-        let (nw, nh) = (frame.width, frame.height);
+        let (nw, nh) = frame.size;
         let data = Bytes::from(frame.rgba);
         self.last_dims = Some((nw, nh));
 
+        // `snapshot()` (the core trait) doesn't carry damage; the per-block
+        // encoder diffs frames itself, so treat everything as changed.
         let streamer_frame = Frame {
             metadata: FrameMetadata {
                 width: nw,
@@ -158,7 +148,7 @@ impl FrameSource for CompFrameSource {
             data,
             presentation_timestamp: None,
             timing: Some(timing),
-            damage: to_streamer_damage(frame.damage),
+            damage: Vec::new(),
         };
 
         // Skip blank boot frames until real content appears (or a budget

@@ -35,15 +35,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use smithay::reexports::calloop::channel as calloop_channel;
-use tuigui_core::TGCompositor;
-
-// pub struct Comp {}
-
-// impl TGCompositor for Comp {
-//     fn spawn(command: std::process::Command) -> impl tuigui_core::TGClient {
-//         todo!()
-//     }
-// }
 
 /// Bound on a [`Client`]/[`Compositor`] control round-trip through the wl
 /// thread. Real-time discipline: no call waits forever, so a stalled compositor
@@ -282,11 +273,18 @@ pub type Result<T, E = CompError> = std::result::Result<T, E>;
 pub struct CompositorOptions {
     /// Draw a software cursor overlay on captured frames. Defaults to true.
     pub show_cursor: bool,
+    /// Spawn an XWayland server so X11-only clients can render through the
+    /// compositor. When false, only native Wayland clients are supported
+    /// (`DISPLAY` is left unset). Defaults to true.
+    pub use_x11: bool,
 }
 
 impl Default for CompositorOptions {
     fn default() -> Self {
-        CompositorOptions { show_cursor: true }
+        CompositorOptions {
+            show_cursor: true,
+            use_x11: true,
+        }
     }
 }
 
@@ -311,6 +309,10 @@ pub struct Compositor {
     /// Whether XWayland is known to be unavailable; `spawn`'s display wait
     /// gives up deterministically when this is set instead of racing a timeout.
     x11_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether to spawn XWayland and route X11-only clients to it (`DISPLAY`).
+    /// `Compositor` needs this in `spawn` to decide whether to wait on
+    /// `x11_display` at all.
+    use_x11: bool,
 }
 
 impl Compositor {
@@ -345,7 +347,13 @@ impl Compositor {
         ));
         std::fs::create_dir_all(&runtime_dir)
             .map_err(|e| CompError::Server(format!("create runtime dir: {e}")))?;
-        let srv = server::Server::new(size, client_scale, &runtime_dir, options.show_cursor)?;
+        let srv = server::Server::new(
+            size,
+            client_scale,
+            &runtime_dir,
+            options.show_cursor,
+            options.use_x11,
+        )?;
         // Query the socket name before handing the server (and its socket) to
         // the compositor thread.
         let socket = srv.socket_name();
@@ -371,6 +379,7 @@ impl Compositor {
             client_scale,
             x11_display,
             x11_failed,
+            use_x11: options.use_x11,
         })
     }
 
@@ -380,8 +389,9 @@ impl Compositor {
     }
 
     /// Spawn `path` with the given resolution, wait for its first toplevel
-    /// commit, and return a handle. The child is launched with
-    /// `WAYLAND_DISPLAY` pointed at our private socket.
+    /// commit, and return a handle. Native Wayland clients reach our private
+    /// socket via `WAYLAND_DISPLAY`; X11-only clients are routed to the
+    /// XWayland server we own via `DISPLAY`.
     pub fn spawn(
         &self,
         path: impl AsRef<std::path::Path>,
@@ -396,22 +406,32 @@ impl Compositor {
             )));
         }
         tracing::info!(path = %path.as_ref().display(), "spawning client");
-        // Launch the child forced onto the *X11* path (DISPLAY -> our own
-        // XWayland). We remove `WAYLAND_DISPLAY` and `WAYLAND_SOCKET` so the
-        // client cannot reach our Wayland socket (nor any host one); it must use
-        // X11. Scrub the env so it can only reach what we provide:
-        //   - WAYLAND_DISPLAY / WAYLAND_SOCKET -> removed, force X11,
+        // Launch the child able to reach both display stacks: a *native* Wayland
+        // client connects straight to our compositor via `WAYLAND_DISPLAY`, while
+        // an X11-only client (glxgears, xterm) falls back to our XWayland via
+        // `DISPLAY`. Scrub the env so it can only reach what we provide:
+        //   - WAYLAND_DISPLAY -> our private socket name (relative to
+        //     XDG_RUNTIME_DIR), so native clients hit our compositor,
+        //   - WAYLAND_SOCKET -> removed (a client-libvar that would pin another
+        //     compositor's socket),
         //   - DISPLAY -> our own XWayland instance (set once its WM is up), never
         //     the host's ambient DISPLAY,
-        //   - XDG_RUNTIME_DIR -> our private dir, so any `wayland-*` socket the
-        //     client auto-discovers is never a host compositor's,
-        //   - GDK_BACKEND / QT_QPA_PLATFORM -> removed so toolkits that default
-        //     to X11 when no Wayland is present actually pick our XWayland,
+        //   - XDG_RUNTIME_DIR -> our private dir, so the `wayland-*` socket a
+        //     client auto-discovers (or resolves WAYLAND_DISPLAY against) is
+        //     always ours, never a host compositor's,
+        //   - GDK_BACKEND / QT_QPA_PLATFORM -> removed so toolkits auto-detect;
+        //     with WAYLAND_DISPLAY set they pick our compositor natively, and
+        //     X11-only apps still use X11,
         //   - HYPRLAND_INSTANCE_SIGNATURE -> removed, so hyprland-specific
         //     autodiscovery (e.g. the drop-in `wayland-*` socket path) fails.
+        let wl_name = self
+            .socket
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
         let mut child = std::process::Command::new(path.as_ref());
         child
-            .env_remove("WAYLAND_DISPLAY")
+            .env("WAYLAND_DISPLAY", wl_name)
             .env_remove("WAYLAND_SOCKET")
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
             .env_remove("GDK_BACKEND")
@@ -419,8 +439,13 @@ impl Compositor {
             .env_remove("HYPRLAND_INSTANCE_SIGNATURE");
         // If XWayland is running, point `DISPLAY` at it. Wait a short, bounded
         // beat for it to become ready so a pure-X11 app (glxgears) launched
-        // right after init doesn't miss its display.
-        set_display_env(&self.x11_display, &self.x11_failed, &mut child);
+        // right after init doesn't miss its display. When X11 is disabled
+        // (`use_x11` false) leave `DISPLAY` unset and skip the wait entirely.
+        if self.use_x11 {
+            set_display_env(&self.x11_display, &self.x11_failed, &mut child);
+        } else {
+            child.env_remove("DISPLAY");
+        }
         let mut child = child
             // Pipe (not inherit) the child's stdout: a GUI app's own terminal
             // writes (glxgears prints FPS to stdout) would otherwise bleed into
@@ -752,5 +777,45 @@ impl Drop for Client {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// Adapter: any crate-level [`CompError`] collapses into the core error enum.
+fn into_core_err(_: CompError) -> tuigui_core::Err {
+    tuigui_core::Err::Unknown
+}
+
+impl tuigui_core::TGCompositor for Compositor {
+    // The trait's `init` is infallible and takes dpi; our real init is fallible
+    // and takes a client scale. We interpret dpi 96 == scale 1.0 and panic on
+    // genuine startup failure (thread/socket creation) rather than paper over
+    // it — starting a compositor is one-shot at the top of the session.
+    fn init(resolution: (u32, u32), dpi: u32) -> Self {
+        let scale = dpi as f64 / 96.0;
+        Compositor::init(resolution, scale)
+            .expect("tuigui-core: compositor init failed")
+    }
+
+    fn spawn(&mut self, command: std::process::Command) -> Result<impl tuigui_core::TGClient, tuigui_core::Err> {
+        Compositor::spawn(self, command.get_program(), self.size)
+            .map_err(into_core_err)
+    }
+}
+
+impl tuigui_core::TGClient for Client {
+    fn snapshot(&self) -> Result<tuigui_core::Frame, tuigui_core::Err> {
+        self.capture().map(|f| tuigui_core::Frame {
+            size: (f.width, f.height),
+            rgba: f.rgba,
+        })
+        .map_err(into_core_err)
+    }
+
+    fn forward_input() {}
+
+    // The MVP admits exactly one toplevel, so there are never children to
+    // hand out.
+    fn children(&self) -> Vec<&impl tuigui_core::TGClient> {
+        Vec::<&Client>::new()
     }
 }

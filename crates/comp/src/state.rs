@@ -423,6 +423,26 @@ impl CompState {
         let y = y.clamp(0.0, h.max(2) as f64 - 1.0);
         let loc = Point::new(x, y);
         self.pointer_loc = loc;
+        // smithay reports surface-local pointer coords as `location * client_scale`
+        // (PointerTarget::motion -> to_client), using the *focused client's*
+        // scale. For a native client that scale is `ui_scale` (set on admission),
+        // and its buffer is created at the full output size (buffer pixel ==
+        // output logical pixel), so it expects output-logical coords. Compensate
+        // by dividing the injected location by that client's scale (which smithay
+        // multiplies back) — otherwise a scale != 1 compresses the hit target
+        // under the cursor and you have to move the mouse further down/right than
+        // the visual target to click it. The XWayland client's scale is never
+        // overridden (stays 1.0), so this divide is a no-op for it.
+        let client_scale = surface
+            .client()
+            .map(|c| self.client_compositor_state(&c).client_scale())
+            .unwrap_or(1.0);
+        let scale = if client_scale.is_finite() && client_scale > 0.0 {
+            client_scale
+        } else {
+            1.0
+        };
+        let loc = Point::new(x / scale, y / scale);
         let pointer = self.seat.get_pointer().ok_or(CompError::NotReady)?;
         let serial = self.next_serial();
         let time = server_time();
@@ -638,11 +658,15 @@ pub fn run_thread(
     // can associate X11 windows with wl_surfaces. XWaylandShellState::new
     // already created the global on the display handle.
 
-    // Spawn the XWayland server, if available. X11-only apps (glxgears,
-    // xterm, old toolkits) reach it through `DISPLAY`; its rendering is
-    // redirected onto wl_surfaces that flow through our normal capture path.
-    let xwayland = spawn_xwayland(&server, handle.clone())?;
-    let _ = xwayland;
+    // Spawn the XWayland server, if available and enabled. X11-only apps
+    // (glxgears, xterm, old toolkits) reach it through `DISPLAY`; its rendering
+    // is redirected onto wl_surfaces that flow through our normal capture path.
+    // With `--no-x` (`server.use_x11` false) we skip it so only native Wayland
+    // clients are supported and `x11_failed` is never set.
+    if server.use_x11 {
+        let xwayland = spawn_xwayland(&server, handle.clone())?;
+        let _ = xwayland;
+    }
 
     // Accept new wayland clients from the listening socket. calloop needs an
     // owned source, so the whole Server lives in an Arc<Mutex> shared between

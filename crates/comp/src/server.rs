@@ -96,6 +96,9 @@ pub struct Server {
     /// Whether captures should draw the software cursor overlay. Disabled with
     /// `--no-cursor` (e.g. for clean pixel-exact screenshots).
     pub show_cursor: bool,
+    /// Whether to spawn an XWayland server so X11-only clients can render
+    /// through the compositor. Disabled with `--no-x`.
+    pub use_x11: bool,
 }
 
 impl Server {
@@ -113,6 +116,7 @@ impl Server {
         client_scale: f64,
         runtime_dir: &std::path::Path,
         show_cursor: bool,
+        use_x11: bool,
     ) -> Result<Self, CompError> {
         let display = Display::new().map_err(|e| CompError::Server(e.to_string()))?;
         // Pick a free name and bind the socket under the private runtime dir.
@@ -170,6 +174,7 @@ impl Server {
             x11_display: std::sync::Arc::new(std::sync::RwLock::new(None)),
             x11_failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             show_cursor,
+            use_x11,
         })
     }
 

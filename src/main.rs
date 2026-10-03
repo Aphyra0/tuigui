@@ -102,6 +102,11 @@ struct Cli {
     #[arg(long)]
     no_cursor: bool,
 
+    /// Disable the XWayland server: only native Wayland clients are supported
+    /// (X11-only apps like glxgears will not render).
+    #[arg(long)]
+    no_x: bool,
+
     /// Split the canvas into an NxN block grid and stream changes via the
     /// kitty animation backend (`a=f` rect edits into one root frame).
     /// `10` (default) = 10x10 grid (100 blocks). The transmit+place backend
@@ -222,6 +227,7 @@ async fn main() -> Result<()> {
         ui_scale as f64,
         tuigui_comp::CompositorOptions {
             show_cursor: !cli.no_cursor,
+            use_x11: !cli.no_x,
         },
     )
     .context("starting compositor")?;
@@ -899,8 +905,12 @@ fn mouse_to_pointer(
     // cell (relative to pane) -> normalized [0,1] -> virtual-frame pixel.
     let (fw, fh) = (output_px.0 as f64, output_px.1 as f64);
     let to_px = |col: u16, row: u16| {
-        let nx = ((col as f64 - px as f64) / pw as f64).clamp(0.0, 1.0);
-        let ny = ((row as f64 - py as f64) / ph as f64).clamp(0.0, 1.0);
+        // Map the mouse to the *center* of the cell it's in (the cell is scaled
+        // to fill the pane, so its middle is where the eye aims), not its
+        // top-left corner. Using `+ 0.5` centers the cell before normalizing;
+        // without it a click lands one cell up-left of the visual target.
+        let nx = ((col as f64 - px as f64 + 0.5) / pw as f64).clamp(0.0, 1.0);
+        let ny = ((row as f64 - py as f64 + 0.5) / ph as f64).clamp(0.0, 1.0);
         (nx * fw, ny * fh)
     };
     match m.kind {
@@ -962,6 +972,7 @@ async fn run_capture_png(cli: &Cli) -> Result<()> {
         1.0,
         tuigui_comp::CompositorOptions {
             show_cursor: !cli.no_cursor,
+            use_x11: !cli.no_x,
         },
     )
     .context("starting compositor")?;
