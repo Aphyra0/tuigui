@@ -23,6 +23,7 @@ base64-turbo = "0.5"
 itertools = "0.15"
 idalloc = "0.1"
 static_init = "1.0"
+crossterm = { version = "0.28", default-features = false }
 
 # internal
 gobo-core = { path = "crates/gobo-core" }

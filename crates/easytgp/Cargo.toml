@@ -15,6 +15,7 @@ base64-turbo = { workspace = true }
 itertools = { workspace = true }
 idalloc = { workspace = true }
 static_init = { workspace = true }
+crossterm = { workspace = true }
 yscv-video = "0.2"
 
 [[example]]

@@ -1,26 +1,55 @@
 //! Terminal graphics protocol (TGP): the wire format used to stream
 //! pixel data into a graphics-capable terminal.
 
-use std::{io::Write, sync::Arc};
+use std::{
+    fmt::Display,
+    io::{Read, Write},
+    sync::Arc,
+};
 
 use derive_builder::Builder;
 use idalloc::Slab;
 use itertools::Itertools;
+use rustix::termios::LocalModes;
 use static_init::dynamic;
 
 // TODO: https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
 // TODO: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
 // TODO: https://sw.kovidgoyal.net/kitty/graphics-protocol/#usage-hints
 
-
 mod id {
     use crate::ID;
+    use crossterm::terminal;
     use idalloc::Slab;
     use static_init::dynamic;
 
     /// Locked lazy global slab. Access via `IDAl.write()` / `IDAl.read()`.
     #[dynamic]
-    static mut IDAl: Slab<ID> = Slab::<ID>::new();
+    static mut IDAl: Slab<ID> = {
+        // read current config
+        // let mut t = rustix::termios::tcgetattr(std::io::stdin()).unwrap(); // any tty fd works: 0=stdin
+
+        // // disable echo only (leave everything else)
+        // t.local_modes.remove(rustix::termios::LocalModes::ECHO);
+        // t.local_modes.remove(rustix::termios::LocalModes::ICANON);
+
+        // // COMMIT — write it back to the fd (this is the missing line)
+        // rustix::termios::tcsetattr(std::io::stdin(), rustix::termios::OptionalActions::Now, &t)
+        //     .unwrap();
+
+        // option 2 — also clear scrollback (kitty/xterm support this)
+
+        // println!("\x1b[2J\x1b[H");
+
+        use std::io::Write;
+        print!("\x1b[2J\x1b[3J\x1b[H");
+        std::io::stdout().flush().unwrap();
+
+        let mut slab = Slab::<ID>::new();
+        // skip 0 as an id.
+        slab.next();
+        slab
+    };
 
     /// Allocate the next unique image/placement id.
     pub(crate) fn alloc() -> ID {
@@ -45,83 +74,44 @@ impl NewImage {
         NewImage { format, data }
     }
 
+    pub fn transplace(self, placement: NewPlacement) -> AnonymousImage {
+        let payload = base64_turbo::STANDARD.encode(self.data.as_slice());
+        let mut a = Action::new()
+            .cd("a", "T")
+            .cd(
+                "f",
+                match self.format {
+                    Format::RGB => 24,
+                    Format::RGBA => 32,
+                    Format::PNG => 100,
+                },
+            )
+            .payload(payload);
+
+        placement.add_cds(&mut a);
+        a.commit();
+
+        AnonymousImage { request: self }
+    }
+
     pub fn transmit(self) -> Image {
         let payload = base64_turbo::STANDARD.encode(self.data.as_slice());
         let id = id::alloc();
 
-        Action {
-            cds: vec![
-                cd("a", "t".to_string()),
-            ],
-            payload,
-        }.commit();
+        Action::new()
+            .cd("i", id)
+            .cd(
+                "f",
+                match self.format {
+                    Format::RGB => 24,
+                    Format::RGBA => 32,
+                    Format::PNG => 100,
+                },
+            )
+            .payload(payload)
+            .commit();
 
-        Image {
-            id,
-            request: self,
-        }
-    }
-
-    // pub fn
-    pub fn display(&self) {
-        let payload = base64_turbo::STANDARD.encode(self.data.as_slice());
-
-        // print!(
-        //     "<ESC>_G{};{payload}<ESC>",
-        //     // "<ESC>_G{},s=10,v=20;{payload}<ESC>",
-        //     self.format.render().format()
-        // )
-        dbg!(payload.len());
-        // print!(
-        //     "{}_G{};{payload}{}",
-        //     '\x1b',
-        //     self.format.render().format(),
-        //     "\x1b\\"
-        // );
-
-        // if payload.len() > 4096 {
-        //     let mut chunks = payload.as_bytes().chunks(4096).enumerate();
-
-        //     while let Some((i, chunk)) = chunks.next() {
-        //         if i == 0 {
-        //             // print!(
-        //             //     "{}_G{},m=1;{}{}",
-        //             //     '\x1b',
-        //             //     chunk.to_stri,
-        //             //     self.format.render().format(),
-        //             //     "\x1b\\"
-        //             // );
-
-        //             continue;
-        //         }
-        //         if chunks.len() == 0 {
-        //             // print!(
-        //             //     "{}_G{};{chunk}{}",
-        //             //     '\x1b',
-        //             //     self.format.render().format(),
-        //             //     "\x1b\\"
-        //             // );
-        //         } else {
-        //         }
-        //     }
-        // } else {
-        // print!(
-        //     "{}_Ga=T,f=100;{}{}",
-        //     '\x1b',
-        //     // "escin",
-        //     // self.format.render().format(),
-        //     payload,
-        //     // "escout\\" //
-        //     "\x1b\\"
-        // );
-        // Action::transplace(payload).format(Format::PNG).commit();
-        Action::transmit(payload, 33).format(Format::PNG).commit();
-        Action::place(33).c(5).r(5).commit();
-        // std::io::stdout().flush().unwrap();
-        // }
-        // for chunk in  {
-        //     dbg!(chunk.len());
-        // }
+        Image { id, request: self }
     }
 }
 
@@ -130,53 +120,33 @@ pub struct Image {
     request: NewImage,
 }
 
+pub struct AnonymousImage {
+    request: NewImage,
+}
+
 impl Image {
     pub fn place_named(&self, request: NewPlacement) -> Placement {
-        Placement {
-            id: todo!(),
-            request,
-        }
-        todo!();
+        let id = id::alloc();
+
+        let mut a = Action::new() //
+            .cd("a", "p")
+            .cd("i", self.id)
+            .cd("p", id);
+
+        request.add_cds(&mut a);
+        a.commit();
+
+        Placement { id, request }
     }
 
-    pub fn place(&self, request: NewPlacement) {}
+    pub fn place(&self, request: NewPlacement) {
+        todo!()
+    }
 
-    pub fn destroy() {}
+    pub fn delete(self) {
+        todo!()
+    }
 }
-
-pub struct Animation {
-    frames: Vec<Frame>,
-    current: ID,
-}
-
-impl Animation {
-    pub fn new() {}
-}
-
-pub struct NewPlacement {
-    image: ID,
-    parent: Option<ID>,
-    offset_x: Option<u32>,
-    offset_y: Option<u32>,
-    cols: Option<u32>,
-    rows: Option<u32>,
-    x: Option<u32>,
-    y: Option<u32>,
-    z: Option<i32>,
-    width: Option<u32>,
-    height: Option<u32>,
-    fix_cursor: Option<bool>,
-    // TODO:
-    // H, V
-}
-
-pub struct Placement {
-    id: ID,
-    request: NewPlacement,
-}
-
-
-pub struct ImageHandle {}
 
 /// Animation based on a single image
 /// and with the single frame
@@ -189,23 +159,197 @@ pub struct ThinStreamer {
     overlay: Frame,
 }
 
-impl ThinStreamer {
-    // pub fn new(base: TermImage) -> Self {
-    // Self {
-    //     root: base,
-    //     // overlay: ,
-    // }
-    // }
+impl ThinStreamer {}
+
+pub struct AtomicStreamer {
+    animation: Animation,
+    pending: bool,
+}
+
+impl AtomicStreamer {
+    pub fn update(&mut self, patch: NewImage, offset: (u32, u32)) {
+        if !self.pending {
+            // create new frame
+            self.animation.new_frame(NewFrame {
+                base_frame: FrameSelector::Last,
+                image: patch,
+                width: None,
+                height: None,
+                x: Some(offset.0),
+                y: Some(offset.1),
+            });
+
+            self.pending = true;
+        } else {
+            // Edit frame instead
+            let f = self.animation.frame(FrameSelector::Last).unwrap();
+        }
+    }
+
+    pub fn present(&mut self) {}
+}
+
+// TODO: Better sync
+pub struct Animation {
+    base_image: Image,
+    frames: Vec<Frame>,
+}
+
+impl From<Image> for Animation {
+    fn from(value: Image) -> Self {
+        Animation::new(value)
+    }
+}
+
+impl Animation {
+    pub fn new(base_image: Image) -> Self {
+        Self {
+            frames: Default::default(),
+            base_image,
+        }
+    }
+
+    pub fn frame(&mut self, selector: FrameSelector) -> Option<&Frame> {
+        use FrameSelector::*;
+
+        match selector {
+            Last => self.frames.last(),
+            First => todo!(),
+            ID(_) => todo!(),
+        }
+    }
+
+    pub fn new_frame(
+        &mut self,
+        NewFrame {
+            base_frame,
+            width,
+            height,
+            x,
+            y,
+            image,
+        }: NewFrame,
+    ) -> &Frame {
+        Action::new()
+            .cd("a", "f")
+            .cd("i", self.base_image.id)
+            .cd(
+                "c",
+                match base_frame {
+                    FrameSelector::Last => self.frames.len() + 1,
+                    FrameSelector::First => 1,
+                    FrameSelector::ID(id) => id,
+                },
+            )
+            .cd_opt("s", width)
+            .cd_opt("v", height)
+            .cd_opt("x", x)
+            .cd_opt("y", y)
+            .cd(
+                "f",
+                match image.format {
+                    Format::RGB => 24,
+                    Format::RGBA => 32,
+                    Format::PNG => 100,
+                },
+            )
+            .payload(base64_turbo::STANDARD.encode(image.data.as_slice()))
+            .commit();
+
+        let prev = self.frames.last().unwrap_or(&Frame {
+            index: 1,
+            base_image: 0,
+        });
+
+        self.frames.push(Frame {
+            index: prev.index + 1,
+            base_image: self.base_image.id,
+        });
+
+        self.frames.last().unwrap()
+    }
+
+    pub fn display_last(&mut self) {
+        if let Some(f) = self.frames.last() {
+            self.display_frame(f.index);
+        }
+    }
+
+    // TODO: Use selector, rename to just display
+    pub fn display_frame(&mut self, frame: usize) {
+        Action::new()
+            .cd("a", "a")
+            .cd("i", self.base_image.id)
+            .cd("c", frame)
+            .commit();
+    }
+
+    // TODO: Terminal driven animations
 }
 
 pub struct NewFrame {
-    base_frame: ID,
-    edit: FrameEdit,
+    pub base_frame: FrameSelector,
+    pub image: NewImage,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub x: Option<u32>,
+    pub y: Option<u32>,
+}
+
+pub enum FrameSelector {
+    Last,
+    First,
+    ID(usize),
+}
+
+pub struct Frame {
+    base_image: ID,
+    index: usize,
+}
+
+impl Frame {
+    pub fn edit(&self, edit: FrameEdit) {
+        use FrameEdit::*;
+        match edit {
+            Compose {
+                from_frame,
+                width,
+                height,
+                src,
+                dst,
+            } => Action::new()
+                .cd("a", "c")
+                // image context
+                .cd("i", self.base_image)
+                // source frame
+                .cd("r", from_frame)
+                // destination frame
+                .cd("c", self.index)
+                // size
+                .cd("w", width)
+                .cd("h", height)
+                // source location
+                .cd("X", src.0)
+                .cd("Y", src.1)
+                // destination location
+                .cd("x", dst.0)
+                .cd("y", dst.1),
+            Upload {
+                x,
+                y,
+                width,
+                height,
+                image,
+            } => todo!(),
+        }
+        .commit();
+    }
 }
 
 pub enum FrameEdit {
-    Copy {
-        frame: ID,
+    Compose {
+        from_frame: usize,
+        // TODO: Make optionals
         width: u32,
         height: u32,
         src: (u32, u32),
@@ -220,14 +364,85 @@ pub enum FrameEdit {
     },
 }
 
-pub struct Frame {
-    id: ID,
+#[derive(Default, Builder, Debug)]
+#[builder(setter(into))]
+pub struct NewPlacement {
+    pub image: Option<ID>,
+    pub parent: Option<ID>,
+    pub offset_x: Option<u32>,
+    pub offset_y: Option<u32>,
+    pub cols: Option<u32>,
+    pub rows: Option<u32>,
+    pub x: Option<u32>,
+    pub y: Option<u32>,
+    pub z: Option<i32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// After placing an image on the screen the cursor must be moved to the right by the number of cols in the image placement rectangle and down by the number of rows in the image placement rectangle.
+    /// This option sets the cursor movement policy to no movement for placing the current image.
+    pub fix_cursor: Option<()>,
+    // TODO:
+    // H, V
 }
 
-impl Frame {
-    pub fn edit() {}
-    pub fn display() {}
+impl NewPlacement {
+    /// Adds attribute related cds
+    fn add_cds(&self, a: &mut Action) {
+        // if let Some(parent)
+
+        if let Some(id) = self.image {
+            a.add_cd("i", id);
+        }
+
+        if let Some(px) = self.offset_x {
+            a.add_cd("X", px);
+        }
+
+        if let Some(px) = self.offset_y {
+            a.add_cd("Y", px);
+        }
+
+        if let Some(u) = self.cols {
+            a.add_cd("c", u);
+        }
+
+        if let Some(u) = self.rows {
+            a.add_cd("r", u);
+        }
+
+        if let Some(u) = self.x {
+            a.add_cd("x", u);
+        }
+
+        if let Some(u) = self.y {
+            a.add_cd("y", u);
+        }
+
+        if let Some(u) = self.z {
+            a.add_cd("z", u);
+        }
+
+        if let Some(px) = self.width {
+            a.add_cd("w", px);
+        }
+
+        if let Some(px) = self.height {
+            a.add_cd("h", px);
+        }
+
+        if let Some(_) = self.fix_cursor {
+            a.add_cd("C", 1);
+        }
+    }
 }
+
+#[derive(Debug)]
+pub struct Placement {
+    id: ID,
+    request: NewPlacement,
+}
+
+pub struct ImageHandle {}
 
 // #[derive(Default, Builder, Debug)]
 pub struct Action {
@@ -235,77 +450,46 @@ pub struct Action {
     payload: Option<String>,
 }
 
-
 impl Action {
+    // TODO: make this take initial action keys
     pub fn new() -> Action {
         Action {
             cds: vec![],
-            payload
-        }
-
-        
-    }
-    fn cd(self, key: &'static str, value: String) -> Self {
-        self.push(ControlData { key, value })
-    }
-    // a=T
-    pub fn transplace(payload: String) -> Self {
-        Action {
-            cds: vec![ControlData {
-                key: "a",
-                value: "T".to_owned(),
-            }],
-            payload,
+            payload: None,
         }
     }
 
-    // a=t
-    pub fn transmit(payload: String, id: u32) -> Self {
-        Action {
-            cds: vec![ControlData {
-                key: "i",
-                value: id.to_string(),
-            }],
-            payload,
+    pub fn payload(mut self, payload: String) -> Self {
+        self.payload.replace(payload);
+        self
+    }
+
+    /// Takes ownership
+    fn cd(self, key: &'static str, value: impl Display) -> Self {
+        self.push(ControlData {
+            key,
+            value: value.to_string(),
+        })
+    }
+
+    fn cd_opt(self, key: &'static str, value_o: Option<impl Display>) -> Self {
+        if let Some(value) = value_o {
+            self.push(ControlData {
+                key,
+                value: value.to_string(),
+            })
+        } else {
+            self
         }
     }
 
-    // TODO: Placement id
-    // a=p
-    pub fn place(id: u32) -> Self {
-        Action {
-            cds: vec![
-                ControlData {
-                    key: "a",
-                    value: "p".to_owned(),
-                },
-                ControlData {
-                    key: "i",
-                    value: id.to_string(),
-                },
-            ],
-            payload: "OK".to_string(),
-        }
+    /// Takes a reference
+    fn add_cd(&mut self, key: &'static str, value: impl Display) {
+        self.cds.push(ControlData {
+            key,
+            value: value.to_string(),
+        })
     }
-
-    /// a=f
-    pub fn frame(payload: String) -> Self {
-        Action {
-            cds: vec![ControlData {
-                key: "a",
-                value: "f".to_owned(),
-            }],
-            payload,
-        }
-    }
-
-    /// a=a
-    pub fn switch_frame(id: u32, frame_id: u32) -> Self {
-        todo!()
-    }
-
-    pub fn new_frame() {}
-    pub fn edit_frame() {}
 
     /// a=d
     pub fn delete(query: DeleteQuery) -> Self {
@@ -314,7 +498,7 @@ impl Action {
                 key: "a",
                 value: "d".to_string(),
             }],
-            payload: "OK".to_string(),
+            payload: None,
         };
 
         use DeleteQuery::*;
@@ -364,7 +548,10 @@ impl Action {
 
     /// execute the command
     // pub fn commit(self) -> Result<(), TGPError> {
-    pub fn commit(self) {
+    pub fn commit(mut self) {
+        // TODO: Handle properly
+        self = self.cd("q", 2);
+
         let cds = self
             .cds
             .iter()
@@ -372,160 +559,12 @@ impl Action {
             .collect_vec()
             .join(",");
 
-        print!("{}_G{cds};{}{}", '\x1b', self.payload, "\x1b\\");
+        let payload = self.payload.unwrap_or_default();
+
+        println!("\x1b_G{cds};{payload}\x1b\\");
         std::io::stdout().flush().unwrap();
+        // TODO: Handle errors propertly.
     }
-
-    /// m=1
-    pub fn chunk(self) -> Self {
-        self.push(ControlData {
-            key: "m",
-            value: 1.to_string(),
-        })
-    }
-
-    /// X=<px>
-    pub fn off_x(self, px: u32) -> Self {
-        self.push(ControlData {
-            key: "X",
-            value: px.to_string(),
-        })
-    }
-
-    // TODO: Add checks for the currect px values.
-    /// Y=<px>
-    pub fn off_y(self, px: u32) -> Self {
-        self.push(ControlData {
-            key: "Y",
-            value: px.to_string(),
-        })
-    }
-
-    /// y=<px>
-    pub fn y(self, px: u32) -> Self {
-        self.push(ControlData {
-            key: "y",
-            value: px.to_string(),
-        })
-    }
-
-    /// x=<px>
-    pub fn x(self, px: u32) -> Self {
-        self.push(ControlData {
-            key: "x",
-            value: px.to_string(),
-        })
-    }
-
-    /// w=<px>
-    pub fn w(self, px: u32) -> Self {
-        self.push(ControlData {
-            key: "w",
-            value: px.to_string(),
-        })
-    }
-
-    /// h=<px>
-    pub fn h(self, px: u32) -> Self {
-        self.push(ControlData {
-            key: "h",
-            value: px.to_string(),
-        })
-    }
-
-    /// number of columns (horizontal) | c=<u>
-    pub fn c(self, u: u32) -> Self {
-        self.push(ControlData {
-            key: "c",
-            value: u.to_string(),
-        })
-    }
-
-    /// number of rows (vertical) | c=<u>
-    pub fn r(self, u: u32) -> Self {
-        self.push(ControlData {
-            key: "r",
-            value: u.to_string(),
-        })
-    }
-
-    /// z index | z=<idx>
-    pub fn z(self, idx: i32) -> Self {
-        self.push(ControlData {
-            key: "z",
-            value: idx.to_string(),
-        })
-    }
-
-    /// C=1
-    pub fn fix_cursor(self) -> Self {
-        self.push(ControlData {
-            key: "C",
-            value: 1.to_string(),
-        })
-    }
-
-    /// m=0
-    pub fn last_chunk(self) -> Self {
-        self.push(ControlData {
-            key: "m",
-            value: 0.to_string(),
-        })
-    }
-
-    /// f=<format>
-    pub fn format(self, format: Format) -> Self {
-        self.push(ControlData {
-            key: "f",
-            value: match format {
-                Format::RGB => 24,
-                Format::RGBA => 32,
-                Format::PNG => 100,
-            }
-            .to_string(),
-        })
-    }
-
-    /// s=<px>
-    pub fn width(self, px: u32) -> Self {
-        self.push(ControlData {
-            key: "s",
-            value: px.to_string(),
-        })
-    }
-
-    /// v=<px>
-    pub fn height(self, px: u32) -> Self {
-        self.push(ControlData {
-            key: "v",
-            value: px.to_string(),
-        })
-    }
-
-    /// o=z
-    pub fn compressed(self) -> Self {
-        self.push(ControlData {
-            key: "o",
-            value: "z".to_owned(),
-        })
-    }
-
-    pub fn medium(&mut self, medium: Medium) {
-        todo!()
-        // self.cds.push(CDVal {
-        //     key: "o",
-        //     value: "z".to_owned(),
-        // });
-    }
-
-    // TODO: a=q
-    // i=q
-    // pub fn probe(&mut self) {
-    //     self.cds.push(CDVal {
-    //         key: "i",
-    //         value: todo!(),
-    //     });
-    // }
 }
 
 // #[derive(this)]
@@ -607,7 +646,6 @@ struct ControlData {
     // TODO: Use proper value type
     value: String,
 }
-
 
 impl ControlData {
     fn format(&self) -> String {
