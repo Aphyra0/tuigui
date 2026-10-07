@@ -16,6 +16,9 @@ itertools = { workspace = true }
 idalloc = { workspace = true }
 static_init = { workspace = true }
 crossterm = { workspace = true }
+derive_deref = { workspace = true }
+derive-getters = { workspace = true }
+thiserror = { workspace = true }
 yscv-video = "0.2"
 
 [[example]]

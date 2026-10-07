@@ -320,6 +320,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive-getters"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74ef43543e701c01ad77d3a5922755c6a1d71b22d942cb8042be4994b380caff"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "derive_builder"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -351,12 +362,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive_deref"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcdbcee2d9941369faba772587a565f4f534e42cb8d17e5295871de730163b2b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
 name = "easytgp"
 version = "0.1.0"
 dependencies = [
  "base64-turbo",
  "crossterm",
+ "derive-getters",
  "derive_builder",
+ "derive_deref",
  "gobo-core",
  "idalloc",
  "image",
@@ -364,6 +388,7 @@ dependencies = [
  "png",
  "rustix 1.1.5",
  "static_init",
+ "thiserror",
  "yscv-video",
 ]
 

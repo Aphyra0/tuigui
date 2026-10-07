@@ -3,29 +3,27 @@
 
 use std::{
     fmt::Display,
-    io::{Read, Write},
-    sync::Arc,
+    io::Write,
+    ops::Deref,
+    sync::{Arc, RwLock, RwLockReadGuard},
 };
 
-use derive_builder::Builder;
-use idalloc::Slab;
+use derive_deref::{Deref, DerefMut};
+use derive_getters::Getters;
 use itertools::Itertools;
-use rustix::termios::LocalModes;
-use static_init::dynamic;
 
 // TODO: https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
 // TODO: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
 // TODO: https://sw.kovidgoyal.net/kitty/graphics-protocol/#usage-hints
 
 mod id {
-    use crate::ID;
-    use crossterm::terminal;
+    use crate::Id;
     use idalloc::Slab;
     use static_init::dynamic;
 
     /// Locked lazy global slab. Access via `IDAl.write()` / `IDAl.read()`.
     #[dynamic]
-    static mut IDAl: Slab<ID> = {
+    static mut IDAL: Slab<Id> = {
         // read current config
         // let mut t = rustix::termios::tcgetattr(std::io::stdin()).unwrap(); // any tty fd works: 0=stdin
 
@@ -45,101 +43,71 @@ mod id {
         print!("\x1b[2J\x1b[3J\x1b[H");
         std::io::stdout().flush().unwrap();
 
-        let mut slab = Slab::<ID>::new();
+        let mut slab = Slab::<Id>::new();
         // skip 0 as an id.
         slab.next();
         slab
     };
 
     /// Allocate the next unique image/placement id.
-    pub(crate) fn alloc() -> ID {
-        IDAl.write().next()
+    pub(crate) fn alloc() -> Id {
+        IDAL.write().next()
     }
 
     /// Reclaim an id for reuse.
-    pub(crate) fn free(id: ID) {
-        IDAl.write().free(id);
+    pub(crate) fn free(id: Id) {
+        IDAL.write().free(id);
     }
 }
 
-pub type ID = u32;
-
-pub struct NewImage {
-    format: Format,
-    data: Vec<u8>,
+pub trait Restorable: std::fmt::Debug {
+    fn restore(&mut self, renew_dependents: bool) -> Res<()>;
+    // fn renew_one();
 }
 
-impl NewImage {
-    pub fn new(format: Format, data: Vec<u8>) -> Self {
-        NewImage { format, data }
-    }
+impl Restorable for DynImageHandle {
+    fn restore(&mut self, renew_dependents: bool) -> Res<()> {
+        let mut img = self.read().unwrap().deref().clone();
 
-    pub fn transplace(self, placement: NewPlacement) -> AnonymousImage {
-        let payload = base64_turbo::STANDARD.encode(self.data.as_slice());
-        let mut a = Action::new()
-            .cd("a", "T")
-            .cd(
-                "f",
-                match self.format {
-                    Format::RGB => 24,
-                    Format::RGBA => 32,
-                    Format::PNG => 100,
-                },
-            )
-            .payload(payload);
+        // Renew image but don't replace this one.
+        // TODO: Should re-use the id;
+        // TODO: Should not call drop that would destroy the image.
+        img.request.exec_transmit(img.id);
 
-        placement.add_cds(&mut a);
-        a.commit();
+        for placement in img.placements.iter_mut() {
+            placement.restore(false)?;
+        }
 
-        AnonymousImage { request: self }
-    }
-
-    pub fn transmit(self) -> Image {
-        let payload = base64_turbo::STANDARD.encode(self.data.as_slice());
-        let id = id::alloc();
-
-        Action::new()
-            .cd("i", id)
-            .cd(
-                "f",
-                match self.format {
-                    Format::RGB => 24,
-                    Format::RGBA => 32,
-                    Format::PNG => 100,
-                },
-            )
-            .payload(payload)
-            .commit();
-
-        Image { id, request: self }
+        todo!()
+        // controller.img_transmit(self.request)
     }
 }
 
-pub struct Image {
-    id: ID,
-    request: NewImage,
-}
+impl Restorable for PlacementHandle {
+    fn restore(&mut self, renew_dependents: bool) -> Res<()> {
+        if renew_dependents {
+            let mut p = self.write().unwrap();
 
-pub struct AnonymousImage {
-    request: NewImage,
-}
+            if let Some(p) = &mut *p {
+                p.image.restore(false)?;
+            } else {
+                // TODO
+                return Ok(());
+            }
+        } else {
+            let Some(l) = self.read().unwrap().clone() else {
+                return Ok(());
+            };
 
-impl Image {
-    pub fn place_named(&self, request: NewPlacement) -> Placement {
-        let id = id::alloc();
-
-        let mut a = Action::new() //
-            .cd("a", "p")
-            .cd("i", self.id)
-            .cd("p", id);
-
-        request.add_cds(&mut a);
-        a.commit();
-
-        Placement { id, request }
+            l.config.exec_place(l.id, "p");
+        }
+        Ok(())
     }
+}
 
-    pub fn place(&self, request: NewPlacement) {
+impl PlacementHandle {
+    /// Deletes the existing placement and returns a new one instead.
+    pub fn replace(self, request: PlacementRequest) -> Self {
         todo!()
     }
 
@@ -148,183 +116,397 @@ impl Image {
     }
 }
 
-/// Animation based on a single image
-/// and with the single frame
-///
-/// all changes are placed on the overlay.
-///
-/// Updates are not atomics, but it doesn't create new frames.
-pub struct ThinStreamer {
-    root: Image,
-    overlay: Frame,
+// controller creates and image
+// image can place itself and preserve the placements
+// pla
+//
+// vs
+//
+// ImageRequest -> ImageHandle;
+//
+// PlaceRequest -> PlacementHandle;
+//
+// can drop the image request or the placement request handles. They are linked in the double linked list.
+//
+// fh.edit();
+//
+//
+//
+//
+
+// impl Renewable for Placement {
+//     fn renew(self, c: &mut Controller) -> Self {}
+// }
+
+pub type Res<R> = Result<R, TGPError>;
+pub type Id = u32;
+pub type DynImageHandle = Handle<DynImage>;
+pub type FrameHandle = Handle<Frame>;
+pub type PlacementHandle = Handle<Option<Placement>>;
+pub type FrameIdx = usize;
+
+#[derive(Clone, Deref, DerefMut, Debug)]
+pub struct Handle<I>(Arc<RwLock<I>>);
+
+// pub enum Handle<I> {
+//     MaybeValid(Arc<RwLock<I>>),
+
+//     // It's invalid but you can still restore it
+//     Invalid(Arc<I>),
+// }
+
+// 1. User:
+// I have an DynImage, I have a placement for it.
+// 1. I delete img, placements I have are invalid and I know about it, but I would rather use .maybe_swallow instead of deleting?
+// 2. Other program is being deleted and it's placements
+//
+// So, we are trying to decide if we need a handle to be another gate that displays if the item is invalid or not.
+//
+// Errors will give user a destinct idea of what handles are dead.
+// User doesn't really know what handles are valid unless polled.
+//
+// But user been warned about the contract which they might have missed or modelled incorrectly.
+// Without the invalidation checks, the user is user is forced to handle this blindly.
+// Which means they need to find out all invalidated handles according to the contract and then drop them.
+//
+// If they don't, the wrong operation on invalid handle will return an error.
+//
+// It also can get unobvious with relative placements that I might add later.
+//
+// Btw, Placement handles aren't necesserely invalidated on image deletion?
+// You can still just replace_with the different image.
+//
+// Frames are specific to the images and I don't see the need for them to be reused anywhere.
+// Placement has the position, sizing and scale, while frames don't. They have an attached image and the index, this is it
+// everything else is the data which would get invalidated anyway on the image drop. So no need for frames.
+//
+// So, when we delete an image, we say that all placements aren't invalidated but rather are detached and user can reattach them.
+//
+// User can detach the placement from the image directly on the placement, in this case image will not be deleted, only placement.
+//
+// Problem: User can clone the handle to either a placement or the image, on manual deletion of the image,
+// the other handle should also be invalidated.
+//
+// Solutions:
+// 1. Don't allow user clonning handle
+// in that case it wouldn't be a handle, it would be an object instead.
+//
+// Let's think when user needs multiple handles to the item.
+//
+// 2. Think about user handling the invalidated handle
+// the user is presented with the contract that if one image is being deleted, all other handles become invalid automatically
+//
+//
+// So the solution:
+// 1. handles aren't clonnable
+// if you drop the placement it's stashed inside the dynimage, which means you can aquire it,
+// you can in fact aquire and drop placements as many times as you'd like, it just doesn't allow multiple user-held references to it.
+//
+// If image deleted all stashed placements are also automatically deleted and ids are freed.
+//
+// 2. The deletion model is reduced. You can delete through the handles, but you can no longer query-delete.
+//
+// 3. Placements handles now resolve to an enum of Attached and detached placements, with different operations on each side.
+//
+// User can delete an image making the placement handle they hold detached, so the next time they use it they would see it's detached and it needs different logic.
+//
+// 4. As frames are mere index and the base image, we drop the frame handle, and instead add clonable FrameIdx,
+// it can be used to call frame_edit on image handle with the given FrameIdx.
+//
+// This makes the model safe, user is present with the image handle which it can always assume is valid unless is evicted
+// or deleted by the other program, but it should be impossible for the user to shoot in the
+// leg by deleting an entity but still having the handle to it. In other words user-space bugs should be comptime checkable which this approach is exactly doing.
+//
+// But by the bug I consider when the user deletes something but still holds a handle that they can try to use and then maybe recover from the previous deletion.
+//
+// Q: Why not use ImageId, PlacementId and a global Session?
+// A: It changes the design drastically, for example it would use s.get(img_id) -> DynImage
+//
+// There is also the third way:
+//
+// Let user own DynImage, let DynImage own placements and give stable ids for all placements. Then
+// img.read(PlacementHandle) -> &Placement;
+// img.read(FrameHandle) -> &Frame;
+// img.displace(PlacementHandle) -> PlacementRequest;
+// img.place(PlacementRequest);
+//
+// But also, can a single placement have multiple images? Per spec no, but what if we don't really care?
+//
+// It's a bit complicated, let's just assume placement is one
+//
+//
+
+impl<I> Handle<I> {
+    pub fn new(entity: I) -> Self {
+        Handle(Arc::new(RwLock::new(entity)))
+    }
 }
 
-impl ThinStreamer {}
-
-pub struct AtomicStreamer {
-    animation: Animation,
-    pending: bool,
+#[derive(Clone, Debug)]
+pub struct ImageRequest {
+    format: Format,
+    data: Vec<u8>,
 }
 
-impl AtomicStreamer {
-    pub fn update(&mut self, patch: NewImage, offset: (u32, u32)) {
-        if !self.pending {
-            // create new frame
-            self.animation.new_frame(NewFrame {
-                base_frame: FrameSelector::Last,
-                image: patch,
-                width: None,
-                height: None,
-                x: Some(offset.0),
-                y: Some(offset.1),
-            });
-
-            self.pending = true;
-        } else {
-            // Edit frame instead
-            let f = self.animation.frame(FrameSelector::Last).unwrap();
-        }
+impl ImageRequest {
+    pub fn new(format: Format, data: Vec<u8>) -> Self {
+        ImageRequest { format, data }
     }
 
-    pub fn present(&mut self) {}
-}
+    pub fn transplace(self, placement: PlacementRequest) -> DynImageHandle {
+        let payload = base64_turbo::STANDARD.encode(self.data.as_slice());
+        let a = Action::new()
+            .cd("a", "T")
+            .push_cd(self.format.into())
+            .payload(payload);
 
-// TODO: Better sync
-pub struct Animation {
-    base_image: Image,
-    frames: Vec<Frame>,
-}
-
-impl From<Image> for Animation {
-    fn from(value: Image) -> Self {
-        Animation::new(value)
-    }
-}
-
-impl Animation {
-    pub fn new(base_image: Image) -> Self {
-        Self {
-            frames: Default::default(),
-            base_image,
-        }
+        placement.add_cds(a).commit();
+        // AnonymousImage { request: self }
+        todo!()
     }
 
-    pub fn frame(&mut self, selector: FrameSelector) -> Option<&Frame> {
-        use FrameSelector::*;
+    pub fn transmit(self) -> Handle<DynImage> {
+        let id = id::alloc();
+        self.exec_transmit(id);
 
-        match selector {
-            Last => self.frames.last(),
-            First => todo!(),
-            ID(_) => todo!(),
-        }
+        Handle::new(DynImage {
+            id,
+            request: self,
+            placements: vec![],
+            frames: vec![],
+        })
     }
 
-    pub fn new_frame(
-        &mut self,
-        NewFrame {
-            base_frame,
-            width,
-            height,
-            x,
-            y,
-            image,
-        }: NewFrame,
-    ) -> &Frame {
+    pub fn exec_transmit(&self, id: Id) {
+        // TODO: Store data already encoded.
+        let payload = base64_turbo::STANDARD.encode(self.data.as_slice());
         Action::new()
-            .cd("a", "f")
-            .cd("i", self.base_image.id)
-            .cd(
-                "c",
-                match base_frame {
-                    FrameSelector::Last => self.frames.len() + 1,
-                    FrameSelector::First => 1,
-                    FrameSelector::ID(id) => id,
-                },
-            )
-            .cd_opt("s", width)
-            .cd_opt("v", height)
-            .cd_opt("x", x)
-            .cd_opt("y", y)
-            .cd(
-                "f",
-                match image.format {
-                    Format::RGB => 24,
-                    Format::RGBA => 32,
-                    Format::PNG => 100,
-                },
-            )
-            .payload(base64_turbo::STANDARD.encode(image.data.as_slice()))
+            .cd("i", id)
+            .push_cd(self.format.into())
+            .payload(payload)
             .commit();
+    }
+}
 
-        let prev = self.frames.last().unwrap_or(&Frame {
-            index: 1,
-            base_image: 0,
-        });
+#[derive(Clone, Debug, Getters)]
+pub struct DynImage {
+    id: Id,
+    placements: Vec<PlacementHandle>,
+    frames: Vec<FrameHandle>,
+    request: ImageRequest,
+}
 
-        self.frames.push(Frame {
-            index: prev.index + 1,
-            base_image: self.base_image.id,
-        });
+/// Simple image, can't be directly deleted, can't be animated. only supports restore.
+#[derive(Clone, Debug)]
+pub struct AnonymousImage {
+    data: ImageRequest,
+    place: PlacementRequest,
+}
 
-        self.frames.last().unwrap()
+impl Restorable for AnonymousImage {
+    fn restore(&mut self, renew_dependents: bool) -> Res<()> {
+        self.data.clone().transplace(self.place.clone());
+        Ok(())
+    }
+}
+
+impl DynImageHandle {
+    pub fn id(&self) -> Id {
+        self.read().unwrap().id
     }
 
-    pub fn display_last(&mut self) {
-        if let Some(f) = self.frames.last() {
-            self.display_frame(f.index);
+    pub fn place_named(&mut self, config: PlacementRequest) -> PlacementHandle {
+        let h = config.place(id::alloc(), "p");
+        self.write().unwrap().placements.push(h.clone());
+        h
+    }
+
+    pub fn place(&mut self, request: PlacementRequest) {
+        todo!()
+    }
+
+    pub fn delete(self) {
+        todo!()
+    }
+
+    fn resolve_frame_selector(&self, selector: FrameSelector) -> usize {
+        use FrameSelector::*;
+        match selector {
+            Last => self.read().unwrap().frames().len() + 1,
+            First => 1,
+            ID(id) => id,
         }
+    }
+
+    pub fn new_frame(&mut self, config: NewFrameRequest) -> Res<FrameHandle> {
+        let base_frame = config.from_frame;
+        let handle = config.create(
+            self.clone(),
+            self.resolve_frame_selector(base_frame),
+            self.read().unwrap().frames.len() + 2,
+        )?;
+
+        self.write().unwrap().frames.push(handle.clone());
+        Ok(handle)
+    }
+
+    pub fn display_last_frame(&self) {
+        self.display_frame(FrameSelector::Last);
     }
 
     // TODO: Use selector, rename to just display
-    pub fn display_frame(&mut self, frame: usize) {
+    pub fn display_frame(&self, frame: FrameSelector) {
         Action::new()
             .cd("a", "a")
-            .cd("i", self.base_image.id)
-            .cd("c", frame)
+            .cd("i", self.id())
+            .cd("c", self.resolve_frame_selector(frame))
             .commit();
     }
 
     // TODO: Terminal driven animations
 }
 
-pub struct NewFrame {
-    pub base_frame: FrameSelector,
-    pub image: NewImage,
+// /// Animation based on a single image
+// /// and with the single frame
+// ///
+// /// all changes are placed on the overlay.
+// ///
+// /// Updates are not atomics, but it doesn't create new frames.
+// pub struct ThinStreamer {
+//     img: ,
+// }
+
+// impl ThinStreamer {
+//     pub fn new(base: ImageRequest) -> Self {
+//         todo!()
+//         // ThinStreamer {
+//         //     animation: base.transmit().into(),
+//         // }
+//     }
+
+//     pub fn update(&mut self, edit: FrameEdit<ComposeFromPrevious, Upload>) {
+//         self.animation
+//             .frame(FrameSelector::Previous)
+//             .unwrap()
+//             .edit(edit.into());
+//     }
+// }
+
+// pub struct AtomicStreamer {
+//     animation: Animation,
+//     pending: bool,
+// }
+
+// impl AtomicStreamer {
+//     pub fn update(&mut self, patch: NewImage, offset: (u32, u32)) {
+//         if !self.pending {
+//             // create new frame
+//             self.animation.new_frame(NewFrame {
+//                 base_frame: FrameSelector::Last,
+//                 image: patch,
+//                 width: None,
+//                 height: None,
+//                 x: Some(offset.0),
+//                 y: Some(offset.1),
+//             });
+
+//             self.pending = true;
+//         } else {
+//             // Edit frame instead
+//             self.animation
+//                 .frame(FrameSelector::Last)
+//                 .unwrap()
+//                 .edit(FrameEdit::Upload {
+//                     x: (),
+//                     y: (),
+//                     width: (),
+//                     height: (),
+//                     image: (),
+//                 });
+//         }
+//     }
+
+//     pub fn present(&mut self) {}
+// }
+
+pub struct NewFrameRequest {
+    pub from_frame: FrameSelector,
+    pub image: ImageRequest,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub x: Option<u32>,
     pub y: Option<u32>,
 }
 
+impl NewFrameRequest {
+    fn create(
+        self,
+        // image where the change is happning
+        base_image: DynImageHandle,
+
+        // compose from the frame at the given index
+        from_frame_idx: FrameIdx,
+
+        // frame index that is given to the new frame
+        new_frame_idx: FrameIdx,
+    ) -> Res<FrameHandle> {
+        Action::new()
+            .cd("a", "f")
+            .cd("i", base_image.id())
+            .cd("c", from_frame_idx)
+            .cd_opt("s", self.width)
+            .cd_opt("v", self.height)
+            .cd_opt("x", self.x)
+            .cd_opt("y", self.y)
+            .push_cd(self.image.format.into())
+            .payload(base64_turbo::STANDARD.encode(self.image.data.as_slice()))
+            .commit();
+
+        Ok(Handle::new(Frame {
+            base_image,
+            index: new_frame_idx,
+        }))
+    }
+}
+
+#[derive(Clone, Copy)]
 pub enum FrameSelector {
-    Last,
     First,
+    Last,
     ID(usize),
+    // TODO?: Previous
 }
 
+#[derive(Clone, Debug)]
 pub struct Frame {
-    base_image: ID,
+    base_image: DynImageHandle,
     index: usize,
+    // request: FrameRequest,
 }
 
-impl Frame {
-    pub fn edit(&self, edit: FrameEdit) {
-        use FrameEdit::*;
+impl FrameHandle {
+    pub fn edit(&self, edit: FrameEdit<ComposeFromSelector, Upload>) -> Res<()> {
+        let Frame {
+            base_image: img,
+            index: frame_idx,
+        } = self.read().unwrap().clone();
+
         match edit {
-            Compose {
+            FrameEdit::Compose(ComposeFromSelector {
                 from_frame,
                 width,
                 height,
                 src,
                 dst,
-            } => Action::new()
+            }) => Action::new()
+                // Use frame composing api
                 .cd("a", "c")
                 // image context
-                .cd("i", self.base_image)
+                .cd("i", img.id())
                 // source frame
-                .cd("r", from_frame)
+                .cd("r", img.resolve_frame_selector(from_frame))
                 // destination frame
-                .cd("c", self.index)
+                .cd("c", frame_idx)
                 // size
                 .cd("w", width)
                 .cd("h", height)
@@ -334,41 +516,86 @@ impl Frame {
                 // destination location
                 .cd("x", dst.0)
                 .cd("y", dst.1),
-            Upload {
+            FrameEdit::Upload(Upload {
                 x,
                 y,
                 width,
                 height,
                 image,
-            } => todo!(),
+            }) => Action::new()
+                // use standard frame action api
+                .cd("a", "f")
+                .cd("i", img.id())
+                // "r" instead of "c" so it edits the frame instead of creating the new one
+                .cd("r", frame_idx)
+                .cd_opt("s", width)
+                .cd_opt("v", height)
+                .cd_opt("x", x)
+                .cd_opt("y", y)
+                .push_cd(image.format.into())
+                .payload(base64_turbo::STANDARD.encode(image.data.as_slice())),
         }
         .commit();
+
+        Ok(())
     }
 }
 
-pub enum FrameEdit {
-    Compose {
-        from_frame: usize,
-        // TODO: Make optionals
-        width: u32,
-        height: u32,
-        src: (u32, u32),
-        dst: (u32, u32),
-    },
-    Upload {
-        x: u32,
-        y: u32,
-        width: Option<u32>,
-        height: Option<u32>,
-        image: Image,
-    },
+pub enum FrameEdit<C, U> {
+    Compose(C),
+    Upload(U),
 }
 
-#[derive(Default, Builder, Debug)]
-#[builder(setter(into))]
-pub struct NewPlacement {
-    pub image: Option<ID>,
-    pub parent: Option<ID>,
+pub struct ComposeFromSelector {
+    from_frame: FrameSelector,
+    // TODO: Make optionals
+    width: u32,
+    height: u32,
+    src: (u32, u32),
+    dst: (u32, u32),
+}
+
+pub struct ComposeFromPrevious {
+    width: u32,
+    height: u32,
+    src: (u32, u32),
+    dst: (u32, u32),
+}
+
+pub struct Upload {
+    x: Option<u32>,
+    y: Option<u32>,
+    width: Option<u32>,
+    height: Option<u32>,
+    image: ImageRequest,
+}
+
+// impl<U> From<FrameEdit<ComposeFromPrevious, U>> for FrameEdit<ComposeFromSelector, U> {
+//     fn from(value: FrameEdit<ComposeFromPrevious, U>) -> Self {
+//         match value {
+//             FrameEdit::Compose(ComposeFromPrevious {
+//                 width,
+//                 height,
+//                 src,
+//                 dst,
+//             }) => FrameEdit::Compose(ComposeFromSelector {
+//                 from_frame: FrameSelector::Last,
+//                 width,
+//                 height,
+//                 src,
+//                 dst,
+//             }),
+//             FrameEdit::Upload(u) => FrameEdit::Upload(u),
+//         }
+//     }
+// }
+
+#[derive(Debug, Clone, Default)]
+pub struct PlacementRequest {
+    // TODO: Do not option this
+    // TODO: DO we need to store an image here?
+    pub image: Option<DynImageHandle>,
+    pub parent: Option<DynImageHandle>,
     pub offset_x: Option<u32>,
     pub offset_y: Option<u32>,
     pub cols: Option<u32>,
@@ -385,64 +612,78 @@ pub struct NewPlacement {
     // H, V
 }
 
-impl NewPlacement {
+impl PlacementRequest {
+    pub fn place(self, id: Id, action: &'static str) -> PlacementHandle {
+        self.exec_place(id, action);
+
+        Handle::new(Some(Placement {
+            id,
+            image: self.image.clone().unwrap(),
+            config: self,
+        }))
+    }
+
+    pub fn exec_place(&self, id: Id, action: &'static str) {
+        Action::new() //
+            .cd("a", action)
+            .cd(
+                "i",
+                self.image
+                    .as_ref()
+                    .expect("image to be there")
+                    .read()
+                    .unwrap()
+                    .id,
+            )
+            .cd("p", id)
+            .cd_opt("X", self.offset_x)
+            .cd_opt("Y", self.offset_y)
+            .cd_opt("c", self.cols)
+            .cd_opt("r", self.rows)
+            .cd_opt("x", self.x)
+            .cd_opt("y", self.y)
+            .cd_opt("z", self.z)
+            .cd_opt("w", self.width)
+            .cd_opt("h", self.height)
+            .cd_if(self.fix_cursor.is_some(), "C", 1)
+            .commit();
+    }
+
     /// Adds attribute related cds
-    fn add_cds(&self, a: &mut Action) {
-        // if let Some(parent)
-
-        if let Some(id) = self.image {
-            a.add_cd("i", id);
-        }
-
-        if let Some(px) = self.offset_x {
-            a.add_cd("X", px);
-        }
-
-        if let Some(px) = self.offset_y {
-            a.add_cd("Y", px);
-        }
-
-        if let Some(u) = self.cols {
-            a.add_cd("c", u);
-        }
-
-        if let Some(u) = self.rows {
-            a.add_cd("r", u);
-        }
-
-        if let Some(u) = self.x {
-            a.add_cd("x", u);
-        }
-
-        if let Some(u) = self.y {
-            a.add_cd("y", u);
-        }
-
-        if let Some(u) = self.z {
-            a.add_cd("z", u);
-        }
-
-        if let Some(px) = self.width {
-            a.add_cd("w", px);
-        }
-
-        if let Some(px) = self.height {
-            a.add_cd("h", px);
-        }
-
-        if let Some(_) = self.fix_cursor {
-            a.add_cd("C", 1);
-        }
+    fn add_cds(&self, a: Action) -> Action {
+        a // add cds
+            .cd("i", self.image.as_ref().unwrap().read().unwrap().id)
+            .cd_opt("X", self.offset_x)
+            .cd_opt("Y", self.offset_y)
+            .cd_opt("c", self.cols)
+            .cd_opt("r", self.rows)
+            .cd_opt("x", self.x)
+            .cd_opt("y", self.y)
+            .cd_opt("z", self.z)
+            .cd_opt("w", self.width)
+            .cd_opt("h", self.height)
+            .cd_if(self.fix_cursor.is_some(), "C", 1)
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Placement {
-    id: ID,
-    request: NewPlacement,
+    id: Id,
+    image: DynImageHandle,
+    config: PlacementRequest,
 }
 
-pub struct ImageHandle {}
+#[derive(Debug, Clone)]
+pub enum Placement2 {
+    Attached(AttachedPlacement),
+    Detached(DetachedPlacement),
+}
+
+#[derive(Debug, Clone)]
+pub struct AttachedPlacement {}
+
+#[derive(Debug, Clone)]
+pub struct DetachedPlacement {}
 
 // #[derive(Default, Builder, Debug)]
 pub struct Action {
@@ -466,82 +707,73 @@ impl Action {
 
     /// Takes ownership
     fn cd(self, key: &'static str, value: impl Display) -> Self {
-        self.push(ControlData {
-            key,
-            value: value.to_string(),
-        })
+        self.push_cd(ControlData(key, value.to_string()))
     }
 
     fn cd_opt(self, key: &'static str, value_o: Option<impl Display>) -> Self {
         if let Some(value) = value_o {
-            self.push(ControlData {
-                key,
-                value: value.to_string(),
-            })
+            self.push_cd(ControlData(key, value.to_string()))
         } else {
             self
         }
     }
 
-    /// Takes a reference
-    fn add_cd(&mut self, key: &'static str, value: impl Display) {
-        self.cds.push(ControlData {
-            key,
-            value: value.to_string(),
-        })
+    fn cd_if(self, condition: bool, key: &'static str, value: impl Display) -> Self {
+        if condition {
+            self.push_cd(ControlData(key, value.to_string()))
+        } else {
+            self
+        }
     }
 
-    /// a=d
-    pub fn delete(query: DeleteQuery) -> Self {
-        let mut a = Action {
-            cds: vec![ControlData {
-                key: "a",
-                value: "d".to_string(),
-            }],
-            payload: None,
-        };
+    // /// a=d
+    // pub fn delete(query: DeleteQuery) -> Self {
+    //     let mut a = TGPAction {
+    //         cds: vec![ControlData("a", "d".to_string())],
+    //         payload: None,
+    //     };
 
-        use DeleteQuery::*;
+    //     use DeleteQuery::*;
 
-        // TODO: refactor
-        match query {
-            All => a.cds.push(ControlData {
-                key: "d",
-                value: "a".to_string(),
-            }),
+    //     // TODO: refactor
+    //     match query {
+    //         All => a.cds.push(ControlData {
+    //             key: "d",
+    //             value: "a".to_string(),
+    //         }),
 
-            Id { image, placement } => {
-                a.cds.push(ControlData {
-                    key: "d",
-                    value: "i".to_string(),
-                });
+    //         Id { image, placement } => {
+    //             a.cds.push(ControlData {
+    //                 key: "d",
+    //                 value: "i".to_string(),
+    //             });
 
-                a.cds.push(ControlData {
-                    key: "i",
-                    value: image.to_string(),
-                });
+    //             a.cds.push(ControlData {
+    //                 key: "i",
+    //                 value: image.to_string(),
+    //             });
 
-                if let Some(id) = placement {
-                    a.cds.push(ControlData {
-                        key: "p",
-                        value: id.to_string(),
-                    });
-                }
-            }
-            Cursor => todo!(),
-            Frames => todo!(),
-            Placements { x, y } => todo!(),
-            PlacementsWithZ { x, y, z } => todo!(),
-            IdsRange { from, to } => todo!(),
-            Column(_) => todo!(),
-            Row(_) => todo!(),
-            Z(_) => todo!(),
-        };
+    //             if let Some(id) = placement {
+    //                 a.cds.push(ControlData {
+    //                     key: "p",
+    //                     value: id.to_string(),
+    //                 });
+    //             }
+    //         }
+    //         Cursor => todo!(),
+    //         Frames => todo!(),
+    //         Placements { x, y } => todo!(),
+    //         PlacementsWithZ { x, y, z } => todo!(),
+    //         IdsRange { from, to } => todo!(),
+    //         Column(_) => todo!(),
+    //         Row(_) => todo!(),
+    //         Z(_) => todo!(),
+    //     };
 
-        a
-    }
+    //     a
+    // }
 
-    fn push(mut self, cd: ControlData) -> Self {
+    fn push_cd(mut self, cd: ControlData) -> Self {
         self.cds.push(cd);
         self
     }
@@ -567,13 +799,48 @@ impl Action {
     }
 }
 
-// #[derive(this)]
-pub enum TGPError {}
+#[derive(thiserror::Error, Debug)]
+pub enum TGPError {
+    #[error("Entity was evicted")]
+    Evicted(Box<dyn Restorable>),
+    #[error("Entity you are trying to use was indirectly or directly deleted")]
+    Deleted(Box<dyn Restorable>),
+    #[error("unknown error")]
+    Unknown,
+}
 
+impl TGPError {
+    pub fn restore_restorable(self) -> Res<()> {
+        match self {
+            TGPError::Evicted(mut entity) =>
+            // try renewing everything we can.
+            {
+                entity.restore(true)
+            }
+            e => Err(e),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub enum Format {
     RGB,
     RGBA,
     PNG,
+}
+
+impl From<Format> for ControlData {
+    fn from(value: Format) -> Self {
+        ControlData(
+            "f",
+            match value {
+                Format::RGB => 24,
+                Format::RGBA => 32,
+                Format::PNG => 100,
+            }
+            .to_string(),
+        )
+    }
 }
 
 pub enum DeleteQuery {
@@ -641,14 +908,10 @@ enum Medium {
 
 // TODO:
 // The PNG format is specified using the f=100 key. The width and height of the image will be read from the PNG data itself. Note that if you use both PNG and compression, then you must provide the S key with the size of the PNG data.
-struct ControlData {
-    key: &'static str,
-    // TODO: Use proper value type
-    value: String,
-}
+struct ControlData(&'static str, String);
 
 impl ControlData {
     fn format(&self) -> String {
-        format!("{}={}", self.key, self.value)
+        format!("{}={}", self.0, self.1)
     }
 }

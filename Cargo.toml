@@ -24,6 +24,8 @@ itertools = "0.15"
 idalloc = "0.1"
 static_init = "1.0"
 crossterm = { version = "0.28", default-features = false }
+derive_deref = "1.1"
+derive-getters = "0.5"
 
 # internal
 gobo-core = { path = "crates/gobo-core" }

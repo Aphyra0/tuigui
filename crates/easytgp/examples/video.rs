@@ -9,7 +9,7 @@
 //! so the caller can hand it straight to the TGP encoder. The `for` loop over
 //! `reader` yields every frame in order.
 
-use easytgp::{Animation, NewPlacement};
+use easytgp::{DynImage, DynImageHandle};
 use image::{ImageBuffer, ImageFormat, Rgb};
 use std::{io::Cursor, path::Path};
 use yscv_video::Mp4VideoReader;
@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut r = Mp4VideoReader::open(Path::new(&path))?;
 
-    let mut animation: Option<Animation> = None;
+    let mut dimg: Option<DynImageHandle> = None;
     while let Some(frame) = r.next_frame()? {
         // frame.rgb8_data
         let buf =
@@ -39,32 +39,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut png_bytes: Vec<u8> = Vec::new();
         buf.write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)?;
 
-        let nimg = easytgp::NewImage::new(easytgp::Format::PNG, png_bytes);
+        let imgreq = easytgp::ImageRequest::new(easytgp::Format::PNG, png_bytes);
 
-        if let Some(anim) = animation.as_mut() {
-            anim.new_frame(easytgp::NewFrame {
-                base_frame: easytgp::FrameSelector::Last,
-                image: nimg,
+        if let Some(dimg) = dimg.as_mut() {
+            dimg.new_frame(easytgp::NewFrameRequest {
+                from_frame: easytgp::FrameSelector::Last,
+                image: imgreq,
                 width: Some(1),
                 height: Some(5),
-                x: Some(1000),
-                y: Some(600),
-            });
-
-            anim.display_last();
+                x: Some(50),
+                y: Some(50),
+            })
+            .unwrap();
+            dimg.display_last_frame();
         } else {
-            let img = nimg.transmit();
-
-            img.place_named(NewPlacement {
+            let mut img = imgreq.transmit();
+            img.place_named(easytgp::PlacementRequest {
+                image: Some(img.clone()),
                 cols: Some(70),
-                fix_cursor: Some(true),
+                fix_cursor: Some(()),
                 // rows: Some(10),
                 // width: Some(140),
                 ..Default::default()
             });
-            animation = Some(img.into());
+
+            dimg = Some(img.into());
         }
     }
+
+    dimg.unwrap().display_frame(easytgp::FrameSelector::First);
     std::thread::sleep(std::time::Duration::from_millis(1000));
     // easytgp::NewImage::new(easytgp::Format::PNG, png_bytes)
     //     .transmit()
