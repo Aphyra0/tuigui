@@ -26,49 +26,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut r = Mp4VideoReader::open(Path::new(&path))?;
 
-    let mut dimg: Option<DynImageHandle> = None;
+    let mut dimg: Option<DynImage> = None;
     while let Some(frame) = r.next_frame()? {
         // frame.rgb8_data
-        let buf =
-            image::RgbImage::from_raw(frame.width as u32, frame.height as u32, frame.rgb8_data)
-                .unwrap();
+        let buf = image::RgbImage::from_raw(
+            frame.width as u32,
+            frame.height as u32,
+            frame.rgb8_data.clone(),
+        )
+        .unwrap();
 
         // buf.save_with_format("/tmp/test.png", image::ImageFormat::Png)
         //     .unwrap();
 
         let mut png_bytes: Vec<u8> = Vec::new();
-        buf.write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)?;
+        if dimg.is_some() {
+            // let buf = image::RgbImage::from_pixel(10, 10, Rgb([32, 250, 0]));
+            // let png_bytes = buf.to_vec();
 
-        let imgreq = easytgp::ImageRequest::new(easytgp::Format::PNG, png_bytes);
+            buf.write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)?;
+        } else {
+            png_bytes = frame.rgb8_data;
+            // dbg!(png_bytes.len());
+        }
+
+        // dbg!(png_bytes.len());
+
+        let imgreq = easytgp::ImageRequest::new(
+            if dimg.is_some() {
+                easytgp::Format::PNG
+            } else {
+                easytgp::Format::RGB
+            },
+            png_bytes,
+        );
 
         if let Some(dimg) = dimg.as_mut() {
             dimg.new_frame(easytgp::NewFrameRequest {
-                from_frame: easytgp::FrameSelector::Last,
                 image: imgreq,
-                width: Some(1),
-                height: Some(5),
-                x: Some(50),
-                y: Some(50),
+                ..Default::default()
             })
             .unwrap();
             dimg.display_last_frame();
         } else {
-            let mut img = imgreq.transmit();
-            img.place_named(easytgp::PlacementRequest {
-                image: Some(img.clone()),
-                cols: Some(70),
-                fix_cursor: Some(()),
+            let mut img = imgreq.transmit(Some((frame.width as u32, frame.height as u32)));
+            img.place(easytgp::PlacementRequest {
+                // image: Some(img.clone()),
+                // cols: Some(70),
+                fix_cursor: true,
+                // width: Some(dbg!(10 as u32)),
+                // height: Some(dbg!(10 as u32)),
+                // width: Some(dbg!(frame.width as u32)),
+                // height: Some(dbg!(frame.height as u32)),
                 // rows: Some(10),
                 // width: Some(140),
                 ..Default::default()
-            });
+            })
+            .unwrap();
 
             dimg = Some(img.into());
+            // break;
         }
     }
 
-    dimg.unwrap().display_frame(easytgp::FrameSelector::First);
+    let mut img = dimg.unwrap();
+
+    // img.display_frame(easytgp::FrameSelector::First);
+
     std::thread::sleep(std::time::Duration::from_millis(1000));
+
+    // img.delete();
     // easytgp::NewImage::new(easytgp::Format::PNG, png_bytes)
     //     .transmit()
     //     .place_named(NewPlacement {
