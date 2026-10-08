@@ -9,7 +9,7 @@
 //! so the caller can hand it straight to the TGP encoder. The `for` loop over
 //! `reader` yields every frame in order.
 
-use easytgp::{DynImage, DynImageHandle};
+use easytgp::{DynImage, DynImageHandle, ImageRequest};
 use image::{ImageBuffer, ImageFormat, Rgb};
 use std::{io::Cursor, path::Path};
 use yscv_video::Mp4VideoReader;
@@ -26,10 +26,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut r = Mp4VideoReader::open(Path::new(&path))?;
 
-    let mut dimg: Option<DynImage> = None;
+    let mut dimg: Option<DynImage<_>> = None;
     while let Some(frame) = r.next_frame()? {
         // frame.rgb8_data
-        let buf = image::RgbImage::from_raw(
+        let imgbuf = image::RgbImage::from_raw(
             frame.width as u32,
             frame.height as u32,
             frame.rgb8_data.clone(),
@@ -39,27 +39,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // buf.save_with_format("/tmp/test.png", image::ImageFormat::Png)
         //     .unwrap();
 
-        let mut png_bytes: Vec<u8> = Vec::new();
-        if dimg.is_some() {
-            // let buf = image::RgbImage::from_pixel(10, 10, Rgb([32, 250, 0]));
-            // let png_bytes = buf.to_vec();
-
-            buf.write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)?;
-        } else {
-            png_bytes = frame.rgb8_data;
-            // dbg!(png_bytes.len());
-        }
-
         // dbg!(png_bytes.len());
 
-        let imgreq = easytgp::ImageRequest::new(
-            if dimg.is_some() {
-                easytgp::Format::PNG
-            } else {
-                easytgp::Format::RGB
-            },
-            png_bytes,
-        );
+        let imgreq = easytgp::ImageRequest::new_png(imgbuf).unwrap();
 
         if let Some(dimg) = dimg.as_mut() {
             dimg.new_frame(easytgp::NewFrameRequest {
@@ -69,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap();
             dimg.display_last_frame();
         } else {
-            let mut img = imgreq.transmit(Some((frame.width as u32, frame.height as u32)));
+            let mut img = imgreq.transmit();
             img.place(easytgp::PlacementRequest {
                 // image: Some(img.clone()),
                 // cols: Some(70),

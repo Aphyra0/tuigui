@@ -4,13 +4,14 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
-    io::Write,
+    io::{Cursor, Write},
     ops::Deref,
     sync::{Arc, RwLock, RwLockReadGuard},
 };
 
 use derive_deref::{Deref, DerefMut};
 use derive_getters::Getters;
+use image::{PixelWithColorType, RgbImage};
 use itertools::Itertools;
 
 // TODO: https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
@@ -109,26 +110,26 @@ pub struct DynImageHandle {
     id: DynId,
 }
 
-/// Optional store for the images. Can be used as a central registry for all images
-pub struct ImageStore {
-    images: HashMap<DynImageHandle, DynImage>,
-}
+// /// Optional store for the images. Can be used as a central registry for all images
+// pub struct ImageStore {
+//     images: HashMap<DynImageHandle, DynImage>,
+// }
 
-impl ImageStore {
-    pub fn store(&mut self, image: DynImage) -> DynImageHandle {
-        let h = DynImageHandle {
-            id: image.id.clone(),
-        };
-        self.images.insert(h.clone(), image);
-        h
-    }
+// impl ImageStore {
+//     pub fn store(&mut self, image: DynImage) -> DynImageHandle {
+//         let h = DynImageHandle {
+//             id: image.id.clone(),
+//         };
+//         self.images.insert(h.clone(), image);
+//         h
+//     }
 
-    pub fn get(&mut self, handle: &DynImageHandle) -> Option<&mut DynImage> {
-        self.images.get_mut(handle)
-    }
-}
+//     pub fn get(&mut self, handle: &DynImageHandle) -> Option<&mut DynImage> {
+//         self.images.get_mut(handle)
+//     }
+// }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, Eq, Hash, PartialEq)]
 pub struct PlacementHandle {
     id: DynId,
     request: Arc<PlacementRequest>,
@@ -161,9 +162,67 @@ impl DynId {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct ImageRequest {
-    format: Format,
+pub struct ImageRequest<F: Format> {
+    format: F,
+    size: Option<ImageSize>,
+    // Encoded in base64
     data: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ImageSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+// #[derive(Clone, Copy, Debug, Default)]
+// pub enum Format {
+//     #[default]
+//     RGB,
+//     RGBA,
+//     PNG,
+// }
+
+// impl From<Format> for ControlData {
+//     fn from(value: Format) -> Self {
+//         ControlData(
+//             "f",
+//             match value {
+//                 Format::RGB => 24,
+//                 Format::RGBA => 32,
+//                 Format::PNG => 100,
+//             }
+//             .to_string(),
+//         )
+//     }
+// }
+
+trait Format: Copy + Clone + Default {
+    fn to_cd(self) -> ControlData;
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct Png;
+impl Format for Png {
+    fn to_cd(self) -> ControlData {
+        ControlData("f", 100.to_string())
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct Rgb;
+impl Format for Rgb {
+    fn to_cd(self) -> ControlData {
+        ControlData("f", 24.to_string())
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct Rgba;
+impl Format for Rgba {
+    fn to_cd(self) -> ControlData {
+        ControlData("f", 32.to_string())
+    }
 }
 
 // pub enum ImageRequest {
@@ -181,9 +240,40 @@ pub struct ImageRequest {
 //     }
 // }
 
-impl ImageRequest {
-    pub fn new(format: Format, data: Vec<u8>) -> Self {
-        ImageRequest { format, data }
+pub trait AnyFormat: image::Pixel<Subpixel = u8> + image::PixelWithColorType {}
+impl AnyFormat for image::Rgb<u8> {}
+impl AnyFormat for image::Rgba<u8> {}
+
+impl ImageRequest<Png> {
+    /// Takes image::RgbaImage or image::RgbImage
+    pub fn new_png(image: image::ImageBuffer<impl AnyFormat, Vec<u8>>) -> Res<Self> {
+        // TODO: allocate with the correct capacity.
+        let mut bytes = vec![];
+        image.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)?;
+        Ok(Self::new_from_raw(Png, bytes, None))
+    }
+}
+
+impl ImageRequest<Rgb> {
+    pub fn new_rgb(image: image::RgbImage, size: ImageSize) -> Self {
+        Self::new_from_raw(Rgb, image.into_vec(), Some(size))
+    }
+}
+
+impl ImageRequest<Rgba> {
+    pub fn new_rgba(image: image::RgbaImage, size: ImageSize) -> Self {
+        Self::new_from_raw(Rgba, image.into_vec(), Some(size))
+    }
+}
+
+impl<F: Format> ImageRequest<F> {
+    /// Create an image request from raw parts.
+    pub fn new_from_raw(format: F, bytes: Vec<u8>, size: Option<ImageSize>) -> Self {
+        ImageRequest {
+            format,
+            data: base64_turbo::STANDARD.encode(bytes).into_bytes(),
+            size,
+        }
     }
 
     // pub fn transplace(self, placement: PlacementRequest) -> DynImageHandle {
@@ -198,9 +288,9 @@ impl ImageRequest {
     //     todo!()
     // }
 
-    pub fn transmit(self, img_size: Option<(u32, u32)>) -> DynImage {
+    pub fn transmit(self) -> DynImage<F> {
         let id = DynId::new(id::alloc());
-        self.exec_transmit(id.assigned(), img_size);
+        self.exec_transmit(id.assigned());
 
         DynImage {
             id,
@@ -210,10 +300,9 @@ impl ImageRequest {
         }
     }
 
-    fn exec_transmit(&self, id: Id, img_size: Option<(u32, u32)>) {
+    fn exec_transmit(&self, id: Id) {
         // TODO: Store data already encoded.
-        let payload = base64_turbo::STANDARD.encode(self.data.as_slice());
-        let chunks = payload.bytes().chunks(4096);
+        let chunks = self.data.clone().chunks(4096);
         let mut iter = chunks.into_iter();
         let (mut first, mut cur_o) = (true, iter.next());
 
@@ -233,9 +322,9 @@ impl ImageRequest {
                         None
                     },
                 )
-                .cd_opt("s", img_size.map(|(s, _v)| s))
-                .cd_opt("v", img_size.map(|(_s, v)| v))
-                .push_cd(self.format.into())
+                .cd_opt("s", self.size.map(|s| s.width))
+                .cd_opt("v", self.size.map(|s| s.height))
+                .push_cd(self.format.to_cd())
                 .payload(String::from_utf8(payload).unwrap()))
             .commit();
             first = false;
@@ -244,18 +333,24 @@ impl ImageRequest {
 }
 
 #[derive(Debug)]
-pub struct DynImage {
+pub struct DynImage<F: Format> {
     id: DynId,
     // Remember what placements are attached to this image.
     placements: HashSet<PlacementHandle>,
     frames: HashMap<FrameHandle, FrameIdx>,
-    request: ImageRequest,
+    request: ImageRequest<F>,
 }
 
-impl DynImage {
+pub struct Checked<'a, T>(&'a T);
+
+impl<F: Format> DynImage<F> {
     pub fn place(&mut self, request: PlacementRequest) -> Res<PlacementHandle> {
         let h = request.place(self.id.assigned(), id::alloc(), "p");
-        self.placements.insert(h.clone());
+        self.placements.insert(PlacementHandle {
+            id: h.id.clone(),
+            request: h.request.clone(),
+        });
+
         Ok(h)
     }
 
@@ -269,7 +364,11 @@ impl DynImage {
 
     pub fn displace(&mut self, handle: PlacementHandle) -> Res<PlacementRequest> {
         if self.placements.remove(&handle) {
-            Ok(handle.request.deref().clone())
+            // ^ Drops the value, reducing reference counter to just one.
+            // Now we can just safely unwrap making it zero-copy
+            Ok(Arc::try_unwrap(handle.request).expect("reference counter to be at one"))
+            // Note: because the handles provided to the user can't be cloned, nor user can request more
+            // we can assume the counter is always at 2.
         } else {
             todo!()
         }
@@ -277,7 +376,7 @@ impl DynImage {
 
     pub fn restore(&mut self) {}
 
-    pub fn delete(self) -> ImageRequest {
+    pub fn delete(self) -> ImageRequest<F> {
         Action::new()
             .cd("a", "d")
             .cd("i", self.id.assigned())
@@ -294,7 +393,7 @@ impl DynImage {
         }
     }
 
-    pub fn new_frame(&mut self, config: NewFrameRequest) -> Res<FrameHandle> {
+    pub fn new_frame(&mut self, config: NewFrameRequest<F>) -> Res<FrameHandle> {
         let base_frame = config.from_frame;
         let idx = self.frames.len() + 2;
         let handle = config.create(
@@ -310,7 +409,7 @@ impl DynImage {
     pub fn edit_frame(
         &self,
         handle: &FrameHandle,
-        edit: FrameEdit<ComposeFromSelector, Upload>,
+        edit: FrameEdit<ComposeFromSelector, Upload<F>>,
     ) -> Res<()> {
         let Some(frame_idx) = self.frames.get(handle) else {
             todo!()
@@ -358,7 +457,7 @@ impl DynImage {
                 .cd_opt("v", height)
                 .cd_opt("x", x)
                 .cd_opt("y", y)
-                .push_cd(image.format.into())
+                .push_cd(image.format.to_cd())
                 .payload(base64_turbo::STANDARD.encode(image.data.as_slice())),
         }
         .commit();
@@ -380,12 +479,12 @@ impl DynImage {
     }
 }
 
-/// Simple image, can't be directly deleted, can't be animated. only supports restore.
-#[derive(Clone, Debug)]
-pub struct AnonymousImage {
-    data: ImageRequest,
-    place: PlacementRequest,
-}
+// /// Simple image, can't be directly deleted, can't be animated. only supports restore.
+// #[derive(Clone, Debug)]
+// pub struct AnonymousImage {
+//     data: ImageRequest,
+//     place: PlacementRequest,
+// }
 
 // /// Animation based on a single image
 // /// and with the single frame
@@ -451,16 +550,16 @@ pub struct AnonymousImage {
 // }
 
 #[derive(Default)]
-pub struct NewFrameRequest {
+pub struct NewFrameRequest<F: Format> {
     pub from_frame: FrameSelector,
-    pub image: ImageRequest,
+    pub image: ImageRequest<F>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub x: Option<u32>,
     pub y: Option<u32>,
 }
 
-impl NewFrameRequest {
+impl<F: Format> NewFrameRequest<F> {
     fn create(
         self,
         // image where the change is happning
@@ -480,7 +579,7 @@ impl NewFrameRequest {
             .cd_opt("v", self.height)
             .cd_opt("x", self.x)
             .cd_opt("y", self.y)
-            .push_cd(self.image.format.into())
+            .push_cd(self.image.format.to_cd())
             .payload(base64_turbo::STANDARD.encode(self.image.data.as_slice()))
             .commit();
 
@@ -523,12 +622,12 @@ pub struct ComposeFromPrevious {
     dst: (u32, u32),
 }
 
-pub struct Upload {
+pub struct Upload<F: Format> {
     x: Option<u32>,
     y: Option<u32>,
     width: Option<u32>,
     height: Option<u32>,
-    image: ImageRequest,
+    image: ImageRequest<F>,
 }
 
 // impl<U> From<FrameEdit<ComposeFromPrevious, U>> for FrameEdit<ComposeFromSelector, U> {
@@ -689,6 +788,9 @@ pub enum TGPError {
     Deleted(Box<dyn Restorable>),
     #[error("unknown error")]
     Unknown,
+
+    #[error(transparent)]
+    ImageProcessing(#[from] image::ImageError),
 }
 
 impl TGPError {
@@ -701,28 +803,6 @@ impl TGPError {
             }
             e => Err(e),
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub enum Format {
-    #[default]
-    RGB,
-    RGBA,
-    PNG,
-}
-
-impl From<Format> for ControlData {
-    fn from(value: Format) -> Self {
-        ControlData(
-            "f",
-            match value {
-                Format::RGB => 24,
-                Format::RGBA => 32,
-                Format::PNG => 100,
-            }
-            .to_string(),
-        )
     }
 }
 
