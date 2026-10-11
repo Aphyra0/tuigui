@@ -78,15 +78,22 @@ pub trait Restorable: std::fmt::Debug {
 
 #[static_init::dynamic]
 static mut R: ReplyRouter = ReplyRouter {
-    last_img: 0,
-    pending: HashMap::new(),
-    ready: HashMap::new(),
     last_marker: 1,
+    ..Default::default()
 };
 
 type Marker = u16;
+
+struct PendingReady {
+    pending: HashMap<ImgNumber, Waker>,
+    ready: HashMap<ImgNumber, Option<Message>>,
+}
+
+#[derive(Default)]
 struct ReplyRouter {
     last_img: Id,
+    pending_transmissions: HashMap<ImgNumber, Waker>,
+    ready_transmissions: HashMap<ImgNumber, Message>,
     pending: HashMap<Marker, Waker>,
     ready: HashMap<Marker, Option<Message>>,
     last_marker: Marker,
@@ -109,14 +116,24 @@ impl ReplyRouter {
             let mut last = None;
             while let Some(reply) = Message::parse_next(&mut buf) {
                 if let Some(marker) = reply.get_from_key('i') {
+                    let marker = marker.parse().unwrap();
+                    if let Some(number) = reply.get_from_key('I') {
+                        let number = number.parse().unwrap();
+
+                        let mut r = R.write();
+                        if let Some(waker) = r.pending_transmissions.remove(&marker) {
+                            r.ready_transmissions.insert(number, reply);
+                            waker.wake();
+                            continue;
+                        }
+                    }
                     // let ActionIdent::ImageId { id: marker } = reply.ident() else {
                     //     unreachable!()
                     // };
 
                     let mut r = R.write();
-                    let marker = marker.parse().unwrap();
                     if let Some(waker) = r.pending.remove(&marker) {
-                        r.ready.insert(marker, last.take());
+                        r.ready_transmissions.insert(marker, last.take());
                         waker.wake();
                         continue;
                     }
@@ -231,7 +248,7 @@ impl Future for ReplyFuture {
     ) -> std::task::Poll<Self::Output> {
         let mut r = R.write();
 
-        if let Some(reply) = r.ready.remove(&self.action_number) {
+        if let Some(reply) = r.ready_transmissions.remove(&self.action_number) {
             return std::task::Poll::Ready(Reply { message: reply });
         } else if !r.pending.contains_key(&self.action_number) {
             r.pending.insert(self.action_number, cx.waker().clone());
@@ -520,7 +537,33 @@ pub struct DynImage<F: Format> {
     pl_id_alloc: Slab<Id>,
 }
 
+pub struct SyncData {
+    /// How long the
+    took: Duration,
+}
+
+pub struct PendingWait {
+    image_num: ImgNumber,
+}
+
+impl Future for PendingWait {
+    type Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        todo!()
+    }
+}
+
 impl<F: Format> DynImage<F> {
+    /// Wait until all pending operations related to the image are done and their status collected
+    /// In cases of errors, the first one is being returned
+    pub fn wait(&mut self) -> Res<SyncData> {
+        todo!()
+    }
+
     pub fn place(&mut self, request: PlacementRequest) -> PendingOperation<PlacementHandle> {
         let h = request.place(self.id.assigned(), id::alloc(), "p");
         // self.placements.insert(PlacementHandle {
