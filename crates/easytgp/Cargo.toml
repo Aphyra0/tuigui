@@ -21,6 +21,13 @@ derive-getters = { workspace = true }
 thiserror = { workspace = true }
 yscv-video = "0.2"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
 [[example]]
 name = "image"
 path = "examples/image.rs"
+
+[[example]]
+name = "marker_bench"
+path = "examples/marker_bench.rs"

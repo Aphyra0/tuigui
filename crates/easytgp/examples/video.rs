@@ -9,9 +9,12 @@
 //! so the caller can hand it straight to the TGP encoder. The `for` loop over
 //! `reader` yields every frame in order.
 
-use easytgp::{DynImage, DynImageHandle, ImageRequest};
+use easytgp::{Controller, DynImage, DynImageHandle, ImageRequest};
 use image::{ImageBuffer, ImageFormat, Rgb};
-use std::{io::Cursor, path::Path};
+use std::{
+    io::{stdin, Cursor},
+    path::Path,
+};
 use yscv_video::Mp4VideoReader;
 
 /// A single decoded frame: RGBA8, row-major, top-left origin.
@@ -21,7 +24,8 @@ struct RgbaFrame {
     rgba: Vec<u8>,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::var("CAPY_VID_PATH")?;
 
     let mut r = Mp4VideoReader::open(Path::new(&path))?;
@@ -41,7 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // dbg!(png_bytes.len());
 
-        let imgreq = easytgp::ImageRequest::new_png(imgbuf).unwrap();
+        let c = Controller::init(stdin());
+        let imgreq = c.new_png(imgbuf).unwrap();
 
         if let Some(dimg) = dimg.as_mut() {
             dimg.new_frame(easytgp::NewFrameRequest {
@@ -51,10 +56,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap();
             dimg.display_last_frame();
         } else {
-            let mut img = imgreq.transmit();
+            let mut img = imgreq.transmit().await?;
+            dbg!("img");
             img.place(easytgp::PlacementRequest {
                 // image: Some(img.clone()),
-                // cols: Some(70),
+                cols: Some(100),
                 fix_cursor: true,
                 // width: Some(dbg!(10 as u32)),
                 // height: Some(dbg!(10 as u32)),
