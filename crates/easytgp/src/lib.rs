@@ -16,6 +16,7 @@ use std::{
 
 use derive_deref::{Deref, DerefMut};
 use derive_getters::Getters;
+use idalloc::Slab;
 use image::{PixelWithColorType, RgbImage};
 use itertools::Itertools;
 
@@ -157,6 +158,19 @@ impl<R> PendingOperation<R> {
             returns: Some(Box::new(returns)),
         }
     }
+
+    /// Unsafe-ish operation for performance.
+    /// Don't wait on the reply status and assume the status is OK,
+    /// Makes return value available immidiately, however introduces a risk of using illegal value.
+    /// Still returns a PendingOperation so one can retrospectively verify if the usage was legal.
+    ///
+    /// Since most terminals process graphics requests sequential, the race condition with two competing operations isn't possible.
+    /// The only failure mode is when the prior operation failed and the former ones depended on it
+    ///
+    /// NOTE: This crate doesn't work in terminals processing requests in non-FIFO manner.
+    pub fn assume_ok(self) -> (R, PendingOperation<()>) {
+        todo!()
+    }
 }
 
 pub struct ReplyFuture {
@@ -174,6 +188,7 @@ impl ReplyFuture {
         let mut r = R.write();
         let marker = r.next_marker();
 
+        // TODO: Probably move inside the .send
         // Send marker as well, marking everything received before that to this action.
         Message::new()
             .cd('a', 'q')
@@ -182,7 +197,8 @@ impl ReplyFuture {
             .cd('s', 1)
             .cd('v', 1)
             .payload("AAAA")
-            .send_raw();
+            .send_raw(false);
+
         ReplyFuture {
             ident,
             action_number: marker,
@@ -227,12 +243,18 @@ impl Future for ReplyFuture {
 
 pub struct Controller {
     router_handle: JoinHandle<()>,
+    num_alloc: Slab<ImgNumber>,
 }
 
 impl Controller {
     pub fn init(stdin: impl std::io::Read + Send + 'static) -> Arc<Controller> {
         Arc::new(Controller {
             router_handle: ReplyRouter::start(stdin),
+            num_alloc: {
+                let mut slab = Slab::new();
+                slab.next();
+                slab
+            },
         })
     }
 
@@ -311,6 +333,7 @@ impl PlacementHandle {
 
 pub type Res<R> = Result<R, TGPError>;
 pub type Id = u32;
+pub type ImgNumber = u32;
 pub type FrameIdx = usize;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -405,7 +428,7 @@ pub struct ImageSize {
 //     }
 // }
 
-trait Format: Copy + Clone + Default {
+trait Format: Copy + Clone + Default + 'static {
     fn to_cd(self) -> ControlData;
 }
 
@@ -467,6 +490,11 @@ impl<F: Format + 'static> ImageRequest<F> {
                 request: self,
                 placements: HashSet::new(),
                 frames: HashMap::new(),
+                pl_id_alloc: {
+                    let mut slab = Slab::new();
+                    slab.next();
+                    slab
+                },
             }
         })
     }
@@ -483,30 +511,24 @@ impl<F: Format + 'static> ImageRequest<F> {
     }
 }
 
-#[derive(Debug)]
 pub struct DynImage<F: Format> {
     id: DynId,
     // Remember what placements are attached to this image.
     placements: HashSet<PlacementHandle>,
     frames: HashMap<FrameHandle, FrameIdx>,
     request: ImageRequest<F>,
+    pl_id_alloc: Slab<Id>,
 }
 
 impl<F: Format> DynImage<F> {
-    pub fn place(&mut self, request: PlacementRequest) -> Res<PlacementHandle> {
+    pub fn place(&mut self, request: PlacementRequest) -> PendingOperation<PlacementHandle> {
         let h = request.place(self.id.assigned(), id::alloc(), "p");
-        self.placements.insert(PlacementHandle {
-            id: h.id.clone(),
-            request: h.request.clone(),
-        });
+        // self.placements.insert(PlacementHandle {
+        //     id: h.id.clone(),
+        //     request: h.request.clone(),
+        // });
 
-        Ok(h)
-    }
-
-    // TODO:
-    pub fn placements(&self) -> Vec<PlacementHandle> {
-        for pl in &self.placements {}
-        todo!()
+        h
     }
 
     // TODO:
@@ -526,12 +548,14 @@ impl<F: Format> DynImage<F> {
 
     pub fn restore(&mut self) {}
 
-    pub fn delete(self) -> ImageRequest<F> {
-        Message::new()
-            .cd('a', "d")
-            .cd('i', self.id.assigned())
-            .send();
-        self.request
+    pub fn delete(self) -> PendingOperation<ImageRequest<F>> {
+        PendingOperation::new(
+            Message::new()
+                .cd('a', "d")
+                .cd('i', self.id.assigned())
+                .send(),
+            |_| self.request,
+        )
     }
 
     fn resolve_frame_selector(&self, selector: FrameSelector) -> usize {
@@ -543,14 +567,14 @@ impl<F: Format> DynImage<F> {
         }
     }
 
-    pub fn new_frame(&mut self, config: NewFrameRequest<F>) -> Res<FrameHandle> {
+    pub fn new_frame(&mut self, config: NewFrameRequest<F>) -> PendingOperation<FrameHandle> {
         let base_frame = config.from_frame;
         let idx = self.frames.len() + 2;
         let handle = config.create(
             self.id.assigned(),
             self.resolve_frame_selector(base_frame),
             idx,
-        )?;
+        );
 
         self.frames.insert(handle.clone(), idx);
         Ok(handle)
@@ -560,12 +584,12 @@ impl<F: Format> DynImage<F> {
         &self,
         handle: &FrameHandle,
         edit: FrameEdit<ComposeFromSelector, Upload<F>>,
-    ) -> Res<()> {
+    ) -> PendingOperation<()> {
         let Some(frame_idx) = self.frames.get(handle) else {
             todo!()
         };
 
-        match edit {
+        let reply = match edit {
             FrameEdit::Compose(ComposeFromSelector {
                 from_frame,
                 width,
@@ -612,20 +636,23 @@ impl<F: Format> DynImage<F> {
         }
         .send();
 
-        Ok(())
+        PendingOperation::new(reply, |_| ())
     }
 
-    pub fn display_last_frame(&self) {
-        self.display_frame(FrameSelector::Last);
+    pub fn display_last_frame(&self) -> PendingOperation<()> {
+        self.display_frame(FrameSelector::Last)
     }
 
     // TODO: Use selector, rename to just display
-    pub fn display_frame(&self, frame: FrameSelector) {
-        Message::new()
-            .cd('a', "a")
-            .cd('i', self.id.assigned())
-            .cd('c', self.resolve_frame_selector(frame))
-            .send();
+    pub fn display_frame(&self, frame: FrameSelector) -> PendingOperation<()> {
+        PendingOperation::new(
+            Message::new()
+                .cd('a', "a")
+                .cd('i', self.id.assigned())
+                .cd('c', self.resolve_frame_selector(frame))
+                .send(),
+            |_| (),
+        )
     }
 }
 
@@ -636,29 +663,25 @@ impl<F: Format> DynImage<F> {
 //     place: PlacementRequest,
 // }
 
-// /// Animation based on a single image
-// /// and with the single frame
-// ///
-// /// all changes are placed on the overlay.
-// ///
-// /// Updates are not atomics, but it doesn't create new frames.
-// pub struct ThinStreamer {
-//     img: ,
+/// Animation based on a single image
+/// and with the single frame
+///
+/// all changes are placed on the overlay.
+///
+/// Updates are not atomics, but it doesn't create new frames.
+// pub struct ThinStreamer<F: Format> {
+//     img: DynImage<F>,
 // }
 
 // impl ThinStreamer {
-//     pub fn new(base: ImageRequest) -> Self {
-//         todo!()
-//         // ThinStreamer {
-//         //     animation: base.transmit().into(),
-//         // }
-//     }
+//     // pub fn new(base: ImageRequest) -> Self {
+//     //     // ThinStreamer {
+//     //     //     animation: base.transmit().into(),
+//     //     // }
+//     // }
 
 //     pub fn update(&mut self, edit: FrameEdit<ComposeFromPrevious, Upload>) {
-//         self.animation
-//             .frame(FrameSelector::Previous)
-//             .unwrap()
-//             .edit(edit.into());
+//         self.img.edit_frame(todo!(), edit.into());
 //     }
 // }
 
@@ -720,8 +743,8 @@ impl<F: Format> NewFrameRequest<F> {
 
         // frame index that is given to the new frame
         new_frame_idx: FrameIdx,
-    ) -> Res<FrameHandle> {
-        Message::new()
+    ) -> PendingOperation<FrameHandle> {
+        let reply = Message::new()
             .cd('a', "f")
             .cd('i', base_image)
             .cd('c', from_frame_idx)
@@ -733,7 +756,7 @@ impl<F: Format> NewFrameRequest<F> {
             .payload(self.image.data)
             .send();
 
-        Ok(FrameHandle {
+        PendingOperation::new(reply, move |_| FrameHandle {
             base_image,
             index: new_frame_idx,
         })
@@ -820,16 +843,21 @@ pub struct PlacementRequest {
 }
 
 impl PlacementRequest {
-    pub fn place(self, image_id: Id, id: Id, action: &'static str) -> PlacementHandle {
-        self.exec_place(image_id, id, action);
-
-        PlacementHandle {
-            id: DynId::new(id),
-            request: Arc::new(self),
-        }
+    pub fn place(
+        self,
+        image_id: Id,
+        id: Id,
+        action: &'static str,
+    ) -> PendingOperation<PlacementHandle> {
+        PendingOperation::new(self.exec_place(image_id, id, action), move |_| {
+            PlacementHandle {
+                id: DynId::new(id),
+                request: Arc::new(self),
+            }
+        })
     }
 
-    pub fn exec_place(&self, image_id: Id, id: Id, action: &'static str) {
+    fn exec_place(&self, image_id: Id, id: Id, action: &'static str) -> ReplyFuture {
         Message::new() //
             .cd('a', action)
             .cd('i', image_id)
@@ -844,7 +872,7 @@ impl PlacementRequest {
             .cd_opt('w', self.width)
             .cd_opt('h', self.height)
             .cd_if(self.fix_cursor, 'C', 1)
-            .send();
+            .send()
     }
 
     // /// Adds attribute related cds
@@ -1001,14 +1029,14 @@ impl Message {
 
             self.payload(chunks.next().unwrap_or_default())
                 .cd_if(chunks.peek().is_some(), 'm', 1)
-                .send_raw();
+                .send_raw(false);
 
             while let Some(chunk) = chunks.next() {
                 Message::new()
                     .cd('m', if chunks.peek().is_some() { 1 } else { 0 })
                     .cd_if(is_frame_edit, 'a', "f")
                     .payload(chunk.to_vec())
-                    .send_raw();
+                    .send_raw(false);
             }
 
             drop(l)
@@ -1018,10 +1046,9 @@ impl Message {
         ReplyFuture::new(aident)
     }
 
-    fn send_raw(mut self) {
+    fn send_raw(mut self, no_reply: bool) {
         // TODO: Handle properly
-        // self = self.cd('q', 2);
-
+        self = self.cd_if(no_reply, 'q', 2);
         let cds = self
             .cds
             .iter()
