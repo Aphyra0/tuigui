@@ -78,11 +78,10 @@ pub trait Restorable: std::fmt::Debug {
 
 #[static_init::dynamic]
 static mut R: ReplyRouter = ReplyRouter {
-    last_marker: 1,
     ..Default::default()
 };
 
-type Marker = u16;
+type Marker = u32;
 
 struct PendingReady {
     pending: HashMap<ImgNumber, Waker>,
@@ -91,21 +90,11 @@ struct PendingReady {
 
 #[derive(Default)]
 struct ReplyRouter {
-    last_img: Id,
-    pending_transmissions: HashMap<ImgNumber, Waker>,
-    ready_transmissions: HashMap<ImgNumber, Message>,
     pending: HashMap<Marker, Waker>,
     ready: HashMap<Marker, Option<Message>>,
-    last_marker: Marker,
 }
 
 impl ReplyRouter {
-    fn next_marker(&mut self) -> Marker {
-        // TODO: track what if the next marker is anywhere in pending or ready.
-        self.last_marker = self.last_marker.wrapping_add(1).clamp(1, Marker::MAX);
-        self.last_marker
-    }
-
     fn start(stdin: impl std::io::Read + Send + 'static) -> JoinHandle<()> {
         std::thread::spawn(move || {
             let mut buf = BufReader::new(stdin)
@@ -115,30 +104,30 @@ impl ReplyRouter {
 
             let mut last = None;
             while let Some(reply) = Message::parse_next(&mut buf) {
-                if let Some(marker) = reply.get_from_key('i') {
-                    let marker = marker.parse().unwrap();
-                    if let Some(number) = reply.get_from_key('I') {
-                        let number = number.parse().unwrap();
-
-                        let mut r = R.write();
-                        if let Some(waker) = r.pending_transmissions.remove(&marker) {
-                            r.ready_transmissions.insert(number, reply);
-                            waker.wake();
-                            continue;
-                        }
-                    }
-                    // let ActionIdent::ImageId { id: marker } = reply.ident() else {
-                    //     unreachable!()
-                    // };
-
+                let iv = reply.get_from_key('i');
+                if let Some(marker) = &iv {
+                    let marker: u32 = marker.parse().unwrap();
                     let mut r = R.write();
+
                     if let Some(waker) = r.pending.remove(&marker) {
-                        r.ready_transmissions.insert(marker, last.take());
+                        let attached = last.take();
+                        eprintln!(
+                            "ROUTE marker={marker} payload={:?} attached_last={:?}",
+                            reply.payload.clone().map(|p| String::from_utf8(p)),
+                            attached.as_ref().map(|m: &Message| m.cds.clone()),
+                        );
+                        r.ready.insert(marker, attached);
                         waker.wake();
+                        id::free(marker);
                         continue;
                     }
                 }
 
+                eprintln!(
+                    "UNROUTED reply i={iv:?} cds={:?} payload={:?}",
+                    reply.cds,
+                    reply.payload.clone().map(|p| String::from_utf8(p)),
+                );
                 last = Some(reply);
             }
         })
@@ -163,30 +152,17 @@ impl From<Reply> for Result<Reply, TGPError> {
     }
 }
 
-pub struct PendingOperation<R> {
+pub struct PendingTransfer<F: Format> {
     reply: ReplyFuture,
-    returns: Option<Box<dyn FnOnce(Reply) -> R>>,
+    returns: Option<Box<dyn FnOnce(Reply) -> DynImage<F>>>,
 }
 
-impl<R> PendingOperation<R> {
-    fn new<C: FnOnce(Reply) -> R + 'static>(reply: ReplyFuture, returns: C) -> Self {
+impl<F: Format> PendingTransfer<F> {
+    fn new<C: FnOnce(Reply) -> DynImage<F> + 'static>(reply: ReplyFuture, returns: C) -> Self {
         Self {
             reply,
             returns: Some(Box::new(returns)),
         }
-    }
-
-    /// Unsafe-ish operation for performance.
-    /// Don't wait on the reply status and assume the status is OK,
-    /// Makes return value available immidiately, however introduces a risk of using illegal value.
-    /// Still returns a PendingOperation so one can retrospectively verify if the usage was legal.
-    ///
-    /// Since most terminals process graphics requests sequential, the race condition with two competing operations isn't possible.
-    /// The only failure mode is when the prior operation failed and the former ones depended on it
-    ///
-    /// NOTE: This crate doesn't work in terminals processing requests in non-FIFO manner.
-    pub fn assume_ok(self) -> (R, PendingOperation<()>) {
-        todo!()
     }
 }
 
@@ -202,8 +178,16 @@ enum ActionIdent {
 
 impl ReplyFuture {
     fn new(ident: ActionIdent) -> Self {
-        let mut r = R.write();
-        let marker = r.next_marker();
+        // TODO: fix this nonesense
+        let marker = id::alloc() + 99999;
+
+        // Register eagerly: the ack can arrive before the future is ever
+        // polled (sync() may not run until much later). Without this the
+        // router sees no pending marker and drops the ack on the floor.
+        //
+        // if router calls on noop waker before the future is awaited the wake is ignored,
+        // however the first poll on the future (from .await) will resolve to the ready
+        R.write().pending.insert(marker, Waker::noop().clone());
 
         // TODO: Probably move inside the .send
         // Send marker as well, marking everything received before that to this action.
@@ -223,8 +207,8 @@ impl ReplyFuture {
     }
 }
 
-impl<R: Unpin> Future for PendingOperation<R> {
-    type Output = Res<R>;
+impl<F: Unpin + Format> Future for PendingTransfer<F> {
+    type Output = Res<DynImage<F>>;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
@@ -248,11 +232,10 @@ impl Future for ReplyFuture {
     ) -> std::task::Poll<Self::Output> {
         let mut r = R.write();
 
-        if let Some(reply) = r.ready_transmissions.remove(&self.action_number) {
+        if let Some(reply) = r.ready.remove(&self.action_number) {
             return std::task::Poll::Ready(Reply { message: reply });
-        } else if !r.pending.contains_key(&self.action_number) {
-            r.pending.insert(self.action_number, cx.waker().clone());
         }
+        r.pending.insert(self.action_number, cx.waker().clone());
 
         std::task::Poll::Pending
     }
@@ -490,10 +473,10 @@ impl<F: Format + 'static> ImageRequest<F> {
     //     todo!()
     // }
 
-    pub fn transmit(self) -> PendingOperation<DynImage<F>> {
+    pub fn transmit(self) -> PendingTransfer<F> {
         let id = DynId::new(id::alloc());
 
-        PendingOperation::new(self.exec_transmit(id.assigned()), |r| {
+        PendingTransfer::new(self.exec_transmit(id.assigned()), |r| {
             let id: u32 = r
                 .message
                 .expect("reply with allocated i")
@@ -512,6 +495,7 @@ impl<F: Format + 'static> ImageRequest<F> {
                     slab.next();
                     slab
                 },
+                pending: vec![],
             }
         })
     }
@@ -535,6 +519,7 @@ pub struct DynImage<F: Format> {
     frames: HashMap<FrameHandle, FrameIdx>,
     request: ImageRequest<F>,
     pl_id_alloc: Slab<Id>,
+    pending: Vec<ReplyFuture>,
 }
 
 pub struct SyncData {
@@ -542,36 +527,53 @@ pub struct SyncData {
     took: Duration,
 }
 
-pub struct PendingWait {
-    image_num: ImgNumber,
+pub struct PendingSync<'a> {
+    pending: &'a mut Vec<ReplyFuture>,
 }
 
-impl Future for PendingWait {
-    type Output;
+impl<'a> Future for PendingSync<'a> {
+    type Output = Res<()>;
 
     fn poll(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        todo!()
+        use std::task::Poll::*;
+        let mut i = 0;
+        while i < self.pending.len() {
+            match pin!(&mut self.pending[i]).poll(cx) {
+                Ready(r) => {
+                    if let Err(e) = Into::into(r) {
+                        return Ready(Err(e));
+                    }
+                    self.pending.swap_remove(i); // resolved → remove; don't bump i
+                }
+                Pending => i += 1, // still in flight → keep, move on
+            }
+        }
+        Ready(Ok(()))
     }
 }
 
 impl<F: Format> DynImage<F> {
     /// Wait until all pending operations related to the image are done and their status collected
     /// In cases of errors, the first one is being returned
-    pub fn wait(&mut self) -> Res<SyncData> {
-        todo!()
+    pub fn sync<'a>(&'a mut self) -> PendingSync<'a> {
+        PendingSync {
+            pending: &mut self.pending,
+        }
     }
 
-    pub fn place(&mut self, request: PlacementRequest) -> PendingOperation<PlacementHandle> {
-        let h = request.place(self.id.assigned(), id::alloc(), "p");
-        // self.placements.insert(PlacementHandle {
-        //     id: h.id.clone(),
-        //     request: h.request.clone(),
-        // });
+    pub fn place(&mut self, request: PlacementRequest) -> PlacementHandle {
+        let (fut, handle) = request.place(self.id.assigned(), id::alloc(), "p");
+        self.placements.insert(PlacementHandle {
+            id: handle.id.clone(),
+            request: handle.request.clone(),
+        });
 
-        h
+        self.pending.push(fut);
+
+        handle
     }
 
     // TODO:
@@ -591,14 +593,11 @@ impl<F: Format> DynImage<F> {
 
     pub fn restore(&mut self) {}
 
-    pub fn delete(self) -> PendingOperation<ImageRequest<F>> {
-        PendingOperation::new(
-            Message::new()
-                .cd('a', "d")
-                .cd('i', self.id.assigned())
-                .send(),
-            |_| self.request,
-        )
+    pub fn delete(self) {
+        Message::new()
+            .cd('a', "d")
+            .cd('i', self.id.assigned())
+            .send();
     }
 
     fn resolve_frame_selector(&self, selector: FrameSelector) -> usize {
@@ -610,24 +609,28 @@ impl<F: Format> DynImage<F> {
         }
     }
 
-    pub fn new_frame(&mut self, config: NewFrameRequest<F>) -> PendingOperation<FrameHandle> {
+    pub fn new_frame(&mut self, config: NewFrameRequest<F>) -> FrameHandle {
         let base_frame = config.from_frame;
         let idx = self.frames.len() + 2;
-        let handle = config.create(
-            self.id.assigned(),
-            self.resolve_frame_selector(base_frame),
-            idx,
-        );
+        // First frame: no base canvas (c=0/absent — the frame IS the content).
+        // Later frames: compose on top of the last existing frame.
+        let base_idx = if self.frames.is_empty() {
+            0
+        } else {
+            self.resolve_frame_selector(base_frame)
+        };
+        let (handle, fut) = config.create(self.id.assigned(), base_idx, idx);
 
         self.frames.insert(handle.clone(), idx);
-        Ok(handle)
+        self.pending.push(fut);
+        handle
     }
 
     pub fn edit_frame(
-        &self,
+        &mut self,
         handle: &FrameHandle,
         edit: FrameEdit<ComposeFromSelector, Upload<F>>,
-    ) -> PendingOperation<()> {
+    ) {
         let Some(frame_idx) = self.frames.get(handle) else {
             todo!()
         };
@@ -644,10 +647,10 @@ impl<F: Format> DynImage<F> {
                 .cd('a', "c")
                 // image context
                 .cd('i', self.id.assigned())
-                // source frame
-                .cd('r', self.resolve_frame_selector(from_frame))
-                // destination frame
-                .cd('c', frame_idx)
+                // source frame (base canvas) — spec: c = base data
+                .cd('c', self.resolve_frame_selector(from_frame))
+                // destination frame being edited — spec: r = edited frame
+                .cd('r', frame_idx)
                 // size
                 .cd('w', width)
                 .cd('h', height)
@@ -679,23 +682,23 @@ impl<F: Format> DynImage<F> {
         }
         .send();
 
-        PendingOperation::new(reply, |_| ())
+        self.pending.push(reply);
+        // PendingTransfer::new(reply, |_| ())
     }
 
-    pub fn display_last_frame(&self) -> PendingOperation<()> {
+    pub fn display_last_frame(&mut self) {
         self.display_frame(FrameSelector::Last)
     }
 
     // TODO: Use selector, rename to just display
-    pub fn display_frame(&self, frame: FrameSelector) -> PendingOperation<()> {
-        PendingOperation::new(
-            Message::new()
-                .cd('a', "a")
-                .cd('i', self.id.assigned())
-                .cd('c', self.resolve_frame_selector(frame))
-                .send(),
-            |_| (),
-        )
+    pub fn display_frame(&mut self, frame: FrameSelector) {
+        let reply = Message::new()
+            .cd('a', "a")
+            .cd('i', self.id.assigned())
+            .cd('c', self.resolve_frame_selector(frame))
+            .send();
+
+        self.pending.push(reply);
     }
 }
 
@@ -786,11 +789,11 @@ impl<F: Format> NewFrameRequest<F> {
 
         // frame index that is given to the new frame
         new_frame_idx: FrameIdx,
-    ) -> PendingOperation<FrameHandle> {
+    ) -> (FrameHandle, ReplyFuture) {
         let reply = Message::new()
             .cd('a', "f")
             .cd('i', base_image)
-            .cd('c', from_frame_idx)
+            .cd_if(from_frame_idx > 0, 'c', from_frame_idx)
             .cd_opt('s', self.width)
             .cd_opt('v', self.height)
             .cd_opt('x', self.x)
@@ -799,10 +802,13 @@ impl<F: Format> NewFrameRequest<F> {
             .payload(self.image.data)
             .send();
 
-        PendingOperation::new(reply, move |_| FrameHandle {
-            base_image,
-            index: new_frame_idx,
-        })
+        (
+            FrameHandle {
+                base_image,
+                index: new_frame_idx,
+            },
+            reply,
+        )
     }
 }
 
@@ -891,13 +897,14 @@ impl PlacementRequest {
         image_id: Id,
         id: Id,
         action: &'static str,
-    ) -> PendingOperation<PlacementHandle> {
-        PendingOperation::new(self.exec_place(image_id, id, action), move |_| {
+    ) -> (ReplyFuture, PlacementHandle) {
+        (
+            self.exec_place(image_id, id, action),
             PlacementHandle {
                 id: DynId::new(id),
                 request: Arc::new(self),
-            }
-        })
+            },
+        )
     }
 
     fn exec_place(&self, image_id: Id, id: Id, action: &'static str) -> ReplyFuture {
@@ -1100,6 +1107,10 @@ impl Message {
             .join(",");
 
         let payload = String::from_utf8(self.payload.unwrap()).unwrap();
+        if cds.contains("m=0") {
+            let tail = &payload[payload.len().saturating_sub(8)..];
+            eprintln!("CHUNK-TAIL cds={cds} len={} tail={tail:?}", payload.len());
+        }
         print!("\x1b_G{cds};{payload}\x1b\\");
         std::io::stdout().flush().unwrap();
     }

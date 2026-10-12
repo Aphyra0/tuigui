@@ -49,18 +49,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let imgreq = c.new_png(imgbuf).unwrap();
 
         if let Some(dimg) = dimg.as_mut() {
-            dimg.new_frame(easytgp::NewFrameRequest {
+            dbg!("before sync");
+            dimg.sync().await.unwrap();
+            dbg!("after sync");
+
+            let handle = dimg.new_frame(easytgp::NewFrameRequest {
                 image: imgreq,
                 ..Default::default()
-            })
-            .unwrap();
+            });
             dimg.display_last_frame();
         } else {
             let mut img = imgreq.transmit().await?;
             dbg!("img");
-            img.place(easytgp::PlacementRequest {
+            let pl = img.place(easytgp::PlacementRequest {
                 // image: Some(img.clone()),
-                cols: Some(100),
+                cols: Some(40),
                 fix_cursor: true,
                 // width: Some(dbg!(10 as u32)),
                 // height: Some(dbg!(10 as u32)),
@@ -69,9 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // rows: Some(10),
                 // width: Some(140),
                 ..Default::default()
-            })
-            .await
-            .unwrap();
+            });
 
             dimg = Some(img.into());
             // break;
@@ -114,33 +115,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let img = TermImage::new(easytgp::Format::PNG, png_bytes);
     // img.display();
     //
-    // 
+    //
 
     Ok(())
 }
 
-/** 
+// // Image is a future that can be awaited, but it also already avail, it's almost certainly safe to assume it's correct.
+// let img: DynImage = c.new()?.await;
+// let pl: PendingPlacement = img.place()?;
 
-// Image is a future that can be awaited, but it also already avail, it's almost certainly safe to assume it's correct.
-let img: DynImage = c.new()?.await;
-let pl: PendingPlacement = img.place()?;
+// let f: PendingFrame = img.new_frame()?;
+// let e: PendingEdit = f.edit()?;
 
+// let mut img = c.new().transmit()?;
 
-let f: PendingFrame = img.new_frame()?;
-let e: PendingEdit = f.edit()?;
+// loop {
+//     match img.ready().await {
+//         Err::Evicted(restorable) => {restorable.restore() } // or custom logic for animations, or whatever you want
+//         Err::Unknown(e) => panic!(e)
+//     }
 
+//     img.place()?;
 
-let mut img = c.new().transmit()?;
+//     ...
+// }
 
-loop {
-    match img.ready().await {
-        Err::Evicted(restorable) => {restorable.restore() } // or custom logic for animations, or whatever you want
-        Err::Unknown(e) => panic!(e)
-    }
-
-    img.place()?;
-
-    ...
-}
-
-**/
+// **/
