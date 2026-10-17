@@ -5,7 +5,7 @@ members = [
     "crates/gobo-comp",
     "crates/gobo-widget",
     "crates/easytgp",
-    "crates/gobo-tgp-renderer",
+    "crates/gobo-renderer",
 ]
 
 [workspace.package]
@@ -23,6 +23,14 @@ base64-turbo = "0.5"
 itertools = "0.15"
 idalloc = "0.1"
 static_init = "1.0"
+yscv-video = "0.2"
+ffmpeg-sidecar = "2"
+rstar = "0.13"
+rayon = "1"
+ndarray = "0.16"
+ratatui = "0.30"
+pollster = "0.4"
+fxhash = "0.2"
 crossterm = { version = "0.28", default-features = false }
 derive_deref = "1.1"
 derive-getters = "0.5"
@@ -32,7 +40,7 @@ gobo-core = { path = "crates/gobo-core" }
 gobo-comp = { path = "crates/gobo-comp" }
 gobo-widget = { path = "crates/gobo-widget" }
 easytgp = { path = "crates/easytgp" }
-gobo-tgp-renderer = { path = "crates/gobo-tgp-renderer" }
+gobo-renderer = { path = "crates/gobo-renderer" }
 
 [package]
 name = "gobo"
@@ -50,4 +58,4 @@ gobo-core = { workspace = true }
 gobo-comp = { workspace = true }
 gobo-widget = { workspace = true }
 easytgp = { workspace = true }
-gobo-tgp-renderer = { workspace = true }
+gobo-renderer = { workspace = true }

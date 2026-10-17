@@ -26,6 +26,9 @@ use itertools::Itertools;
 // TODO: Compression
 // TODO: User-implemented full-recovery crate
 // TODO: Notifications of the bottleneck.
+// TODO: Better api to create fast placements
+// TODO: Edit images
+// TODO: Unicode placeholders
 
 mod id {
     use crate::Id;
@@ -39,7 +42,7 @@ mod id {
         let mut t = rustix::termios::tcgetattr(std::io::stdin()).unwrap(); // any tty fd works: 0=stdin
 
         // // disable echo only (leave everything else)
-        // t.local_modes.remove(rustix::termios::LocalModes::ECHO);
+        t.local_modes.remove(rustix::termios::LocalModes::ECHO);
         t.local_modes.remove(rustix::termios::LocalModes::ICANON);
 
         // // COMMIT — write it back to the fd (this is the missing line)
@@ -69,6 +72,61 @@ mod id {
     pub(crate) fn free(id: Id) {
         I.write().free(id);
     }
+}
+
+/// Dedicated TGP writer: consumes fully-formed escape sequences off a channel
+/// and writes + flushes them to stdout. Keeping this off the calling thread
+/// means the pty-write stall (terminal decoding slower than we produce) can't
+/// block frame encoding/comparison — the two overlap. One thread + one channel
+/// preserves FIFO order, which kitty needs for its single-loading-slot rule.
+mod writer {
+    use static_init::dynamic;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc::{self, Sender};
+
+    /// Escape sequences produced but not yet flushed to the pty. Rising =
+    /// the terminal can't keep up and the queue is piling up.
+    pub(crate) static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+
+    #[dynamic]
+    static mut W_TX: Sender<Vec<u8>> = {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut out = std::io::stdout();
+            loop {
+                // Block for the first escape, then drain whatever else is
+                // queued in the same batch. One write_all + one flush per
+                // batch instead of per escape: fewer syscalls, and nothing
+                // can pile up behind a flush mid-frame.
+                let first = match rx.recv() {
+                    Ok(m) => m,
+                    Err(_) => break, // channel disconnected, all senders dropped
+                };
+                out.write_all(&first).expect("tgp write");
+                IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+                while let Ok(more) = rx.try_recv() {
+                    out.write_all(&more).expect("tgp write");
+                    IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+                }
+                out.flush().expect("tgp flush");
+            }
+        });
+        tx
+    };
+
+    pub(crate) fn send(bytes: Vec<u8>) {
+        let tx = W_TX.write();
+        IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        tx.send(bytes).expect("tgp writer thread died");
+        drop(tx);
+    }
+}
+
+/// Number of escape sequences produced but not yet flushed to the pty.
+/// Rising values mean the terminal is decoding slower than we produce.
+pub fn writer_in_flight() -> u64 {
+    writer::IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub trait Restorable: std::fmt::Debug {
@@ -111,23 +169,12 @@ impl ReplyRouter {
 
                     if let Some(waker) = r.pending.remove(&marker) {
                         let attached = last.take();
-                        eprintln!(
-                            "ROUTE marker={marker} payload={:?} attached_last={:?}",
-                            reply.payload.clone().map(|p| String::from_utf8(p)),
-                            attached.as_ref().map(|m: &Message| m.cds.clone()),
-                        );
                         r.ready.insert(marker, attached);
                         waker.wake();
                         id::free(marker);
                         continue;
                     }
                 }
-
-                eprintln!(
-                    "UNROUTED reply i={iv:?} cds={:?} payload={:?}",
-                    reply.cds,
-                    reply.payload.clone().map(|p| String::from_utf8(p)),
-                );
                 last = Some(reply);
             }
         })
@@ -166,11 +213,13 @@ impl<F: Format> PendingTransfer<F> {
     }
 }
 
+#[derive(Debug)]
 pub struct ReplyFuture {
     ident: ActionIdent,
     action_number: Marker,
 }
 
+#[derive(Debug)]
 enum ActionIdent {
     ImageNumber { number: usize },
     ImageId { id: Id },
@@ -527,6 +576,7 @@ pub struct SyncData {
     took: Duration,
 }
 
+#[derive(Debug)]
 pub struct PendingSync<'a> {
     pending: &'a mut Vec<ReplyFuture>,
 }
@@ -540,6 +590,7 @@ impl<'a> Future for PendingSync<'a> {
     ) -> std::task::Poll<Self::Output> {
         use std::task::Poll::*;
         let mut i = 0;
+        let mut still_pending = false;
         while i < self.pending.len() {
             match pin!(&mut self.pending[i]).poll(cx) {
                 Ready(r) => {
@@ -548,10 +599,23 @@ impl<'a> Future for PendingSync<'a> {
                     }
                     self.pending.swap_remove(i); // resolved → remove; don't bump i
                 }
-                Pending => i += 1, // still in flight → keep, move on
+                Pending => {
+                    // Still in flight: the inner future has registered our
+                    // waker, so the router will re-poll us when it's done.
+                    // Remember and keep it.
+                    still_pending = true;
+                    i += 1;
+                }
             }
         }
-        Ready(Ok(()))
+        // True backpressure: only resolve once every op has been acked.
+        // Otherwise we produce frames faster than the terminal can apply
+        // them and the pipe floods.
+        if still_pending {
+            Pending
+        } else {
+            Ready(Ok(()))
+        }
     }
 }
 
@@ -678,7 +742,7 @@ impl<F: Format> DynImage<F> {
                 .cd_opt('x', x)
                 .cd_opt('y', y)
                 .push_cd(image.format.to_cd())
-                .payload(base64_turbo::STANDARD.encode(image.data.as_slice())),
+                .payload(image.data.as_slice()),
         }
         .send();
 
@@ -845,11 +909,11 @@ pub struct ComposeFromPrevious {
 }
 
 pub struct Upload<F: Format> {
-    x: Option<u32>,
-    y: Option<u32>,
-    width: Option<u32>,
-    height: Option<u32>,
-    image: ImageRequest<F>,
+    pub x: Option<u32>,
+    pub y: Option<u32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub image: ImageRequest<F>,
 }
 
 // impl<U> From<FrameEdit<ComposeFromPrevious, U>> for FrameEdit<ComposeFromSelector, U> {
@@ -1062,7 +1126,7 @@ impl Message {
     // TODO: implement chunking
     /// execute the command
     pub fn send(mut self) -> ReplyFuture {
-        const CHUNK_SIZE: usize = 4 * 1024;
+        const CHUNK_SIZE: usize = 16 * 1024;
         const LOCK: Mutex<()> = Mutex::new(());
 
         // TODO: might be missed because of mismatching spaces
@@ -1107,12 +1171,18 @@ impl Message {
             .join(",");
 
         let payload = String::from_utf8(self.payload.unwrap()).unwrap();
-        if cds.contains("m=0") {
-            let tail = &payload[payload.len().saturating_sub(8)..];
-            eprintln!("CHUNK-TAIL cds={cds} len={} tail={tail:?}", payload.len());
-        }
-        print!("\x1b_G{cds};{payload}\x1b\\");
-        std::io::stdout().flush().unwrap();
+        // writer::send(format!("\x1b_G{cds};{payload}\x1b\\").into_bytes());
+        let mut out = std::io::stdout();
+        out.write(
+            format!("\x1b_G{cds};{payload}\x1b\\")
+                .into_bytes()
+                .as_slice(),
+        )
+        .unwrap();
+        out.flush().unwrap();
+
+        // println!("\x1b_G{cds};{payload}\x1b\\");
+        // std::io::stdout().flush().unwrap();
     }
 }
 

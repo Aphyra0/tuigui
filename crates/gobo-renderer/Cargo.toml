@@ -1,0 +1,22 @@
+[package]
+name = "gobo-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Renders TGP frames into a terminal backend"
+
+[dependencies]
+gobo-core = { workspace = true }
+easytgp = { workspace = true }
+yscv-video = { workspace = true }
+ffmpeg-sidecar = { workspace = true }
+rstar = { workspace = true }
+image = { workspace = true }
+rustix = { workspace = true }
+rayon = { workspace = true }
+ndarray = { workspace = true }
+ratatui = { workspace = true }
+pollster = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

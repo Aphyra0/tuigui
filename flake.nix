@@ -108,6 +108,9 @@
               # links against: pixman renderer + xkbcommon keymaps
               pixman
               libxkbcommon
+              # decoder backend for the renderer: ffmpeg-sidecar spawns the
+              # ffmpeg CLI, so it must be on PATH at build/run time
+              ffmpeg
             ];
 
             meta = with pkgs.lib; {
