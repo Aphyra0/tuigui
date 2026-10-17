@@ -7,3 +7,4 @@ description = "In-process headless Wayland compositor for capture and input inje
 
 [dependencies]
 gobo-core = { workspace = true }
+gobo-renderer = { workspace = true }

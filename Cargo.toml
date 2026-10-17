@@ -19,6 +19,7 @@ derive_builder = "0.20"
 rustix = { version = "1.1", features = ["fs", "termios", "process"] }
 png = "0.18"
 image = "0.25"
+fast_image_resize = { version = "6", features = ["rayon"] }
 base64-turbo = "0.5"
 itertools = "0.15"
 idalloc = "0.1"

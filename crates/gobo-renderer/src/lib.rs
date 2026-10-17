@@ -18,8 +18,13 @@ use easytgp::{
     Controller, DynImage, FrameEdit, FrameHandle, FrameSelector, ImageRequest, NewFrameRequest,
     Upload,
 };
-use image::{GenericImageView, RgbImage};
+use fast_image_resize::Resizer;
+use image::GenericImageView;
 use ndarray::{Array2, Array3, ArrayBase};
+
+/// The frame type handed out by [`Streamer`], re-exported so implementors
+/// don't need to depend on `image` themselves.
+pub use image::RgbImage;
 use pollster::block_on;
 use ratatui::layout::Position;
 use ratatui::widgets::StatefulWidget;
@@ -35,13 +40,6 @@ use ratatui::{
 pub trait Streamer: Send {
     /// Full-resolution next frame.
     fn next_frame(&mut self) -> Option<RgbImage>;
-
-    /// Ask for downscaled frames at `w`x`h` (a second ffmpeg process). Respawns
-    /// the scaler only when the target size changes.
-    fn set_preview_size(&mut self, w: u32, h: u32);
-
-    /// Next downscaled frame at the size previously requested.
-    fn next_preview(&mut self) -> Option<RgbImage>;
 }
 
 /// Per-frame timings, in milliseconds, split by stage.
@@ -107,32 +105,22 @@ pub fn redirect_stderr(path: &std::path::Path) -> std::io::Result<()> {
 type FrameIter = Box<dyn Iterator<Item = ffmpeg_sidecar::event::OutputVideoFrame> + Send>;
 
 pub struct Mp4Stream {
-    path: PathBuf,
     frames: FrameIter,
-    preview: Option<FrameIter>,
-    preview_size: Option<(u32, u32)>,
 }
 
 impl Mp4Stream {
     pub fn from_path(path: PathBuf) -> Self {
         Self {
-            frames: spawn_raw(&path, None),
-            path,
-            preview: None,
-            preview_size: None,
+            frames: spawn_raw(&path),
         }
     }
 }
 
-fn spawn_raw(path: &std::path::Path, scale: Option<(u32, u32)>) -> FrameIter {
+fn spawn_raw(path: &std::path::Path) -> FrameIter {
     use ffmpeg_sidecar::command::FfmpegCommand;
 
     let mut cmd = FfmpegCommand::new();
     cmd.input(path.as_os_str());
-    if let Some((w, h)) = scale {
-        // FFmpeg does the downscale (its own threads) and hands back rgb24.
-        cmd.args(["-vf", &format!("scale={w}:{h}")]);
-    }
     let frames = cmd
         .rawvideo()
         .spawn()
@@ -148,18 +136,36 @@ impl Streamer for Mp4Stream {
         let frame = self.frames.next()?;
         image::RgbImage::from_raw(frame.width, frame.height, frame.data)
     }
+}
 
-    fn set_preview_size(&mut self, w: u32, h: u32) {
-        if self.preview_size == Some((w, h)) {
-            return;
+/// SIMD + rayon downscaler for the ▀ preview grid. Kept across frames so the
+/// resizer's filter kernels and the destination buffer are reused; the buffer
+/// is only reallocated when the source or destination size changes.
+pub struct Scaler {
+    resizer: Resizer,
+    dst: RgbImage,
+    src_size: (u32, u32),
+}
+
+impl Scaler {
+    fn new() -> Self {
+        Self {
+            resizer: Resizer::new(),
+            dst: RgbImage::new(1, 1),
+            src_size: (0, 0),
         }
-        self.preview_size = Some((w, h));
-        self.preview = Some(spawn_raw(&self.path, Some((w, h))));
     }
 
-    fn next_preview(&mut self) -> Option<RgbImage> {
-        let frame = self.preview.as_mut()?.next()?;
-        image::RgbImage::from_raw(frame.width, frame.height, frame.data)
+    /// Downscale `src` to `cols` x `rows * 2` pixels and return the result.
+    pub fn scale(&mut self, src: &RgbImage, cols: u32, rows: u32) -> &RgbImage {
+        let src_size = (src.width(), src.height());
+        let dst_size = (cols, rows * 2);
+        if self.dst.dimensions() != dst_size || src_size != self.src_size {
+            self.dst = RgbImage::new(dst_size.0, dst_size.1);
+            self.src_size = src_size;
+        }
+        self.resizer.resize(src, &mut self.dst, None).unwrap();
+        &self.dst
     }
 }
 
@@ -185,6 +191,8 @@ enum InnerState {
         tiles: ndarray::Array2<Tile>,
         /// Previous full-res frame, for change detection.
         prev_frame: RgbImage,
+        /// Downscaler for the ▀ preview grid.
+        scaler: Scaler,
         image: DynImage<easytgp::Png>,
         frame: FrameHandle,
         c: Arc<Controller>,
@@ -290,6 +298,7 @@ impl StatefulWidget for TgpRendererWidget {
                     shape,
                     tiles: Array2::default(shape),
                     prev_frame: RgbImage::new(width_px, height_px),
+                    scaler: Scaler::new(),
                     frame: image.new_frame(NewFrameRequest {
                         from_frame: FrameSelector::Last,
                         image: request,
@@ -307,6 +316,7 @@ impl StatefulWidget for TgpRendererWidget {
                 shape,
                 tiles,
                 prev_frame,
+                scaler,
                 image,
                 frame,
                 c,
@@ -314,36 +324,33 @@ impl StatefulWidget for TgpRendererWidget {
                 // Decode the next frame on a worker thread so it overlaps the
                 // sync wait below.
                 let shape_cols = shape.0 as u32;
-                let (next_frame, downscaled, decode, decode_preview) =
-                    std::thread::scope(|scope| {
-                        let stream = &mut state.stream;
-                        let h = scope.spawn(move || {
-                            // Full-res frame (TGP final tiles).
-                            let t = std::time::Instant::now();
-                            let full = stream.next_frame().unwrap();
-                            let decode = t.elapsed();
-
-                            // Downscaled frame (▀ preview cells), produced by a
-                            // second ffmpeg process. Still blocks us, so time it
-                            // separately as `scl`.
-                            let w = (area.width as u32 / shape_cols) * shape_cols;
-                            let hh = (w as f32 * (full.height() as f32 / full.width() as f32))
-                                as u32
-                                / 2;
-                            stream.set_preview_size(w, hh * 2);
-                            let t = std::time::Instant::now();
-                            let preview = stream.next_preview().unwrap();
-                            (full, preview, decode, t.elapsed())
-                        });
-
+                let (next_frame, decode) = std::thread::scope(|scope| {
+                    let stream = &mut state.stream;
+                    let h = scope.spawn(move || {
                         let t = std::time::Instant::now();
-                        block_on(image.sync()).unwrap();
-                        state.stats.sync = t.elapsed();
-
-                        h.join().unwrap()
+                        let full = stream.next_frame().unwrap();
+                        (full, t.elapsed())
                     });
+
+                    let t = std::time::Instant::now();
+                    block_on(image.sync()).unwrap();
+                    state.stats.sync = t.elapsed();
+
+                    h.join().unwrap()
+                });
                 state.stats.decode = decode;
-                state.stats.scale = decode_preview;
+
+                // Downscale for the ▀ cell grid. The box is the widget area
+                // rounded down to whole tiles, with an even pixel height so
+                // every cell gets an upper and a lower pixel.
+                let w = (area.width as u32 / shape_cols) * shape_cols;
+                let rows = (w as f32 * (next_frame.height() as f32 / next_frame.width() as f32))
+                    as u32
+                    / 2;
+                let t = std::time::Instant::now();
+                let downscaled = scaler.scale(&next_frame, w, rows);
+                state.stats.scale = t.elapsed();
+
                 let (width_px, height_px) = (next_frame.width(), next_frame.height());
                 let (width_u, height_half_u) = (downscaled.width(), downscaled.height() / 2);
                 let (tile_width_u, tile_half_height_u) =

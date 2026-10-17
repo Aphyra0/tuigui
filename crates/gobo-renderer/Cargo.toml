@@ -12,6 +12,7 @@ yscv-video = { workspace = true }
 ffmpeg-sidecar = { workspace = true }
 rstar = { workspace = true }
 image = { workspace = true }
+fast_image_resize = { workspace = true }
 rustix = { workspace = true }
 rayon = { workspace = true }
 ndarray = { workspace = true }
