@@ -19,10 +19,10 @@ crossterm = { workspace = true }
 derive_deref = { workspace = true }
 derive-getters = { workspace = true }
 thiserror = { workspace = true }
-yscv-video = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+ffmpeg-sidecar = { workspace = true }
 
 [[example]]
 name = "image"

@@ -337,7 +337,34 @@ impl Controller {
             format,
             data: base64_turbo::STANDARD.encode(bytes).into_bytes(),
             size,
+            shm: None,
         }
+    }
+
+    /// Stage packed RGB pixels in a shared memory object and return a request
+    /// that transmits them with the `t=s` medium.
+    ///
+    /// The object is filled once and the wire command carries only its name, so
+    /// no image bytes are base64-encoded or compressed. Compare
+    /// [`Controller::new_rgb`], which encodes and inlines every pixel.
+    ///
+    /// Only use this when the terminal shares this machine's memory: across a
+    /// network the object is on the wrong side of the connection. The terminal
+    /// is expected to unlink the object once it has read it; the frame is held
+    /// by the request until then.
+    pub fn new_shm_rgb(&self, image: image::RgbImage) -> Res<ImageRequest<Shm>> {
+        let size = ImageSize {
+            width: image.width(),
+            height: image.height(),
+        };
+        let frame = Arc::new(ShmFrame::create(&image.into_vec())?);
+        Ok(ImageRequest {
+            format: Shm,
+            // The payload for this medium is the object's name, not pixels.
+            data: frame.payload(),
+            size: Some(size),
+            shm: Some(frame),
+        })
     }
 
     // TODO: route errors here.
@@ -447,12 +474,36 @@ pub struct ImageRequest<F: Format> {
     size: Option<ImageSize>,
     // Encoded in base64
     data: Vec<u8>,
+    /// The shared memory object backing `data` when the medium is `t=s`.
+    ///
+    /// Held here rather than in the caller so it lives exactly as long as the
+    /// image does: the terminal reads it when it parses the escapes, and the
+    /// protocol has the terminal unlink what it reads.
+    shm: Option<Arc<ShmFrame>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ImageSize {
     pub width: u32,
     pub height: u32,
+}
+
+/// The `s`/`v` a frame command must carry, given whatever the caller supplied.
+///
+/// A frame with a raw format is sized from these values by the terminal, which
+/// computes the payload length as `width * height * bytes_per_pixel` and rejects
+/// a zero-sized frame outright. An explicit request wins; otherwise the image
+/// knows its own size, and falling back to it is what makes a caller that passes
+/// `..Default::default()` work.
+fn resolve_dims(
+    requested: Option<u32>,
+    requested_other: Option<u32>,
+    image: Option<ImageSize>,
+) -> (Option<u32>, Option<u32>) {
+    (
+        requested.or(image.map(|s| s.width)),
+        requested_other.or(image.map(|s| s.height)),
+    )
 }
 
 // #[derive(Clone, Copy, Debug, Default)]
@@ -479,6 +530,35 @@ pub struct ImageSize {
 
 trait Format: Copy + Clone + Default + 'static {
     fn to_cd(self) -> ControlData;
+
+    /// The wire byte for the protocol's `t` key: the transmission medium.
+    ///
+    /// Direct sends the pixel data inline in the escape. Shared memory (`s`)
+    /// sends only an object *name*, and the terminal maps the pixels out of it.
+    /// A parser that does not recognize a value treats it as direct.
+    fn medium(self) -> &'static str {
+        "d"
+    }
+
+    /// Whether `data` is payload bytes rather than an object name.
+    ///
+    /// Chunking only makes sense for inline payloads; a local medium is a single
+    /// command naming an object, so it must never be split across `m=1` chunks.
+    fn is_inline(self) -> bool {
+        true
+    }
+
+    /// Whether a transmitted frame must state its pixel dimensions.
+    ///
+    /// The terminal sizes a raw frame's payload as
+    /// `width * height * bytes_per_pixel`, and reports "Zero width/height not
+    /// allowed" when those are absent. PNG instead carries its own size in its
+    /// header, so declaring one is pointless there — and actively harmful: the
+    /// declared size is still checked against the image, so a stale value would
+    /// be rejected where omitting it was fine.
+    fn needs_dimensions(self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -486,6 +566,10 @@ pub struct Png;
 impl Format for Png {
     fn to_cd(self) -> ControlData {
         ControlData('f', 100.to_string())
+    }
+    /// A PNG describes its own dimensions, so none are declared.
+    fn needs_dimensions(self) -> bool {
+        false
     }
 }
 
@@ -504,6 +588,114 @@ impl Format for Rgba {
         ControlData('f', 32.to_string())
     }
 }
+
+/// RGB pixels delivered through a POSIX shared memory object (`t=s`).
+///
+/// The payload is the base64 of the object's *name*, not of the pixels: the
+/// terminal opens the name, maps it, reads, and then unlinks it. That is the
+/// point of the medium — no base64 of the image and no compression, so a frame
+/// costs one pass over the pixels instead of two passes and a third more bytes.
+///
+/// Only meaningful when the terminal is on this machine; across a network the
+/// object would be on the wrong side of the connection.
+#[derive(Clone, Copy, Default)]
+pub struct Shm;
+impl Format for Shm {
+    fn to_cd(self) -> ControlData {
+        ControlData('f', 24.to_string())
+    }
+    fn medium(self) -> &'static str {
+        "s"
+    }
+    fn is_inline(self) -> bool {
+        false
+    }
+}
+
+/// A POSIX shared memory object holding one image's pixels.
+///
+/// On Linux a POSIX shared memory object *is* a file under `/dev/shm`:
+/// `shm_open("/name", …)` is `open("/dev/shm/name", …)`. Plain file I/O at that
+/// path therefore produces an object the terminal's own `shm_open` resolves,
+/// which avoids needing a libc binding here for a single syscall.
+///
+/// *Lifetime:* the specification makes the terminal responsible for unlinking
+/// an object once it has read it, so this must outlive the transmit call and
+/// must not unlink eagerly — racing the emulator to the name loses silently,
+/// because the replies that would report it are suppressed. [`Drop`] removes
+/// any name still present, which covers both a terminal that never read it and
+/// a process that is going away.
+pub struct ShmFrame {
+    /// The name as the protocol wants it: a leading `/`, no other `/`.
+    name: String,
+    path: std::path::PathBuf,
+}
+
+impl ShmFrame {
+    /// Create an object of `len` bytes and fill it with `data`.
+    ///
+    /// Fails on a platform with no `/dev/shm`, or when the name is already
+    /// taken (a stale object from a dead process whose pid was reused).
+    pub fn create(data: &[u8]) -> Res<Self> {
+        let dir = std::path::Path::new(SHM_DIR);
+        if !dir.is_dir() {
+            return Err(TGPError::Shm(format!(
+                "{SHM_DIR} is not available; the shared memory medium needs a POSIX shm filesystem"
+            )));
+        }
+        // Names must fit the platform's limit (macOS caps them at 31 bytes
+        // including the slash) and must contain no `/` after the first.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("/easytgp{:x}-{:x}", std::process::id(), serial);
+        let path = dir.join(name.trim_start_matches('/'));
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| TGPError::Shm(format!("creating {}: {e}", path.display())))?;
+        file.set_len(data.len() as u64)
+            .and_then(|()| {
+                use std::io::{Seek as _, Write as _};
+                file.rewind()?;
+                file.write_all(data)
+            })
+            .map_err(|e| {
+                // Never leave a partial object behind under a fresh name.
+                let _ = std::fs::remove_file(&path);
+                TGPError::Shm(format!("writing {}: {e}", path.display()))
+            })?;
+        Ok(Self { name, path })
+    }
+
+    /// The object's name, as the `t=s` payload is base64 of.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The base64 payload this medium carries in place of pixel data.
+    fn payload(&self) -> Vec<u8> {
+        base64_turbo::STANDARD.encode(self.name.as_bytes()).into_bytes()
+    }
+}
+
+impl std::fmt::Debug for ShmFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShmFrame").field("name", &self.name).finish()
+    }
+}
+
+impl Drop for ShmFrame {
+    fn drop(&mut self) {
+        // The terminal normally got there first, in which case this is a no-op.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Where Linux keeps POSIX shared memory objects.
+const SHM_DIR: &str = "/dev/shm";
 
 pub trait AnyFormat: image::Pixel<Subpixel = u8> + image::PixelWithColorType {}
 impl AnyFormat for image::Rgb<u8> {}
@@ -544,20 +736,26 @@ impl<F: Format + 'static> ImageRequest<F> {
                     slab.next();
                     slab
                 },
+                frame_shm: vec![],
                 pending: vec![],
             }
         })
     }
 
     fn exec_transmit(&self, id: Id) -> ReplyFuture {
+        // The `t` key must precede the payload: for a shared memory medium the
+        // payload is an object name, not pixels.
+        let medium = self.format.medium();
+        let inline = self.format.is_inline();
         Message::new()
             .cd('I', id)
             .cd_opt('s', self.size.map(|s| s.width))
             .cd_opt('v', self.size.map(|s| s.height))
             .push_cd(self.format.to_cd())
+            .cd('t', medium)
             // TODO: I don't like clone here
             .payload(self.data.clone())
-            .send()
+            .send_medium(inline)
     }
 }
 
@@ -567,6 +765,17 @@ pub struct DynImage<F: Format> {
     placements: HashSet<PlacementHandle>,
     frames: HashMap<FrameHandle, FrameIdx>,
     request: ImageRequest<F>,
+    /// Shared memory objects backing frames that have been sent but not yet
+    /// acknowledged.
+    ///
+    /// A frame transmission carries the object's *name*, and the terminal reads
+    /// the object after it has parsed that command. Holding the request here for
+    /// the first frame is not enough: every later frame is created from a fresh
+    /// request, which would be dropped at the end of `new_frame`/`edit_frame`
+    /// and unlink the object before the terminal ever opened it. Keeping the
+    /// object alive until the reply arrives is what makes the medium usable for
+    /// animation rather than only for a single image.
+    frame_shm: Vec<Arc<ShmFrame>>,
     pl_id_alloc: Slab<Id>,
     pending: Vec<ReplyFuture>,
 }
@@ -579,6 +788,14 @@ pub struct SyncData {
 #[derive(Debug)]
 pub struct PendingSync<'a> {
     pending: &'a mut Vec<ReplyFuture>,
+    /// Objects backing frames already sent.
+    ///
+    /// Released only once every pending op has been acknowledged: the reply is
+    /// the terminal telling us it processed the command, and it reads the object
+    /// while processing. Dropping one earlier would unlink it before the
+    /// terminal opened it, which is the failure this whole lifetime exists to
+    /// avoid.
+    frame_shm: &'a mut Vec<Arc<ShmFrame>>,
 }
 
 impl<'a> Future for PendingSync<'a> {
@@ -614,6 +831,10 @@ impl<'a> Future for PendingSync<'a> {
         if still_pending {
             Pending
         } else {
+            // Every op is acknowledged, so every object has been read. Letting
+            // them go here is what keeps a long animation from accumulating a
+            // full frame's pixels per frame.
+            self.frame_shm.clear();
             Ready(Ok(()))
         }
     }
@@ -625,6 +846,7 @@ impl<F: Format> DynImage<F> {
     pub fn sync<'a>(&'a mut self) -> PendingSync<'a> {
         PendingSync {
             pending: &mut self.pending,
+            frame_shm: &mut self.frame_shm,
         }
     }
 
@@ -683,6 +905,11 @@ impl<F: Format> DynImage<F> {
         } else {
             self.resolve_frame_selector(base_frame)
         };
+        // The object outlives this call: the terminal reads it after parsing the
+        // command this creates, so the image keeps it until the reply lands.
+        if let Some(frame) = config.image.shm.clone() {
+            self.frame_shm.push(frame);
+        }
         let (handle, fut) = config.create(self.id.assigned(), base_idx, idx);
 
         self.frames.insert(handle.clone(), idx);
@@ -699,31 +926,34 @@ impl<F: Format> DynImage<F> {
             todo!()
         };
 
-        let reply = match edit {
+        let (message, inline) = match edit {
             FrameEdit::Compose(ComposeFromSelector {
                 from_frame,
                 width,
                 height,
                 src,
                 dst,
-            }) => Message::new()
-                // Use frame composing api
-                .cd('a', "c")
-                // image context
-                .cd('i', self.id.assigned())
-                // source frame (base canvas) — spec: c = base data
-                .cd('c', self.resolve_frame_selector(from_frame))
-                // destination frame being edited — spec: r = edited frame
-                .cd('r', frame_idx)
-                // size
-                .cd('w', width)
-                .cd('h', height)
-                // source location
-                .cd('X', src.0)
-                .cd('Y', src.1)
-                // destination location
-                .cd('x', dst.0)
-                .cd('y', dst.1),
+            }) => (
+                Message::new()
+                    // Use frame composing api
+                    .cd('a', "c")
+                    // image context
+                    .cd('i', self.id.assigned())
+                    // source frame (base canvas) — spec: c = base data
+                    .cd('c', self.resolve_frame_selector(from_frame))
+                    // destination frame being edited — spec: r = edited frame
+                    .cd('r', frame_idx)
+                    // size
+                    .cd('w', width)
+                    .cd('h', height)
+                    // source location
+                    .cd('X', src.0)
+                    .cd('Y', src.1)
+                    // destination location
+                    .cd('x', dst.0)
+                    .cd('y', dst.1),
+                true,
+            ),
 
             FrameEdit::Upload(Upload {
                 x,
@@ -731,20 +961,44 @@ impl<F: Format> DynImage<F> {
                 width,
                 height,
                 image,
-            }) => Message::new()
-                // use standard frame action api
-                .cd('a', "f")
-                .cd('i', self.id.assigned())
-                // "r" instead of "c" so it edits the frame instead of creating the new one
-                .cd('r', frame_idx)
-                .cd_opt('s', width)
-                .cd_opt('v', height)
-                .cd_opt('x', x)
-                .cd_opt('y', y)
-                .push_cd(image.format.to_cd())
-                .payload(image.data.as_slice()),
-        }
-        .send();
+            }) => {
+                // A raw upload is sized from `s`/`v` by the terminal, so fall
+                // back to the image's own dimensions rather than sending none.
+                // A self-describing format declares nothing.
+                let upload_dims = if image.format.needs_dimensions() {
+                    resolve_dims(width, height, image.size)
+                } else {
+                    (None, None)
+                };
+                // The object must outlive this call, exactly as in `new_frame`.
+                if let Some(frame) = image.shm.clone() {
+                    self.frame_shm.push(frame);
+                }
+                (
+                    Message::new()
+                    // use standard frame action api
+                    .cd('a', "f")
+                    .cd('i', self.id.assigned())
+                    // "r" instead of "c" so it edits the frame instead of creating the new one
+                    .cd('r', frame_idx)
+                    // A raw upload is sized from these, so fall back to the
+                    // image's own dimensions rather than sending none; a
+                    // self-describing format declares nothing, as above.
+                    .cd_opt('s', upload_dims.0)
+                    .cd_opt('v', upload_dims.1)
+                    .cd_opt('x', x)
+                    .cd_opt('y', y)
+                    .push_cd(image.format.to_cd())
+                    // Same as a frame transmission: name the medium, and do not
+                    // chunk a payload that is an object name.
+                    .cd('t', image.format.medium())
+                    .payload(image.data.as_slice()),
+                    image.format.is_inline(),
+                )
+            }
+        };
+
+        let reply = message.send_medium(inline);
 
         self.pending.push(reply);
         // PendingTransfer::new(reply, |_| ())
@@ -854,17 +1108,30 @@ impl<F: Format> NewFrameRequest<F> {
         // frame index that is given to the new frame
         new_frame_idx: FrameIdx,
     ) -> (FrameHandle, ReplyFuture) {
+        // A raw frame is sized from these by the terminal, which computes the
+        // payload length as `width * height * bytes_per_pixel` and rejects a
+        // zero-sized one. A self-describing format declares nothing: the size is
+        // still checked against the image, so a wrong value would be worse than
+        // none at all.
+        let (width, height) = if self.image.format.needs_dimensions() {
+            resolve_dims(self.width, self.height, self.image.size)
+        } else {
+            (None, None)
+        };
         let reply = Message::new()
             .cd('a', "f")
             .cd('i', base_image)
             .cd_if(from_frame_idx > 0, 'c', from_frame_idx)
-            .cd_opt('s', self.width)
-            .cd_opt('v', self.height)
+            .cd_opt('s', width)
+            .cd_opt('v', height)
             .cd_opt('x', self.x)
             .cd_opt('y', self.y)
             .push_cd(self.image.format.to_cd())
+            // The medium must be named on a frame transmission too, or an
+            // object name would be read as inline pixel data.
+            .cd('t', self.image.format.medium())
             .payload(self.image.data)
-            .send();
+            .send_medium(self.image.format.is_inline());
 
         (
             FrameHandle {
@@ -1126,6 +1393,16 @@ impl Message {
     // TODO: implement chunking
     /// execute the command
     pub fn send(mut self) -> ReplyFuture {
+        self.send_medium(true)
+    }
+
+    /// Execute the command, chunking the payload only when it is inline.
+    ///
+    /// A local medium (`t=s`, `t=f`) carries an object name rather than data, so
+    /// it is one command by construction: the `m` key is meaningless for it and
+    /// splitting it would hand the terminal a fragment of a name. `inline` says
+    /// which of the two this is.
+    fn send_medium(mut self, inline: bool) -> ReplyFuture {
         const CHUNK_SIZE: usize = 16 * 1024;
         const LOCK: Mutex<()> = Mutex::new(());
 
@@ -1133,8 +1410,19 @@ impl Message {
         let is_frame_edit = self.cds.contains(&ControlData('a', "f".to_string()));
 
         let payload = self.payload.take().unwrap_or_default();
-        let mut chunks = payload.chunks(CHUNK_SIZE).into_iter().peekable();
         let aident = self.ident();
+
+        if !inline {
+            // One command, no chunk state, and no `m` key. The lock is taken as
+            // a binding so it lives to the end of the block.
+            let lock = LOCK;
+            let guard = lock.lock().unwrap();
+            self.payload(payload).send_raw(false);
+            drop(guard);
+            return ReplyFuture::new(aident);
+        }
+
+        let mut chunks = payload.chunks(CHUNK_SIZE).into_iter().peekable();
 
         // Critical section goes here
         {
@@ -1163,29 +1451,31 @@ impl Message {
     fn send_raw(mut self, no_reply: bool) {
         // TODO: Handle properly
         self = self.cd_if(no_reply, 'q', 2);
+        let bytes = self.into_escape();
+        let mut out = std::io::stdout();
+        out.write(bytes.as_slice()).unwrap();
+        out.flush().unwrap();
+
+        // println!("\x1b_G{cds};{payload}\x1b\\");
+        // std::io::stdout().flush().unwrap();
+    }
+
+    /// The escape sequence this message encodes to, exactly as it goes on the wire.
+    ///
+    /// Separated from the write so the encoding can be asserted without a
+    /// terminal: `\x1b_G<cds>;<payload>\x1b\\`.
+    fn into_escape(self) -> Vec<u8> {
         let cds = self
             .cds
             .iter()
             .map(|cdv| cdv.format())
             .collect_vec()
             .join(",");
-
-        let payload = String::from_utf8(self.payload.unwrap()).unwrap();
-        // writer::send(format!("\x1b_G{cds};{payload}\x1b\\").into_bytes());
-        let mut out = std::io::stdout();
-        out.write(
-            format!("\x1b_G{cds};{payload}\x1b\\")
-                .into_bytes()
-                .as_slice(),
-        )
-        .unwrap();
-        out.flush().unwrap();
-
-        // println!("\x1b_G{cds};{payload}\x1b\\");
-        // std::io::stdout().flush().unwrap();
+        // The payload is base64 (or a fragment of it), so it is already ASCII.
+        let payload = String::from_utf8(self.payload.unwrap_or_default()).unwrap();
+        format!("\x1b_G{cds};{payload}\x1b\\").into_bytes()
     }
 }
-
 #[derive(thiserror::Error, Debug)]
 pub enum TGPError {
     #[error("Entity was evicted")]
@@ -1200,6 +1490,9 @@ pub enum TGPError {
 
     #[error(transparent)]
     Utf8Error(#[from] std::str::Utf8Error),
+
+    #[error("shared memory: {0}")]
+    Shm(String),
 }
 
 impl TGPError {
@@ -1295,6 +1588,273 @@ mod tests {
     fn noise_before_the_intro_is_skipped() {
         let r = parse("junk\x1b[31m\x1b_Gi=31;\x1b\\").unwrap();
         assert_eq!(cds(&r), [('i', "31")]);
+    }
+
+    /// The object a `t=s` command names has to exist, hold exactly the pixels,
+    /// and be resolvable the way a terminal's `shm_open` resolves it.
+    #[test]
+    fn shm_frame_holds_the_pixels_under_the_name_it_reports() {
+        let pixels: Vec<u8> = (0..=255u8).cycle().take(300).collect();
+        let frame = ShmFrame::create(&pixels).expect("create shm object");
+
+        // The protocol requires a leading slash and no other slash, and name
+        // lengths must fit the platform limit (macOS: 31 bytes).
+        assert!(frame.name().starts_with('/'), "{}", frame.name());
+        assert_eq!(frame.name().matches('/').count(), 1, "{}", frame.name());
+        assert!(frame.name().len() <= 31, "{}", frame.name());
+
+        // A terminal resolves the name through shm_open, which on Linux is the
+        // same file under /dev/shm.
+        let path = std::path::Path::new(SHM_DIR).join(frame.name().trim_start_matches('/'));
+        assert_eq!(std::fs::read(&path).expect("readable"), pixels);
+
+        // The payload is base64 of the name, not of the pixels: that is the
+        // whole difference between this medium and the inline one.
+        let decoded = base64_turbo::STANDARD
+            .decode(frame.payload())
+            .expect("payload decodes");
+        assert_eq!(decoded, frame.name().as_bytes());
+        assert!(decoded.len() < pixels.len() / 4, "payload must be the name");
+
+        // Dropping removes the object so a long session does not leak names.
+        let leaked = path.to_path_buf();
+        drop(frame);
+        assert!(std::fs::read(&leaked).is_err(), "object outlived the frame");
+    }
+
+    #[test]
+    fn shm_format_declares_the_shared_memory_medium() {
+        assert_eq!(Shm.medium(), "s");
+        assert!(!Shm.is_inline(), "a name payload must never be chunked");
+        // RGB, so the terminal interprets the object as packed pixels.
+        assert_eq!(Shm.to_cd().format(), "f=24");
+    }
+
+    #[test]
+    fn inline_formats_stay_on_the_direct_medium() {
+        // Each is a distinct type, so they are asserted one at a time.
+        assert_eq!(Png.medium(), "d");
+        assert!(Png.is_inline());
+        assert_eq!(Png.to_cd().format(), "f=100");
+
+        assert_eq!(Rgb.medium(), "d");
+        assert!(Rgb.is_inline());
+        assert_eq!(Rgb.to_cd().format(), "f=24");
+
+        assert_eq!(Rgba.medium(), "d");
+        assert!(Rgba.is_inline());
+        assert_eq!(Rgba.to_cd().format(), "f=32");
+    }
+
+    /// The wire command a shared memory transmit produces: the medium is named,
+    /// the payload is the object's name, and there is no `m` key because a name
+    /// is never chunked.
+    #[test]
+    fn shm_transmit_puts_the_medium_and_a_name_on_the_wire() {
+        let pixels = vec![7u8; 4 * 4 * 3];
+        let frame = ShmFrame::create(&pixels).expect("create shm object");
+        let name_payload = frame.payload();
+
+        // What ImageRequest::exec_transmit assembles for an Shm format.
+        let escape = Message::new()
+            .cd('I', 1)
+            .cd_opt('s', Some(4u32))
+            .cd_opt('v', Some(4u32))
+            .push_cd(Shm.to_cd())
+            .cd('t', Shm.medium())
+            .payload(name_payload.clone())
+            .into_escape();
+
+        let text = String::from_utf8(escape).expect("escape is ASCII");
+        assert!(text.starts_with("\x1b_G"), "{text:?}");
+        assert!(text.ends_with("\x1b\\"), "{text:?}");
+        assert!(text.contains(",f=24"), "packed RGB: {text:?}");
+        // `t` is the last key before the payload, so it is terminated by `;`.
+        assert!(text.contains(",t=s;"), "the shared memory medium: {text:?}");
+        assert!(!text.contains(",m="), "a name must never be chunked: {text:?}");
+        assert!(
+            !text.contains("t=d"),
+            "must not fall back to the inline medium: {text:?}"
+        );
+
+        // The payload is the name, not the pixels.
+        let payload = text
+            .split_once(';')
+            .and_then(|(_, rest)| rest.strip_suffix("\x1b\\"))
+            .expect("payload");
+        assert_eq!(
+            base64_turbo::STANDARD.decode(payload).unwrap(),
+            frame.name().as_bytes()
+        );
+    }
+
+    /// The saving the medium exists for: at any real frame size the payload is
+    /// the object's name, so it does not grow with the image at all.
+    #[test]
+    fn shm_payload_does_not_scale_with_the_image() {
+        // A 1920x1080 RGB frame, the size the medium is worth using at.
+        let pixels = vec![0u8; 1920 * 1080 * 3];
+        let frame = ShmFrame::create(&pixels).expect("create shm object");
+        let payload = frame.payload();
+
+        // The inline medium would carry base64 of every pixel.
+        let inline = base64_turbo::STANDARD.encode(&pixels).len();
+        assert!(
+            payload.len() * 1000 < inline,
+            "payload {} should be orders of magnitude below the inline {}",
+            payload.len(),
+            inline
+        );
+        // Still exactly the object's name.
+        assert_eq!(
+            base64_turbo::STANDARD.decode(&payload).unwrap(),
+            frame.name().as_bytes()
+        );
+    }
+
+    /// A raw frame must carry its dimensions: the terminal sizes an `f=24`
+    /// frame's payload as `width * height * 3` and rejects a zero-sized one with
+    /// "ERROR: EINVAL:Zero width/height not allowed". PNG escaped this because it
+    /// describes its own size, so the omission stayed invisible until a raw
+    /// medium existed.
+    #[test]
+    fn a_raw_frame_falls_back_to_the_image_size() {
+        let image_size = Some(ImageSize {
+            width: 1692,
+            height: 1220,
+        });
+
+        // Unset, as `..Default::default()` leaves them: the image's own size is
+        // used, which is what keeps a raw frame from being zero-sized.
+        assert_eq!(resolve_dims(None, None, image_size), (Some(1692), Some(1220)));
+
+        // An explicit size always wins (the tiled renderer passes one).
+        assert_eq!(
+            resolve_dims(Some(64), Some(32), image_size),
+            (Some(64), Some(32))
+        );
+
+        // Mixed: each axis falls back independently.
+        assert_eq!(
+            resolve_dims(Some(64), None, image_size),
+            (Some(64), Some(1220))
+        );
+
+        // No size anywhere stays None, leaving the terminal to report it.
+        assert_eq!(resolve_dims(None, None, None), (None, None));
+    }
+
+    /// A self-describing format must declare nothing: the terminal still checks
+    /// a declared size against the image, so a stale dimension would be rejected
+    /// where omitting it was fine. This is what keeps the PNG path unchanged.
+    #[test]
+    fn a_self_describing_format_declares_no_dimensions() {
+        assert!(
+            !Png.needs_dimensions(),
+            "PNG carries its own size in its header"
+        );
+        assert!(Rgb.needs_dimensions(), "raw RGB is sized from s/v");
+        assert!(Rgba.needs_dimensions());
+        assert!(Shm.needs_dimensions(), "the shm medium carries raw RGB");
+
+        // The rule the call sites apply.
+        let declared = |needs: bool, requested: Option<u32>, image: Option<ImageSize>| {
+            if needs {
+                resolve_dims(requested, requested, image).0
+            } else {
+                None
+            }
+        };
+        let size = Some(ImageSize {
+            width: 1692,
+            height: 1220,
+        });
+        assert_eq!(declared(Png.needs_dimensions(), None, size), None);
+        assert_eq!(declared(Shm.needs_dimensions(), None, size), Some(1692));
+    }
+
+    /// A frame's object must outlive the send that named it.
+    ///
+    /// This is the bug that produced "EBADF:Failed to open file for graphics
+    /// transmission ... No such file or directory": the request was dropped at
+    /// the end of `new_frame`, whose `Drop` unlinked the object before the
+    /// terminal could open it. The image now holds it across the send.
+    #[test]
+    fn a_transmitted_frame_keeps_its_object_alive() {
+        let pixels = vec![5u8; 8 * 8 * 3];
+        let frame = Arc::new(ShmFrame::create(&pixels).expect("create shm object"));
+        let path =
+            std::path::Path::new(SHM_DIR).join(frame.name().trim_start_matches('/'));
+
+        let mut image: DynImage<Shm> = DynImage {
+            id: DynId::Assigned(Arc::new(1)),
+            placements: HashSet::new(),
+            frames: HashMap::new(),
+            // The base image's own object: held for the image's whole life, so
+            // it is deliberately not one of the ones `sync` releases.
+            request: ImageRequest {
+                format: Shm,
+                size: Some(ImageSize {
+                    width: 8,
+                    height: 8,
+                }),
+                data: vec![],
+                shm: None,
+            },
+            frame_shm: vec![],
+            pl_id_alloc: {
+                let mut slab = Slab::new();
+                slab.next();
+                slab
+            },
+            pending: vec![],
+        };
+
+        // A frame created from a request hands its object to the image rather
+        // than letting the request's drop remove it.
+        image.frame_shm.push(frame.clone());
+        assert_eq!(std::fs::read(&path).expect("readable"), pixels);
+
+        // Dropping the request's own handle must not unlink while the image
+        // still holds one: this is the ownership the fix establishes.
+        drop(frame);
+        assert!(
+            std::fs::read(&path).is_ok(),
+            "the object must outlive the sending call"
+        );
+
+        // With nothing in flight, `sync` resolves at once and releases the
+        // objects, so an animation does not accumulate a frame per frame. There
+        // is no runtime here, but an empty pending list makes it ready on the
+        // first poll, so a noop waker is enough.
+        let mut sync = image.sync();
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::pin::Pin::new(&mut sync).poll(&mut cx),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        drop(sync);
+        assert!(image.frame_shm.is_empty(), "objects are freed once acked");
+        assert!(
+            std::fs::read(&path).is_err(),
+            "the object is gone once released"
+        );
+    }
+
+    /// The inline path is unchanged: direct medium, and still chunked when the
+    /// payload is larger than one command can carry.
+    #[test]
+    fn inline_transmit_keeps_the_direct_medium_and_chunks() {
+        let escape = Message::new()
+            .cd('I', 1)
+            .push_cd(Rgb.to_cd())
+            .cd('t', Rgb.medium())
+            .payload(vec![b'A'; 10])
+            .into_escape();
+        let text = String::from_utf8(escape).unwrap();
+        assert!(text.contains(",t=d;"), "{text:?}");
+        assert!(text.contains(",f=24"), "{text:?}");
     }
 
     #[test]
