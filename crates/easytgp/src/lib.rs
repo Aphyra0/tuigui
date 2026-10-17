@@ -75,25 +75,56 @@ mod id {
 }
 
 /// Dedicated TGP writer: consumes fully-formed escape sequences off a channel
-/// and writes + flushes them to stdout. Keeping this off the calling thread
-/// means the pty-write stall (terminal decoding slower than we produce) can't
-/// block frame encoding/comparison — the two overlap. One thread + one channel
-/// preserves FIFO order, which kitty needs for its single-loading-slot rule.
+/// and writes + flushes them. Keeping this off the calling thread means the
+/// pty-write stall (terminal decoding slower than we produce) can't block frame
+/// encoding/comparison — the two overlap. One thread + one channel preserves
+/// FIFO order, which kitty needs for its single-loading-slot rule.
 mod writer {
     use static_init::dynamic;
-    use std::io::Write;
+    use std::io::{self, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{self, Sender};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     /// Escape sequences produced but not yet flushed to the pty. Rising =
     /// the terminal can't keep up and the queue is piling up.
     pub(crate) static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 
+    /// Where escapes go. Defaults to this process's stdout, which is right when
+    /// the renderer owns the terminal. A wrapper that serializes its own output
+    /// under a lock (`tui`) installs its sink here instead, so escapes interleave
+    /// with the wrapped command's bytes rather than racing them via a second
+    /// independent writer to the same fd.
+    static SINK: OnceLock<Arc<Mutex<dyn Write + Send>>> = OnceLock::new();
+
+    /// Direct every later escape to `sink`. Returns false if a sink was already
+    /// installed: moving it mid-stream would split one image's escapes across
+    /// two destinations, so the first caller wins.
+    pub fn set_sink(sink: Arc<Mutex<dyn Write + Send>>) -> bool {
+        SINK.set(sink).is_ok()
+    }
+
+    fn write_all(out: &mut dyn Write, bytes: &[u8]) {
+        match SINK.get() {
+            Some(sink) => {
+                if let Ok(mut s) = sink.lock() {
+                    let _ = s.write_all(bytes);
+                    let _ = s.flush();
+                }
+            }
+            None => {
+                let _ = out.write_all(bytes);
+                let _ = out.flush();
+            }
+        }
+    }
+
     #[dynamic]
     static mut W_TX: Sender<Vec<u8>> = {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         std::thread::spawn(move || {
-            let mut out = std::io::stdout();
+            // Only used when no sink is installed.
+            let mut out = io::stdout();
             loop {
                 // Block for the first escape, then drain whatever else is
                 // queued in the same batch. One write_all + one flush per
@@ -103,13 +134,12 @@ mod writer {
                     Ok(m) => m,
                     Err(_) => break, // channel disconnected, all senders dropped
                 };
-                out.write_all(&first).expect("tgp write");
+                write_all(&mut out, &first);
                 IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
                 while let Ok(more) = rx.try_recv() {
-                    out.write_all(&more).expect("tgp write");
+                    write_all(&mut out, &more);
                     IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
                 }
-                out.flush().expect("tgp flush");
             }
         });
         tx
@@ -121,6 +151,15 @@ mod writer {
         tx.send(bytes).expect("tgp writer thread died");
         drop(tx);
     }
+}
+
+/// Send every TGP escape to `sink` instead of this process's stdout.
+///
+/// For a wrapper that owns multiple writers of one terminal: install its locked
+/// stdout here so escapes and the wrapped command's output interleave correctly.
+/// Returns false if a sink was already set.
+pub fn set_output_sink(sink: Arc<Mutex<dyn std::io::Write + Send>>) -> bool {
+    writer::set_sink(sink)
 }
 
 /// Number of escape sequences produced but not yet flushed to the pty.
@@ -357,7 +396,9 @@ impl Controller {
             width: image.width(),
             height: image.height(),
         };
-        let frame = Arc::new(ShmFrame::create(&image.into_vec())?);
+        // The image buffer moves into the object rather than being copied: at
+        // frame sizes a copy here is several megabytes of memcpy per frame.
+        let frame = Arc::new(ShmFrame::create_owned(image.into_vec())?);
         Ok(ImageRequest {
             format: Shm,
             // The payload for this medium is the object's name, not pixels.
@@ -629,14 +670,40 @@ pub struct ShmFrame {
     /// The name as the protocol wants it: a leading `/`, no other `/`.
     name: String,
     path: std::path::PathBuf,
+    /// The pixels the object was filled from.
+    ///
+    /// The terminal unlinks the object once it has read it, so the name is only
+    /// usable until the command is processed and cannot be re-sent. Keeping the
+    /// bytes is what makes a second transmission possible, and it costs nothing
+    /// extra: the caller's own copy is dropped after this, so the data moves
+    /// here rather than being duplicated.
+    data: Vec<u8>,
 }
 
 impl ShmFrame {
+    /// The bytes this object was filled with.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Create an object from bytes the caller no longer needs.
+    ///
+    /// The owned form exists so the hot path does not copy a frame twice: with
+    /// [`ShmFrame::create`] the caller's `Vec` becomes a slice and is cloned into
+    /// the object, which for a full frame is several megabytes of memcpy.
+    pub fn create_owned(data: Vec<u8>) -> Res<Self> {
+        Self::build(data)
+    }
+
     /// Create an object of `len` bytes and fill it with `data`.
     ///
     /// Fails on a platform with no `/dev/shm`, or when the name is already
     /// taken (a stale object from a dead process whose pid was reused).
     pub fn create(data: &[u8]) -> Res<Self> {
+        Self::build(data.to_vec())
+    }
+
+    fn build(data: Vec<u8>) -> Res<Self> {
         let dir = std::path::Path::new(SHM_DIR);
         if !dir.is_dir() {
             return Err(TGPError::Shm(format!(
@@ -660,19 +727,49 @@ impl ShmFrame {
             .and_then(|()| {
                 use std::io::{Seek as _, Write as _};
                 file.rewind()?;
-                file.write_all(data)
+                file.write_all(&data)
             })
             .map_err(|e| {
                 // Never leave a partial object behind under a fresh name.
                 let _ = std::fs::remove_file(&path);
                 TGPError::Shm(format!("writing {}: {e}", path.display()))
             })?;
-        Ok(Self { name, path })
+        Ok(Self {
+            name,
+            path,
+            data,
+        })
+    }
+
+    /// Create a fresh object holding the same bytes.
+    ///
+    /// The previous object is gone by now: the terminal unlinks what it reads,
+    /// so a re-send has to name a new one. The bytes are already here, so this
+    /// is one write and no pixel work.
+    pub fn recreate(&self) -> Res<Self> {
+        Self::create(&self.data)
     }
 
     /// The object's name, as the `t=s` payload is base64 of.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Re-transmit this frame as a fresh object with the same bytes.
+    ///
+    /// For putting an image back after a terminal discarded it: a whole-screen
+    /// erase frees the terminal's *copy* of the image, and its own unlink has
+    /// already removed ours, so a new object is needed. The bytes are already
+    /// here, so this costs one write and no pixel work, where re-encoding from
+    /// the caller's frame would cost a full frame of memcpy.
+    pub fn resend(&self, size: ImageSize) -> Res<ImageRequest<Shm>> {
+        let frame = Arc::new(self.recreate()?);
+        Ok(ImageRequest {
+            format: Shm,
+            data: frame.payload(),
+            size: Some(size),
+            shm: Some(frame),
+        })
     }
 
     /// The base64 payload this medium carries in place of pixel data.
@@ -717,7 +814,7 @@ impl<F: Format + 'static> ImageRequest<F> {
     pub fn transmit(self) -> PendingTransfer<F> {
         let id = DynId::new(id::alloc());
 
-        PendingTransfer::new(self.exec_transmit(id.assigned()), |r| {
+        PendingTransfer::new(self.exec_transmit('I', id.assigned()), |r| {
             let id: u32 = r
                 .message
                 .expect("reply with allocated i")
@@ -736,19 +833,51 @@ impl<F: Format + 'static> ImageRequest<F> {
                     slab.next();
                     slab
                 },
+                held: None,
                 frame_shm: vec![],
                 pending: vec![],
             }
         })
     }
 
-    fn exec_transmit(&self, id: Id) -> ReplyFuture {
+    /// Transmit under an id that already exists, replacing its data.
+    ///
+    /// Named with `i=`, the image *id*. `I=` is the image *number*, which is a
+    /// different namespace: the terminal answers a numbered transmit by creating
+    /// a brand-new image and reporting its id, so re-sending under `I=` would
+    /// leave the original pixels untouched and leak one image per frame until
+    /// the storage quota evicted them.
+    ///
+    /// For a stream where the terminal may discard the image at any time: a
+    /// fresh id each frame would invalidate every placeholder cell referencing
+    /// the old one, because the id lives in the cell's color. Reusing the id
+    /// means a re-send can be unconditional and the client never repaints.
+    pub fn transmit_as(self, id: Id) -> PendingTransfer<F> {
+        // Moved into the closure rather than captured by reference: the closure
+        // is boxed as `'static`, since the reply may arrive much later.
+        PendingTransfer::new(self.exec_transmit('i', id), move |_r| DynImage {
+            id: DynId::Assigned(Arc::new(id)),
+            request: self,
+            placements: HashSet::new(),
+            frames: HashMap::new(),
+            pl_id_alloc: {
+                let mut slab = Slab::new();
+                slab.next();
+                slab
+            },
+            held: None,
+            frame_shm: vec![],
+            pending: vec![],
+        })
+    }
+
+    fn exec_transmit(&self, key: char, id: Id) -> ReplyFuture {
         // The `t` key must precede the payload: for a shared memory medium the
         // payload is an object name, not pixels.
         let medium = self.format.medium();
         let inline = self.format.is_inline();
         Message::new()
-            .cd('I', id)
+            .cd(key, id)
             .cd_opt('s', self.size.map(|s| s.width))
             .cd_opt('v', self.size.map(|s| s.height))
             .push_cd(self.format.to_cd())
@@ -776,6 +905,15 @@ pub struct DynImage<F: Format> {
     /// object alive until the reply arrives is what makes the medium usable for
     /// animation rather than only for a single image.
     frame_shm: Vec<Arc<ShmFrame>>,
+    /// The object backing the most recently sent frame, kept after its reply
+    /// lands.
+    ///
+    /// A terminal frees its own copy of the image on a whole-screen erase, and
+    /// the object here is the only remaining copy of those pixels: the caller
+    /// streams and does not repeat a frame. Holding it lets the image be sent
+    /// again without re-encoding, which is the difference between one command
+    /// and a full frame of memcpy per restore. See [`DynImage::last_object`].
+    held: Option<Arc<ShmFrame>>,
     pl_id_alloc: Slab<Id>,
     pending: Vec<ReplyFuture>,
 }
@@ -796,6 +934,9 @@ pub struct PendingSync<'a> {
     /// terminal opened it, which is the failure this whole lifetime exists to
     /// avoid.
     frame_shm: &'a mut Vec<Arc<ShmFrame>>,
+    /// Where the last object goes instead of being dropped, so the image can be
+    /// sent again after a terminal erases it.
+    held: &'a mut Option<Arc<ShmFrame>>,
 }
 
 impl<'a> Future for PendingSync<'a> {
@@ -831,9 +972,18 @@ impl<'a> Future for PendingSync<'a> {
         if still_pending {
             Pending
         } else {
-            // Every op is acknowledged, so every object has been read. Letting
-            // them go here is what keeps a long animation from accumulating a
-            // full frame's pixels per frame.
+            // Every op is acknowledged, so every object has been read. Releasing
+            // them here is what keeps a long animation from accumulating a full
+            // frame's pixels per frame.
+            //
+            // The newest one is kept: a terminal frees its own copy of the image
+            // on a whole-screen erase, and this object is then the only copy of
+            // those pixels left, since the caller streams and does not repeat a
+            // frame. The vector is newest-first because frames are pushed in
+            // order, so the last element was sent most recently.
+            if let Some(last) = self.frame_shm.pop() {
+                *self.held = Some(last);
+            }
             self.frame_shm.clear();
             Ready(Ok(()))
         }
@@ -841,17 +991,37 @@ impl<'a> Future for PendingSync<'a> {
 }
 
 impl<F: Format> DynImage<F> {
+    /// The image's id on the wire.
+    ///
+    /// Needed by callers that must name the image in their own escapes, the
+    /// main case being Unicode placeholders: the id is encoded in the
+    /// placeholder cell's foreground color, so the client has to know it.
+    pub fn id(&self) -> Id {
+        self.id.assigned()
+    }
+
     /// Wait until all pending operations related to the image are done and their status collected
     /// In cases of errors, the first one is being returned
     pub fn sync<'a>(&'a mut self) -> PendingSync<'a> {
         PendingSync {
             pending: &mut self.pending,
             frame_shm: &mut self.frame_shm,
+            held: &mut self.held,
         }
     }
 
+    /// The shared memory object backing the most recently displayed frame.
+    ///
+    /// Held past its reply so the frame can be transmitted again without
+    /// re-encoding it, which is what a terminal needs after a whole-screen erase
+    /// frees its own copy of the image.
+    pub fn last_object(&self) -> Option<Arc<ShmFrame>> {
+        self.held.clone()
+    }
+
     pub fn place(&mut self, request: PlacementRequest) -> PlacementHandle {
-        let (fut, handle) = request.place(self.id.assigned(), id::alloc(), "p");
+        let id = request.placement_id.unwrap_or_else(id::alloc);
+        let (fut, handle) = request.place(self.id.assigned(), id, "p");
         self.placements.insert(PlacementHandle {
             id: handle.id.clone(),
             request: handle.request.clone(),
@@ -1218,6 +1388,16 @@ pub struct PlacementRequest {
     /// After placing an image on the screen the cursor must be moved to the right by the number of cols in the image placement rectangle and down by the number of rows in the image placement rectangle.
     /// This option sets the cursor movement policy to no movement for placing the current image.
     pub fix_cursor: bool,
+    /// Create a *virtual* placement (`U=1`): a prototype that has no screen
+    /// position of its own. Unicode placeholder cells resolve against it, which
+    /// is how an image is anchored to text a multiplexer is free to move.
+    pub virtual_placement: bool,
+    /// A placement id to reuse instead of allocating one (`p=`).
+    ///
+    /// Placement ids are scoped to their image, so the same value on two images
+    /// is two placements, not a conflict. Naming it lets a caller move an image
+    /// swap onto a known placement id rather than one that changes per call.
+    pub placement_id: Option<u32>,
     // TODO:
     // H, V
 }
@@ -1253,6 +1433,7 @@ impl PlacementRequest {
             .cd_opt('w', self.width)
             .cd_opt('h', self.height)
             .cd_if(self.fix_cursor, 'C', 1)
+            .cd_if(self.virtual_placement, 'U', 1)
             .send()
     }
 
@@ -1452,12 +1633,11 @@ impl Message {
         // TODO: Handle properly
         self = self.cd_if(no_reply, 'q', 2);
         let bytes = self.into_escape();
-        let mut out = std::io::stdout();
-        out.write(bytes.as_slice()).unwrap();
-        out.flush().unwrap();
-
-        // println!("\x1b_G{cds};{payload}\x1b\\");
-        // std::io::stdout().flush().unwrap();
+        // Through the writer, not straight to fd 1. A wrapper that serializes
+        // several writers of one terminal (`tui`) installs a sink here, and
+        // writing around it would race the wrapped command's bytes: an escape
+        // could land in the middle of a line the command is printing.
+        writer::send(bytes);
     }
 
     /// The escape sequence this message encodes to, exactly as it goes on the wire.
@@ -1801,6 +1981,7 @@ mod tests {
                 data: vec![],
                 shm: None,
             },
+            held: None,
             frame_shm: vec![],
             pl_id_alloc: {
                 let mut slab = Slab::new();
@@ -1836,9 +2017,16 @@ mod tests {
         ));
         drop(sync);
         assert!(image.frame_shm.is_empty(), "objects are freed once acked");
+        // The newest one is not freed outright: it moves into `held`, which is
+        // what lets the image be sent again after the terminal erases it
+        // without re-encoding a frame the caller has already moved past.
         assert!(
-            std::fs::read(&path).is_err(),
-            "the object is gone once released"
+            image.last_object().is_some(),
+            "the newest object is kept for a re-send"
+        );
+        assert!(
+            std::fs::read(&path).is_ok(),
+            "the held object must stay on disk"
         );
     }
 

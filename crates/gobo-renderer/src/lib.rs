@@ -175,6 +175,10 @@ pub struct TgpRendererWidget;
 
 pub struct State {
     stream: Box<dyn Streamer + Send>,
+    /// Where the terminal's TGP replies arrive. Taken at init to start the
+    /// router; the caller decides the source, because whoever reads fd 0 must
+    /// be the only reader of it.
+    replies: Option<Box<dyn std::io::Read + Send>>,
     counter: u32,
     frame_time: std::time::Instant,
     last_frame_start: std::time::Instant,
@@ -213,7 +217,22 @@ enum TileState {
 }
 
 impl State {
-    pub fn new(mut streamer: impl Streamer + Send + 'static) -> Self {
+    /// Render `streamer`, reading terminal replies from stdin.
+    ///
+    /// Only use this when nothing else reads fd 0: two readers of the same
+    /// stream means whoever wins is a race, and a lost graphics reply stalls
+    /// the first transmit forever. An event loop that also wants keys and mouse
+    /// should read fd 0 itself and hand the demultiplexed replies to
+    /// [`State::with_replies`].
+    pub fn new(streamer: impl Streamer + Send + 'static) -> Self {
+        Self::with_replies(streamer, stdin())
+    }
+
+    /// Render `streamer`, taking TGP replies from `replies`.
+    pub fn with_replies(
+        mut streamer: impl Streamer + Send + 'static,
+        replies: impl std::io::Read + Send + 'static,
+    ) -> Self {
         Self {
             counter: 1,
             frame_time: std::time::Instant::now(),
@@ -221,6 +240,7 @@ impl State {
             stats: Stats::default(),
             history: std::collections::VecDeque::new(),
             stream: Box::new(streamer),
+            replies: Some(Box::new(replies)),
             inner: InnerState::Init,
         }
     }
@@ -275,7 +295,12 @@ impl StatefulWidget for TgpRendererWidget {
                 state.stats.decode = t.elapsed();
                 let (width_px, height_px) = (next_frame.width(), next_frame.height());
 
-                let c = Controller::init(stdin());
+                let c = Controller::init(
+                    state
+                        .replies
+                        .take()
+                        .expect("replies are taken once, on first render"),
+                );
                 let request = c.new_png(next_frame).unwrap();
 
                 let mut image = block_on(request.clone().transmit()).unwrap();
@@ -355,9 +380,9 @@ impl StatefulWidget for TgpRendererWidget {
                 let (width_u, height_half_u) = (downscaled.width(), downscaled.height() / 2);
                 let (tile_width_u, tile_half_height_u) =
                     (width_u / shape.0 as u32, height_half_u / shape.1 as u32);
-                if state.counter == 500 {
-                    panic!("done");
-                }
+                // if state.counter == 500 {
+                //     panic!("done");
+                // }
 
                 // let mut handles = vec![];
                 let mut budget = 32;

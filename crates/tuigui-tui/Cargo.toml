@@ -1,0 +1,17 @@
+[package]
+name = "tuigui-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Server side: run a command in a pty and paint remotely-sent frames onto the real terminal"
+
+[dependencies]
+tuigui-wire = { workspace = true }
+easytgp = { workspace = true }
+image = { workspace = true }
+rustix = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "sync", "time", "macros"] }
+
+[[bin]]
+name = "tui"
+path = "src/bin/tui.rs"

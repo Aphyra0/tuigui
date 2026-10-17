@@ -8,3 +8,12 @@ description = "In-process headless Wayland compositor for capture and input inje
 [dependencies]
 gobo-core = { workspace = true }
 gobo-renderer = { workspace = true }
+smithay = { workspace = true }
+wayland-protocols = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+# Used by the smoke client in src/bin, which exercises the compositor
+# end-to-end (it is a real Wayland client).
+wayland-client = "0.31"
+rustix = { workspace = true }
+memmap2 = "0.9"

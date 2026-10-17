@@ -1,0 +1,27 @@
+[package]
+name = "tuigui-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Client side: decode frames and stream them to the tui server"
+
+[dependencies]
+tuigui-wire = { workspace = true }
+easytgp = { workspace = true }
+ratatui = { workspace = true }
+# SIMD JPEG encoding. `image`'s encoder is scalar and was the single largest
+# cost in the frame budget; this one is libjpeg-turbo. `image` is no longer a
+# dependency here: frames go from ffmpeg's RGB buffer straight into the encoder.
+#
+# Linked against the system libjpeg-turbo rather than building it from source:
+# Nix's build is already SIMD-optimized, and the pkg-config route needs neither
+# cmake nor nasm. `require-simd` makes a scalar fallback a build error instead of
+# a silent return to the slow encoder this exists to avoid.
+turbojpeg = { version = "1.5", default-features = false, features = ["pkg-config", "require-simd"] }
+ffmpeg-sidecar = { workspace = true }
+rustix = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "sync", "time"] }
+
+[[bin]]
+name = "gui"
+path = "src/bin/gui.rs"

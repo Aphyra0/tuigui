@@ -1,0 +1,14 @@
+[package]
+name = "tuigui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Run the tui server and a gui client as a single unit"
+
+[dependencies]
+tuigui-tui = { workspace = true }
+tuigui-gui = { workspace = true }
+
+[[bin]]
+name = "tuigui"
+path = "src/bin/tuigui.rs"

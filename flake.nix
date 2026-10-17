@@ -108,6 +108,10 @@
               # links against: pixman renderer + xkbcommon keymaps
               pixman
               libxkbcommon
+              # SIMD JPEG encoding for the streaming client. Nix's build already
+              # has the SIMD kernels, so it is linked via pkg-config rather than
+              # compiled from source: no cmake or nasm needed.
+              libjpeg_turbo
               # decoder backend for the renderer: ffmpeg-sidecar spawns the
               # ffmpeg CLI, so it must be on PATH at build/run time
               ffmpeg
@@ -155,6 +159,9 @@
               # libs the comp crate (in-process smithay compositor) links against
               pkgs.pixman
               pkgs.libxkbcommon
+              # SIMD JPEG encoding: linked against Nix's libjpeg-turbo, so it
+              # only needs to be on the linker/pkg-config path.
+              pkgs.libjpeg_turbo
               # demo apps to stream + TGP test terminals
               pkgs.foot
               pkgs.kitty

@@ -20,6 +20,15 @@
 //! `transmit()` and `sync()`, so the two are directly comparable and both wait
 //! for the terminal's acknowledgement.
 //!
+//! # Image swap
+//!
+//! Neither path animates a single image with frames. Each decoded frame is
+//! transmitted as a *new* image, placed over the one on screen, and then the
+//! image it superseded is deleted. Deleting an image removes its placement, so
+//! two images are alive only between the place and the delete and the screen
+//! holds a frame at every instant: the swap does not flicker. A new image per
+//! frame also sidesteps the frame bookkeeping an animation would need.
+//!
 //! # What is measured
 //!
 //! Each frame is split into stages, so a slow run says which one is responsible
@@ -152,10 +161,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let c = Controller::init(std::io::stdin());
 
-    // The two media produce different image types, so each keeps its own
-    // animation chain. Everything else about the loop is identical.
-    let mut direct: Option<DynImage<easytgp::Png>> = None;
-    let mut shm: Option<DynImage<easytgp::Shm>> = None;
+    // Double buffer, one per medium. `front` holds the image the terminal is
+    // showing; each frame transmits a *fresh* image, places it over the one on
+    // screen, and then deletes the image it superseded. Two images are alive
+    // only between the place and the delete, and the screen is never empty, so
+    // the swap does not flicker.
+    let mut png_front: Option<DynImage<easytgp::Png>> = None;
+    let mut shm_front: Option<DynImage<easytgp::Shm>> = None;
 
     let mut frames: u32 = 0;
     let mut window = Stage::default();
@@ -203,65 +215,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let imgreq = c.new_shm_rgb(imgbuf)?;
             stage.stage = t.elapsed();
 
-            if let Some(dimg) = shm.as_mut() {
-                // Wait for the previous frame's ack before replacing it, so the
-                // terminal has read and unlinked the old object by now.
+            // Each frame is a brand-new image: transmit it, place it over the
+            // one on screen, then delete the previous image, which takes its
+            // placement with it. A frame is on screen at every instant, so the
+            // swap does not flicker.
+            let t = Instant::now();
+            let mut back = imgreq.transmit().await?;
+            stage.submit = t.elapsed();
+
+            let t = Instant::now();
+            back.place(easytgp::PlacementRequest {
+                cols: Some(140),
+                fix_cursor: true,
+                ..Default::default()
+            });
+            stage.overhead += t.elapsed();
+
+            if let Some(old) = shm_front.take() {
+                // Wait for the new placement to land before the old image goes,
+                // so the screen is never briefly empty.
                 let t = Instant::now();
-                dimg.sync().await?;
-                stage.submit = t.elapsed();
+                back.sync().await?;
+                stage.submit += t.elapsed();
 
                 let t = Instant::now();
-                dimg.new_frame(easytgp::NewFrameRequest {
-                    image: imgreq,
-                    ..Default::default()
-                });
-                dimg.display_last_frame();
+                old.delete();
                 stage.overhead += t.elapsed();
-            } else {
-                let t = Instant::now();
-                let mut img = imgreq.transmit().await?;
-                stage.submit = t.elapsed();
-
-                let t = Instant::now();
-                img.place(easytgp::PlacementRequest {
-                    cols: Some(140),
-                    fix_cursor: true,
-                    ..Default::default()
-                });
-                stage.overhead += t.elapsed();
-                shm = Some(img.into());
             }
+            shm_front = Some(back);
         } else {
             let t = Instant::now();
             let imgreq = c.new_png(imgbuf)?;
             stage.stage = t.elapsed();
 
-            if let Some(dimg) = direct.as_mut() {
+            let t = Instant::now();
+            let mut back = imgreq.transmit().await?;
+            stage.submit = t.elapsed();
+
+            let t = Instant::now();
+            back.place(easytgp::PlacementRequest {
+                cols: Some(40),
+                fix_cursor: true,
+                ..Default::default()
+            });
+            stage.overhead += t.elapsed();
+
+            if let Some(old) = png_front.take() {
                 let t = Instant::now();
-                dimg.sync().await?;
-                stage.submit = t.elapsed();
+                back.sync().await?;
+                stage.submit += t.elapsed();
 
                 let t = Instant::now();
-                dimg.new_frame(easytgp::NewFrameRequest {
-                    image: imgreq,
-                    ..Default::default()
-                });
-                dimg.display_last_frame();
+                old.delete();
                 stage.overhead += t.elapsed();
-            } else {
-                let t = Instant::now();
-                let mut img = imgreq.transmit().await?;
-                stage.submit = t.elapsed();
-
-                let t = Instant::now();
-                img.place(easytgp::PlacementRequest {
-                    cols: Some(40),
-                    fix_cursor: true,
-                    ..Default::default()
-                });
-                stage.overhead += t.elapsed();
-                direct = Some(img.into());
             }
+            png_front = Some(back);
         }
 
         stage.total = t_total.elapsed();

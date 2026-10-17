@@ -2,3 +2,5 @@ target/
 .cache/
 .direnv/
 result
+# Stray output from a panicking debug run, not a source artifact.
+log.txt

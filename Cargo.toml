@@ -6,6 +6,10 @@ members = [
     "crates/gobo-widget",
     "crates/easytgp",
     "crates/gobo-renderer",
+    "crates/tuigui-wire",
+    "crates/tuigui-tui",
+    "crates/tuigui-gui",
+    "crates/tuigui",
 ]
 
 [workspace.package]
@@ -16,7 +20,7 @@ license = "MIT"
 [workspace.dependencies]
 thiserror = "2"
 derive_builder = "0.20"
-rustix = { version = "1.1", features = ["fs", "termios", "process"] }
+rustix = { version = "1.1", features = ["fs", "termios", "process", "pty"] }
 png = "0.18"
 image = "0.25"
 fast_image_resize = { version = "6", features = ["rayon"] }
@@ -25,7 +29,11 @@ itertools = "0.15"
 idalloc = "0.1"
 static_init = "1.0"
 yscv-video = "0.2"
-ffmpeg-sidecar = "2"
+# Its default feature is the ffmpeg *downloader*, which drags in ureq ->
+# rustls -> ring: a full TLS stack and a C build that this project never uses,
+# since ffmpeg comes from the dev shell's PATH. Disabled, so the crate is just
+# the subprocess plumbing we actually call.
+ffmpeg-sidecar = { version = "2", default-features = false }
 rstar = "0.13"
 rayon = "1"
 ndarray = "0.16"
@@ -35,6 +43,9 @@ fxhash = "0.2"
 crossterm = { version = "0.28", default-features = false }
 derive_deref = "1.1"
 derive-getters = "0.5"
+smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend", "renderer_pixman", "desktop", "xwayland"] }
+wayland-protocols = { version = "0.32", features = ["client"] }
+tracing = "0.1"
 
 # internal
 gobo-core = { path = "crates/gobo-core" }
@@ -42,6 +53,9 @@ gobo-comp = { path = "crates/gobo-comp" }
 gobo-widget = { path = "crates/gobo-widget" }
 easytgp = { path = "crates/easytgp" }
 gobo-renderer = { path = "crates/gobo-renderer" }
+tuigui-wire = { path = "crates/tuigui-wire" }
+tuigui-tui = { path = "crates/tuigui-tui" }
+tuigui-gui = { path = "crates/tuigui-gui" }
 
 [package]
 name = "gobo"
@@ -60,3 +74,5 @@ gobo-comp = { workspace = true }
 gobo-widget = { workspace = true }
 easytgp = { workspace = true }
 gobo-renderer = { workspace = true }
+ratatui = { workspace = true }
+rustix = { workspace = true }
