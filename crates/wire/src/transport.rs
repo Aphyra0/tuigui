@@ -35,60 +35,49 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::message::Message;
 
-/// The sequence a client opens its announcement with. `ESC ] 3 0 0 0 1 ;`
+/// What separates a transport's name from its address in an announcement.
 ///
-/// The delimiters an announcement is written between, as they travel through a
-/// terminal.
+/// An announcement is a transport's own name, this separator, and the address to
+/// dial:
 ///
-/// OSC because it has a numeric namespace and an explicit terminator, so it is
-/// unambiguous to find and to delimit, and a terminal that does not recognize the
-/// dispatch number ignores it rather than corrupting the screen. That is what
-/// makes it safe to write into a pane at all.
+/// ```text
+///   unix : /run/user/1000/tuigui-1234.sock
+/// ```
 ///
-/// Here, and not in a transport, because two halves of a session may be *different
-/// transports*: the client announces over a herdr pane while the server scans a
-/// unix pty, and both are looking for the same sequence in the same terminal. What
-/// is inside the delimiters is each transport's own business — see
-/// [`Transport::to_magic`] — but where it starts and ends is the one thing they
-/// have to agree on.
-pub const ANNOUNCE_OPEN: &[u8] = b"\x1b]30001;";
-/// What ends an announcement. BEL, which is the short OSC terminator.
-pub const ANNOUNCE_CLOSE: u8 = 0x07;
+/// Plain text, and not an escape sequence, because of what is above us. A
+/// multiplexer is a terminal emulator as well as a relay: it parses a pane's output
+/// into a grid of cells and re-renders that grid, so a sequence it does not model
+/// is consumed and never reaches the real terminal. A private OSC announcement dies
+/// there. Text does not: it becomes cells, and cells are what a multiplexer draws.
+///
+/// The cost is that an announcement is no longer *unambiguously* ours. It is a line
+/// of text saying which channel to dial, and a command that printed the same thing
+/// would be treated as one. That is accepted deliberately: the alternative is a
+/// channel that cannot be found behind a muxer at all.
+pub const ANNOUNCE_SEPARATOR: &str = " : ";
 
-/// The longest announcement a scanner will hold while waiting for its terminator.
+/// The longest address an announcement may carry.
 ///
-/// An unterminated one would otherwise grow without bound: the carry is fed by a
-/// stream nobody controls, so an opener followed by a flood would grow it until
-/// memory runs out. Past this the carry is dropped, which loses one announcement
-/// and keeps the process alive.
-pub const ANNOUNCE_MAX_PAYLOAD: usize = 8 * 1024;
+/// A cap because the search runs over a stream nobody controls, and an address is
+/// short by construction: a socket path, a pane id. Past it the candidate is
+/// dropped, which loses one announcement and keeps the process alive.
+pub const ANNOUNCE_MAX_LEN: usize = 1024;
 
-/// Wrap a transport's own value in the announcement delimiters.
+/// An announcement, in the one place its format is defined.
 ///
-/// A transport calls this from [`Transport::to_magic`] and chooses what goes in
-/// the middle. Base64 by default because the announcement travels through a
-/// terminal, which is free to interpret control characters and line endings, and
-/// the encoding has neither — but a transport whose own value is already plain
-/// text can write it directly, since only it has to read it back.
-pub fn wrap_announcement(payload: &str) -> String {
-    format!(
-        "{}{payload}{}",
-        String::from_utf8_lossy(ANNOUNCE_OPEN),
-        ANNOUNCE_CLOSE as char
-    )
+/// A transport calls this to say how it can be reached, and a scanner builds the
+/// same string with an empty address to know what to look for. One definition, so a
+/// transport cannot announce one shape and be searched for in another.
+pub fn announcement(name: &str, address: &str) -> String {
+    format!("{name}{ANNOUNCE_SEPARATOR}{address}")
 }
 
-/// The value between the delimiters, for a transport reading its own announcement
-/// back.
+/// The text a scanner looks for to find `name`'s announcement.
 ///
-/// `None` for a sequence that is not an announcement at all, which is what makes
-/// this safe to hand to every transport in turn: the ones that did not write it can
-/// say so without inspecting anything else.
-pub fn strip_announcement(magic: &str) -> Option<&str> {
-    let bytes = magic.as_bytes();
-    let inner = bytes.strip_prefix(ANNOUNCE_OPEN)?;
-    let inner = inner.strip_suffix(&[ANNOUNCE_CLOSE])?;
-    std::str::from_utf8(inner).ok()
+/// Including the separator is what keeps a name that is also an ordinary word from
+/// matching: only the name *followed by the separator* starts an announcement.
+pub fn announcement_prefix(name: &str) -> String {
+    announcement(name, "")
 }
 
 /// A future that a transport returns, boxed so it can be a trait method.
@@ -486,35 +475,32 @@ pub trait Transport: Send + Sync {
     /// transport that exists must therefore answer this.
     fn advert(&self) -> Option<Advert>;
 
-    /// The bytes this transport writes into a pane so a peer can find it.
+    /// The text this transport writes into a pane so a peer can find it.
     ///
-    /// **The transport's own**, both halves: it builds the value here and it
-    /// parses one back with [`Transport::from_magic`]. Nothing outside either
-    /// looks inside, so a transport is free to put anything in there — a unix
-    /// socket puts a path (one channel for every instance, distinguished by the
-    /// id in the advert), while a transport with several channels puts whatever
-    /// it needs to tell them apart.
+    /// **The transport's own**, both halves: it builds the text here and parses one
+    /// back with [`Transport::from_magic`]. A unix socket writes its name and a
+    /// path; a transport with several logical clients on one connection writes
+    /// whatever tells them apart.
     ///
-    /// A string rather than bytes because it goes into a pane, which is a text
-    /// channel by the time anything sees it.
+    /// Text, and not an escape sequence, because of what a peer's output passes
+    /// through: see [`ANNOUNCE_SEPARATOR`].
     fn to_magic(&self) -> String;
 
     /// The transport a peer's announcement describes, if it is one of ours.
     ///
     /// The other half of [`Transport::to_magic`], and the only place an
-    /// announcement is understood. `magic` is exactly what was written into the
-    /// pane, delimiters and all, because only the transport knows where its own
-    /// value starts and ends.
+    /// announcement is understood. The scanner splits the line into the name and
+    /// what follows it, so a transport reads only the two parts it wrote and never
+    /// the framing.
     ///
     /// Returns a transport rather than a bare address because the instance is what
-    /// carries the routing: two peers can announce the same kind of channel and
-    /// still have to be told apart, and whatever distinguishes them is written
-    /// here and nowhere else.
+    /// carries the routing: two peers of the same kind still have to be told apart,
+    /// and whatever distinguishes them is written here and read here.
     ///
-    /// `None` for an announcement that is not this transport's, which is not an
-    /// error: a peer may be announcing a channel we do not speak, and a scanner
-    /// has to try the others.
-    fn from_magic(magic: &str) -> Option<Self>
+    /// `None` for a name that is not ours, which is not an error: most output
+    /// belongs to the command, and a scanner offers the same line to every transport
+    /// in turn.
+    fn from_magic(name: &str, address: &str) -> Option<Self>
     where
         Self: Sized;
 
@@ -714,10 +700,10 @@ mod tests {
             Some(Advert::new("stub"))
         }
         fn to_magic(&self) -> String {
-            wrap_announcement("stub")
+            self.label()
         }
-        fn from_magic(magic: &str) -> Option<Self> {
-            (strip_announcement(magic) == Some("stub")).then(|| Self {
+        fn from_magic(name: &str, address: &str) -> Option<Self> {
+            (name == "stub" && address == "00000000").then(|| Self {
                 caps: caps(false, true, false),
                 attempts: Arc::new(AtomicUsize::new(0)),
                 works: true,
@@ -859,31 +845,22 @@ mod tests {
         assert_eq!(link.peer(), None);
     }
 
-    /// The delimiters are what a scanner looks for, and the value between them is
-    /// the transport's own.
+    /// The one definition of an announcement, and the prefix a scanner searches by.
     ///
-    /// Framing only: what goes inside is a transport's business, so the shape to
-    /// pin down is that the delimiters are there and can be peeled off again.
+    /// Two halves of a session are different programs, so the shape has to be agreed
+    /// rather than remembered: a transport announces with [`announcement`] and a
+    /// scanner looks for [`announcement_prefix`], and both come from here.
     #[test]
-    fn an_announcement_round_trips_through_the_delimiters() {
-        let payload = "anything the transport likes";
-        let wrapped = wrap_announcement(payload);
-        assert!(wrapped.starts_with("\x1b]30001;"), "the opener comes first");
-        assert_eq!(wrapped.as_bytes().last(), Some(&ANNOUNCE_CLOSE));
-        assert_eq!(strip_announcement(&wrapped), Some(payload));
-    }
-
-    /// Something that is not an announcement has no value to peel off.
-    ///
-    /// This is what makes it safe to offer every transport the same bytes: one
-    /// that did not write them can say so without looking any further.
-    #[test]
-    fn a_sequence_that_is_not_an_announcement_is_rejected() {
-        assert_eq!(strip_announcement("hello"), None);
-        assert_eq!(strip_announcement("\x1b]30001;unterminated"), None);
-        // The opener without the terminator, and the terminator without the opener.
-        assert_eq!(strip_announcement("\x1b]30001;"), None);
-        assert_eq!(strip_announcement("\x07"), None);
+    fn an_announcement_is_its_name_and_its_address() {
+        assert_eq!(announcement("unix", "/tmp/tuigui.sock"), "unix : /tmp/tuigui.sock");
+        // The prefix includes the separator, which is what keeps a name used as an
+        // ordinary word from matching: only the name *followed by the separator*
+        // starts an announcement.
+        assert_eq!(announcement_prefix("unix"), "unix : ");
+        assert_eq!(
+            announcement_prefix("unix"),
+            &announcement("unix", "anything")[..announcement_prefix("unix").len()]
+        );
     }
 
     fn caps(in_process: bool, local: bool, may_relay: bool) -> Capabilities {

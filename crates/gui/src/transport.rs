@@ -76,33 +76,25 @@ impl Transport for ListenOnPath {
         Some(Advert::new(NAME).with(PATH, self.path.to_string_lossy().into_owned()))
     }
 
-    /// The advert's own lines, wrapped in the announcement delimiters.
+    /// This transport's own announcement: its name, then the path to dial.
     ///
-    /// The value inside is this transport's to choose: a path, because a socket is
-    /// found by name and the server has to know where to dial. Base64 because the
-    /// announcement travels through a terminal, which is free to interpret control
-    /// characters and line endings, and the encoding has neither.
+    /// The [`Transport::label`], and not a separate format: the text a peer shows
+    /// and the text it dials by are the same fact, so a label that disagreed with an
+    /// announcement would be a client showing one address and listening on another.
+    ///
+    /// Plain text, not an escape sequence, because of what the output passes
+    /// through: see [`wire::transport::ANNOUNCE_SEPARATOR`].
     fn to_magic(&self) -> String {
-        let advert = self.advert().unwrap_or_else(|| {
-            Advert::new(NAME).with(PATH, self.path.to_string_lossy().into_owned())
-        });
-        wire::transport::wrap_announcement(&base64_turbo::encode(advert.lines()))
+        self.label()
     }
 
     /// The socket an announcement describes, if it is one of ours.
     ///
-    /// Present because the trait requires both halves, and left honest rather than
-    /// stubbed: a client handed an announcement it wrote would parse it, and this
-    /// is the code that has to be right if that ever happens.
-    fn from_magic(magic: &str) -> Option<Self> {
-        let payload = wire::transport::strip_announcement(magic)?;
-        let lines = String::from_utf8(base64_turbo::decode(payload.trim().as_bytes()).ok()?).ok()?;
-        let advert = Advert::parse(&lines)?;
-        if advert.transport != NAME {
-            return None;
-        }
-        let path = advert.get(PATH)?;
-        Some(Self::new(path))
+    /// Present because the trait requires both halves, and honest rather than
+    /// stubbed: a client handed an announcement it wrote would parse it, and this is
+    /// the code that has to be right if that ever happens.
+    fn from_magic(name: &str, address: &str) -> Option<Self> {
+        (name == NAME).then(|| Self::new(address))
     }
 
     fn connect<'a>(&'a self, _advert: &'a Advert) -> BoxFuture<'a, io::Result<Connection>> {

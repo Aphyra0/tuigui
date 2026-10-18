@@ -9,10 +9,6 @@ description = "Client side: draw a runnable's output into the pane the tui serve
 wire = { workspace = true }
 easytgp = { workspace = true }
 ratatui = { workspace = true }
-# For the transport's own announcement value. Base64 because the announcement
-# travels through a terminal, which is free to interpret control characters and
-# translate line endings; the encoding has neither.
-base64-turbo = { workspace = true }
 # SIMD JPEG encoding. `image`'s encoder is scalar and was the single largest
 # cost in the frame budget; this one is libjpeg-turbo. `image` is no longer a
 # dependency here: frames go from ffmpeg's RGB buffer straight into the encoder.

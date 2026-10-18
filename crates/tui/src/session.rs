@@ -203,8 +203,7 @@ impl Sessions {
 mod tests {
     use super::*;
     use wire::transport::{
-        read_message, strip_announcement, wrap_announcement, write_message, Advert, BoxFuture,
-        Capabilities, Listener,
+        read_message, write_message, Advert, BoxFuture, Capabilities, Listener,
     };
 
     /// A transport whose only job is to be one.
@@ -230,10 +229,10 @@ mod tests {
             Some(Advert::new("stub"))
         }
         fn to_magic(&self) -> String {
-            wrap_announcement("stub")
+            self.label()
         }
-        fn from_magic(magic: &str) -> Option<Self> {
-            (strip_announcement(magic) == Some("stub")).then_some(Stub)
+        fn from_magic(name: &str, address: &str) -> Option<Self> {
+            (name == "unix" && address == "/tmp/client.sock").then_some(Stub)
         }
         fn connect<'a>(&'a self, _advert: &'a Advert) -> BoxFuture<'a, io::Result<Connection>> {
             Box::pin(async { Err(io::Error::other("the stub does not dial")) })

@@ -6,128 +6,210 @@
 //!
 //! The scanner does **not** own that output: the pty does, and hands out a view of
 //! it ([`crate::bytes::Bytes`]). The server subscribes, so the scanner is the
-//! server's and owns its own carry. The pty is the producer and never learns that
-//! a scan exists.
+//! server's and owns its own carry. The pty is the producer and never learns that a
+//! scan exists.
 //!
-//! The framing is [`wire::transport`]'s: the delimiters and the payload encoding
-//! live with the channel's shape, not with either side, because a framing two
-//! halves disagree about is a client that silently never connects.
+//! # Why the announcement is plain text
 //!
-//! # What this does and does not do
+//! ```text
+//!   unix : /run/user/1000/tuigui-1234.sock
+//! ```
 //!
-//! It **notices**; it does not consume. The view hands the same slice onward, so
-//! the announcement reaches the terminal like any other OSC. Stripping it is a
-//! separate decision and is not made here: it belongs in the output path where the
-//! write happens, not in a scanner that cannot modify what it is given.
+//! It was a private OSC sequence first, which is unambiguously ours and invisible on
+//! screen. That is wrong for the case this exists for. When a multiplexer owns the
+//! terminal, a pane's output is not forwarded to the real terminal — it is parsed by
+//! the multiplexer's own terminal emulator and re-drawn from the screen model. A
+//! sequence the emulator does not model is consumed and dropped, so the announcement
+//! never reaches anything reading the pane. Text is not dropped: it becomes cells,
+//! and cells are what the multiplexer re-draws.
+//!
+//! So the announcement is text, and it is *visible*. That is the honest form of the
+//! trade: it can be spoofed by a command that prints the same text, in exchange for
+//! working behind the thing this whole design exists to work behind.
+//!
+//! # Why it is a search, and not a line
+//!
+//! The bytes arriving here are a *rendered* stream, not a log. A client drawing its
+//! pane moves the cursor with escapes and never emits a newline — so "read a line,
+//! then parse it" finds the announcement glued to the end of a whole screen dump,
+//! and no line ever contains just the announcement. What is reliable is the text
+//! itself: a name, the separator, and an address. So the scan looks for the
+//! separator and reads what follows, whatever is around it.
 
 use std::sync::mpsc::Sender;
 
-use wire::transport::{Connection, ANNOUNCE_CLOSE, ANNOUNCE_MAX_PAYLOAD, ANNOUNCE_OPEN};
+use wire::transport::{announcement_prefix, Connection, ANNOUNCE_MAX_LEN};
 
 use crate::transport::for_magic;
 
 /// Watches the command's output for an announcement.
 pub struct Announcement {
-    /// Bytes of a possible announcement that have not resolved yet.
+    /// The end of the window that may still contain a separator.
     ///
-    /// Holds a partial opener, or a complete opener and a partial payload. Only
-    /// ever one at a time, because an announcement cannot nest.
+    /// A separator can split across two reads, so the last few bytes of a chunk are
+    /// kept and examined again with the next one. Bounded, because an announcement
+    /// is short: anything older than that cannot be part of one.
     carry: Vec<u8>,
     /// Where a found link is offered.
     ///
-    /// A `std::sync::mpsc::Sender` rather than tokio's: the view is called from
-    /// the pty's blocking forwarding thread, which is not a task and has no
-    /// runtime to await on. `try_send` is what keeps that thread off the network.
+    /// A `std::sync::mpsc::Sender` rather than tokio's: the view is called from the
+    /// pty's blocking forwarding thread, which is not a task and has no runtime to
+    /// await on. `send` on the standard channel does not block, which is what keeps
+    /// that thread off the network.
     found: Sender<Connection>,
+    /// The names to look for, longest first.
+    ///
+    /// Held rather than looked up per byte: this runs on the path of every byte the
+    /// command writes, and a scan that asked a registry each time would allocate per
+    /// chunk.
+    names: Vec<&'static str>,
+    /// The announcements already turned into links.
+    ///
+    /// An announcement is written once, but the text stays on screen and every
+    /// redraw puts it out again — the same client, the same address, several times
+    /// per second if it is redrawing. Dialing each sighting would connect to one
+    /// client over and over, so a sighting of an address already dialed is the same
+    /// client and is ignored.
+    ///
+    /// Only the addresses, and never removed: a client that reconnects announces the
+    /// same address, and re-dialing a socket that is already served would add a
+    /// second link to the same peer.
+    dialed: Vec<String>,
 }
 
 impl Announcement {
+    /// A scanner for the transports this build can dial.
     pub fn new(found: Sender<Connection>) -> Self {
+        let mut names = crate::transport::names();
+        // Longest first, so a name that is a prefix of another does not match the
+        // shorter one's address.
+        names.sort_by_key(|name| std::cmp::Reverse(name.len()));
         Self {
             carry: Vec::new(),
             found,
+            names,
+            dialed: Vec::new(),
         }
     }
 
     /// Feed one chunk of the command's output.
     ///
-    /// Must not block and must not allocate per chunk: it runs on the thread that
+    /// Should not block and must not allocate per chunk: it runs on the thread that
     /// forwards every byte the command writes.
     pub fn feed(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            // Byte at a time, because an announcement can split across chunks at
-            // any offset, including inside the opener. A chunk-at-a-time scan
-            // would miss every split one.
-            self.push(byte);
-        }
+        self.carry.extend_from_slice(bytes);
+        self.scan();
+        self.trim();
     }
 
-    fn push(&mut self, byte: u8) {
-        if self.carry.is_empty() && byte != ANNOUNCE_OPEN[0] {
-            // The overwhelmingly common case: ordinary output. Returning here is
-            // what keeps the hot path to one comparison.
+    /// Look for `<name> : <address>` anywhere in what is held.
+    ///
+    /// At most one announcement per call: one is what a client writes, and doing the
+    /// rest on the next chunk keeps this to a single pass with nothing borrowed
+    /// across the mutation that follows.
+    fn scan(&mut self) {
+        let Some((name, address, consumed)) = self.find_announcement() else {
+            return;
+        };
+        // Consumed whether or not it is dialed: a redraw puts the same text out
+        // again, and what matters is whether the address has been dialed, not
+        // whether the text is still on screen.
+        self.carry.drain(..consumed);
+        if self.dialed.iter().any(|seen| *seen == address) {
+            // The same client, seen again. Not a second one, and not an error.
             return;
         }
-        self.carry.push(byte);
-
-        if self.carry.len() <= ANNOUNCE_OPEN.len() {
-            // Still possibly the opener.
-            if !ANNOUNCE_OPEN.starts_with(&self.carry) {
-                self.reset();
-            }
-            return;
-        }
-
-        if byte == ANNOUNCE_CLOSE {
-            let whole = String::from_utf8_lossy(&self.carry).into_owned();
-            self.reset();
-            self.deliver(&whole);
-            return;
-        }
-
-        if self.carry.len() > ANNOUNCE_OPEN.len() + ANNOUNCE_MAX_PAYLOAD {
-            // Unterminated and unbounded. Dropping it loses this announcement;
-            // keeping it would lose the process.
-            self.reset();
-        }
+        self.dialed.push(address.clone());
+        self.deliver(&name, &address);
     }
 
-    /// Hand a found announcement to the server.
+    /// The first announcement in the carry, with how much of it that accounts for.
     ///
-    /// `send` on a std channel does not block, which is what keeps this thread off
-    /// the network: dialing happens on the server's own task, and a full channel
-    /// costs one client rather than stalling the command's output.
-    fn deliver(&self, magic: &str) {
-        match self.decode(magic) {
-            Some(connection) => {
-                if self.found.send(connection).is_err() {
-                    eprintln!("tui: the server is gone; dropping a client");
-                }
-            }
-            None => eprintln!("tui: could not decode an announcement; ignoring"),
+    /// `None` for text that is not an announcement, and for one whose address has
+    /// not arrived in full: the caller keeps the carry either way, and the rest
+    /// arrives with the next chunk.
+    fn find_announcement(&self) -> Option<(String, String, usize)> {
+        let text = std::str::from_utf8(&self.carry).ok()?;
+        for name in &self.names {
+            let prefix = announcement_prefix(name);
+            let Some(start) = text.find(&prefix) else {
+                continue;
+            };
+            let rest = &text[start + prefix.len()..];
+            let Some((address, end)) = take_address(rest) else {
+                continue;
+            };
+            return Some(((*name).to_string(), address.to_string(), start + prefix.len() + end));
         }
+        None
     }
 
-    /// Turn a whole announcement into a link, by asking the transports whether
-    /// they recognize it.
-    ///
-    /// The scanner does **not** look inside: it found the delimiters, and what is
-    /// between them belongs to whichever transport wrote it. Each is asked in turn
-    /// and the one that answers is the one that knows how to dial it, which is why
-    /// a transport may put anything it likes in its own announcement.
-    ///
-    /// `None` for an announcement naming a transport we do not have, which is not
-    /// an error: there is nothing to dial, so there is nothing to offer.
-    fn decode(&self, magic: &str) -> Option<Connection> {
-        let transport = for_magic(magic)?;
-        let advert = transport.advert()?;
+    /// Turn a name and address into a link, and offer it.
+    fn deliver(&mut self, name: &str, address: &str) {
+        let Some(transport) = for_magic(name, address) else {
+            return;
+        };
+        let Some(advert) = transport.advert() else {
+            return;
+        };
         eprintln!("tui: a client announced itself over {}", transport.name());
-        Some(Connection::requested(transport.into(), advert))
+        if self
+            .found
+            .send(Connection::requested(transport.into(), advert))
+            .is_err()
+        {
+            eprintln!("tui: the server is gone; dropping a client");
+        }
     }
 
-    fn reset(&mut self) {
-        self.carry.clear();
+    /// Drop everything that a separator could no longer straddle.
+    ///
+    /// The window only has to reach back as far as the longest prefix plus the
+    /// longest address, so an announcement cannot be missed by trimming. What is
+    /// dropped is the command's own output, which is most of it.
+    fn trim(&mut self) {
+        let keep = self
+            .names
+            .iter()
+            .map(|name| announcement_prefix(name).len())
+            .max()
+            .unwrap_or(0)
+            + ANNOUNCE_MAX_LEN;
+        if self.carry.len() > keep {
+            let from = self.carry.len() - keep;
+            self.carry.drain(..from);
+        }
     }
+}
+
+/// Peel one address off the front of `text`.
+///
+/// An address ends at the first byte that cannot be part of one. That is not the
+/// same as the end of a line: a rendered pane positions rows with escapes and never
+/// emits a newline, so an announcement sits inside a run of padding and cursor
+/// moves. Reading to a newline swallows all of it, and the address becomes a few
+/// hundred bytes of spaces — which is exactly how a valid path came to be rejected
+/// for being longer than a socket path can be.
+///
+/// So the address is the run of non-blank, non-control characters after the
+/// separator, and anything else ends it: the renderer's padding, a carriage return,
+/// an escape, a newline.
+///
+/// `None` when no address has arrived yet, which has to be told apart from an empty
+/// one: a chunk that ends just after the separator has the rest in the next chunk.
+fn take_address(text: &str) -> Option<(&str, usize)> {
+    let end = text
+        .find(|c: char| c.is_whitespace() || c.is_control())
+        .unwrap_or(text.len());
+    if end == 0 {
+        return None;
+    }
+    // A run this long is not an address. Giving up keeps the carry bounded on a
+    // stream nobody controls.
+    if end > ANNOUNCE_MAX_LEN {
+        return None;
+    }
+    Some((&text[..end], end))
 }
 
 #[cfg(test)]
@@ -136,9 +218,6 @@ mod tests {
     use wire::transport::Transport as _;
 
     /// What a scanner saw, without a running server.
-    ///
-    /// The scanner's own channel, not the server's: what is being tested is the
-    /// finding, and the server is not on this path until a link is in hand.
     fn scan(chunks: &[&[u8]]) -> Vec<Connection> {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut announcement = Announcement::new(tx);
@@ -149,43 +228,37 @@ mod tests {
         rx.try_iter().collect()
     }
 
-    /// An announcement a client would write, framed by the transport that owns it.
+    /// The text a client writes for itself, from the transport that owns it.
     ///
-    /// Through [`InfluxByPath::to_magic`] rather than a literal: the value inside
-    /// the delimiters is the transport's own, so a test that spelled it out would
-    /// keep passing after the transport changed, which is exactly the failure it
-    /// exists to catch. The socket in the path is the same one [`UNIX`] names.
-    fn encoded(advert: &str) -> Vec<u8> {
-        let transport = crate::transport::InfluxByPath::new("/tmp/tuigui.sock");
-        // Sanity: the test's own advert and the transport's must describe the same
-        // channel, or the assertions below would be about two different things.
-        assert_eq!(transport.advert().unwrap().lines(), advert);
-        transport.to_magic().into_bytes()
+    /// Through [`crate::transport::InfluxByPath::to_magic`] rather than a literal:
+    /// the text is the transport's own, so a test that spelled it out would keep
+    /// passing after the transport changed, which is exactly the failure it exists to
+    /// catch.
+    fn announced() -> Vec<u8> {
+        crate::transport::InfluxByPath::new("/tmp/tuigui.sock")
+            .to_magic()
+            .into_bytes()
     }
-
-    /// A whole unix advert, which is what a real announcement carries.
-    const UNIX: &str = "transport=unix\nsocket=/tmp/tuigui.sock\n";
 
     /// Ordinary output is not an announcement.
     #[test]
     fn plain_output_is_ignored() {
         assert!(scan(&[b"hello, world\n"]).is_empty());
-        // An OSC that is not ours must not match either: the dispatch number is
-        // what makes this namespace ours.
-        assert!(scan(&[b"\x1b]0;title\x07"]).is_empty());
+        // A colon that is not the separator, and a name without one.
+        assert!(scan(&[b"note:/tmp/something\n"]).is_empty());
+        assert!(scan(&[b"unix\n"]).is_empty());
+        // An article using the transport's name as an ordinary word.
+        assert!(scan(&[b"the unix way of sockets\n"]).is_empty());
     }
 
     /// An announcement split across reads is still found.
     ///
-    /// This is the property that matters and the reason the scan is byte-at-a-
-    /// time: a pty delivers arbitrary chunks, so an announcement can split at
-    /// any offset, including inside the opener. A chunk-at-a-time scan would miss
-    /// every split one, and the client would silently never connect.
+    /// This is the property that matters: a pty delivers arbitrary chunks, so one can
+    /// split at any offset, including inside the separator. A chunk-at-a-time scan
+    /// would miss every split one, and the client would silently never connect.
     #[test]
     fn an_announcement_split_across_chunks_is_found() {
-        let whole = encoded(UNIX);
-        // Every split point, not a sample: a scanner that only handles the
-        // common one is a scanner that fails occasionally.
+        let whole = announced();
         for cut in 1..whole.len() {
             let (a, b) = whole.split_at(cut);
             let seen = scan(&[a, b]);
@@ -193,69 +266,96 @@ mod tests {
         }
     }
 
-    /// The opener alone is not an announcement, and a partial opener is not lost
-    /// when the rest arrives.
+    /// An announcement at the end of a rendered screen is found.
+    ///
+    /// This is the real shape of the input: a client that draws its pane emits cursor
+    /// moves and colours with no newline anywhere, so the announcement is glued to the
+    /// end of a whole screen dump. A scanner that required a line to itself would find
+    /// nothing, which is exactly what happened.
     #[test]
-    fn a_partial_opener_is_held_until_it_resolves() {
-        // The first byte of the opener, then ordinary text: not an announcement.
-        assert!(scan(&[&ANNOUNCE_OPEN[..1], b"not an announcement"]).is_empty());
-        // The whole opener in one chunk, then a real payload in the next: the
-        // scanner must keep the opener rather than discard it for being alone.
-        let whole = encoded(UNIX);
-        let (opener, rest) = whole.split_at(ANNOUNCE_OPEN.len());
-        assert_eq!(scan(&[opener, rest]).len(), 1);
+    fn an_announcement_after_a_rendered_screen_is_found() {
+        let mut stream = Vec::new();
+        // Rows drawn by cursor positioning, as a terminal UI does.
+        for row in 1..=3 {
+            stream.extend_from_slice(format!("\x1b[{row};1H\x1b[39;48;2;255;105;180m").as_bytes());
+            stream.extend_from_slice(&vec![b' '; 80]);
+        }
+        // No newline before the announcement, because the renderer never wrote one.
+        stream.extend_from_slice(&announced());
+
+        let seen = scan(&[&stream]);
+        assert_eq!(seen.len(), 1, "the announcement must be found after a screen");
     }
 
-    /// A sequence that never terminates is dropped rather than accumulated.
+    /// The same announcement twice on one stream is one client, not two.
     ///
-    /// The carry is fed by a stream we do not control, so an unterminated opener
-    /// followed by a flood would otherwise grow it until memory runs out.
+    /// A client writes its announcement once, but the bytes around it are re-read as
+    /// the window slides. Finding it twice would dial twice.
     #[test]
-    fn an_unterminated_announcement_is_bounded() {
+    fn a_second_sighting_is_not_a_second_client() {
+        let mut twice = announced();
+        twice.extend_from_slice(&announced());
+        assert_eq!(scan(&[&twice]).len(), 1);
+    }
+
+    /// An overlong run without a terminator is bounded.
+    ///
+    /// The carry is fed by a stream nobody controls, so a command printing without
+    /// any break would otherwise grow it until memory runs out.
+    #[test]
+    fn an_overlong_line_is_bounded() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut announcement = Announcement::new(tx);
-        announcement.feed(ANNOUNCE_OPEN);
-        // Far more than the cap, with no terminator anywhere.
-        let flood = vec![b'A'; ANNOUNCE_MAX_PAYLOAD * 2];
-        announcement.feed(&flood);
+        announcement.feed(b"unix : ");
+        announcement.feed(&vec![b'A'; ANNOUNCE_MAX_LEN * 4]);
         assert!(
-            announcement.carry.len() <= ANNOUNCE_MAX_PAYLOAD + ANNOUNCE_OPEN.len(),
+            announcement.carry.len() <= ANNOUNCE_MAX_LEN * 3,
             "the carry must stay bounded, was {}",
             announcement.carry.len()
         );
     }
 
-    /// The announcement becomes a link naming the transport that recognized it,
-    /// with the announcer's own advert.
+    /// The announcement becomes a link naming the transport that recognized it.
     ///
-    /// This is the property the matching exists for: `transport=unix` has to turn
-    /// into something that can dial a unix socket, not into a name that a
-    /// different layer looks up again.
+    /// This is the property the matching exists for: the text has to turn into
+    /// something that can dial, not into a name a different layer looks up again.
     #[test]
-    fn an_announcement_becomes_a_link_for_the_transport_that_recognized_it() {
-        let seen = scan(&[&encoded(UNIX)]);
+    fn an_announcement_becomes_a_link() {
+        let seen = scan(&[&announced()]);
         assert_eq!(seen.len(), 1, "a whole announcement must produce a link");
         let transport = seen[0]
             .dialing_transport()
             .expect("a find carries the transport that will dial it");
         assert_eq!(transport.name(), "unix");
-        // The label names the path from the announcement, which is the only address
-        // the server was told.
+        assert_eq!(transport.label(), "unix : /tmp/tuigui.sock");
+    }
+
+    /// The address ends at the renderer's padding, not at the end of the stream.
+    ///
+    /// This is the bug that made a valid path undialable. A pane is drawn as fixed
+    /// rows: the announcement is followed by spaces to the edge of the area, then a
+    /// cursor move, then the next row, and there is no newline anywhere. An address
+    /// read to a newline is therefore the path plus hundreds of bytes of spaces, and
+    /// the dial fails on a path that is far longer than a socket path can be.
+    #[test]
+    fn an_address_ends_at_the_renderers_padding() {
+        let mut stream = announced();
+        stream.extend_from_slice(&vec![b' '; 200]);
+        stream.extend_from_slice(b"\x1b[24;1H");
+
+        let seen = scan(&[&stream]);
+        assert_eq!(seen.len(), 1, "the padded announcement must still be found");
+        let transport = seen[0].dialing_transport().expect("a find carries one");
         assert_eq!(transport.label(), "unix : /tmp/tuigui.sock");
     }
 
     /// An announcement for a transport we do not have produces no link.
     ///
-    /// Not an error: there is nothing to dial, so there is nothing for the
-    /// server to do. A link with a transport it cannot use would fail later and
-    /// read as a client that broke.
+    /// Not an error: there is nothing to dial, so there is nothing for the server to
+    /// do. A link with a transport it cannot use would fail later and read as a
+    /// client that broke.
     #[test]
     fn an_announcement_for_an_unknown_transport_is_ignored() {
-        let unknown = "transport=nonexistent\nsocket=/tmp/x\n";
-        let framed = wire::transport::wrap_announcement(&base64_turbo::encode(unknown));
-        assert!(scan(&[framed.as_bytes()]).is_empty());
-        // Malformed is the same case: an announcement whose value is not an advert.
-        let junk = wire::transport::wrap_announcement("not an advert");
-        assert!(scan(&[junk.as_bytes()]).is_empty());
+        assert!(scan(&[b"nonexistent : /tmp/x\n"]).is_empty());
     }
 }

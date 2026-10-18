@@ -21,8 +21,7 @@ use std::path::PathBuf;
 
 use wire::message::Message;
 use wire::transport::{
-    read_message, strip_announcement, write_message, Advert, BoxFuture, Capabilities, Connection,
-    Listener, Transport,
+    read_message, write_message, Advert, BoxFuture, Capabilities, Connection, Listener, Transport,
 };
 
 /// `Advert` key: the path a client is listening on.
@@ -85,29 +84,24 @@ impl Transport for InfluxByPath {
         Some(Advert::new(NAME).with(PATH, self.path.to_string_lossy().into_owned()))
     }
 
-    /// The advert's own lines, wrapped in the announcement delimiters.
+    /// This transport's own announcement: its name, then the path to dial.
     ///
-    /// The value inside is this transport's: a path, which is all the server needs
-    /// to dial. Base64 because the announcement travels through a terminal, which
-    /// is free to interpret control characters and line endings, and the encoding
-    /// has neither.
+    /// The [`Transport::label`], and not a separate format: the text a peer shows
+    /// and the text it dials by are the same fact, so a label that disagreed with
+    /// an announcement would be a client showing one address and listening on
+    /// another.
     fn to_magic(&self) -> String {
-        let advert = self
-            .advert()
-            .unwrap_or_else(|| Advert::new(NAME).with(PATH, self.path.to_string_lossy().into_owned()));
-        wire::transport::wrap_announcement(&base64_turbo::encode(advert.lines()))
+        self.label()
     }
 
     /// The socket an announcement describes, if it is one of ours.
     ///
-    /// Reads its own value back out of the delimiters and nothing else: the
-    /// scanner hands over a whole announcement, and where the value starts and ends
-    /// is this transport's business.
-    fn from_magic(magic: &str) -> Option<Self> {
-        let payload = strip_announcement(magic)?;
-        let lines = String::from_utf8(base64_turbo::decode(payload.trim().as_bytes()).ok()?).ok()?;
-        let advert = Advert::parse(&lines)?;
-        (advert.transport == NAME).then(|| Self::from_advert(&advert))
+    /// `name` is the transport named in the announcement and `address` what
+    /// follows it, already split by the scanner. A name that is not ours returns
+    /// `None` rather than being rejected, so the scanner can offer the same line to
+    /// every transport in turn.
+    fn from_magic(name: &str, address: &str) -> Option<Self> {
+        (name == NAME).then(|| Self::new(address))
     }
 
     fn connect<'a>(&'a self, advert: &'a Advert) -> BoxFuture<'a, io::Result<Connection>> {
@@ -142,6 +136,15 @@ impl Transport for InfluxByPath {
 /// Stable key for this transport, as it appears in an advert.
 pub const NAME: &str = "unix";
 
+/// The names of the transports this build can dial.
+///
+/// The scanner's search is built from these, so a new transport is added once:
+/// implement it, and put its name here. Everything else — what it announces, how the
+/// text is found, which one answers — follows from that.
+pub fn names() -> Vec<&'static str> {
+    vec![NAME]
+}
+
 /// The transport that can dial the client an announcement describes.
 ///
 /// The **only** place on this side that knows which channels exist, and it does not
@@ -153,6 +156,6 @@ pub const NAME: &str = "unix";
 /// A channel this build does not have returns `None` without complaint, because an
 /// announcement for a transport we do not speak is not an error, only something we
 /// cannot use — and a newer client against an older server is exactly that.
-pub fn for_magic(magic: &str) -> Option<Box<dyn Transport>> {
-    InfluxByPath::from_magic(magic).map(|t| Box::new(t) as Box<dyn Transport>)
+pub fn for_magic(name: &str, address: &str) -> Option<Box<dyn Transport>> {
+    InfluxByPath::from_magic(name, address).map(|t| Box::new(t) as Box<dyn Transport>)
 }

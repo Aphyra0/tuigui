@@ -101,54 +101,36 @@ impl Gui {
             self.socket.clone().unwrap_or_else(socket_path),
         ));
 
-        // The advert is what this client announces, and it is also what the pane
-        // shows while it waits: a client that announced an address nobody dialed can
-        // say which address, which is the difference between a visible stall and a
-        // blank pane that looks like a crash.
-        let advert = transport.advert().ok_or_else(|| {
-            // Nothing to announce is a channel nothing can find. Reporting it beats
-            // waiting forever for a dial that was never possible.
-            std::io::Error::other(format!(
-                "the {} transport has no address to announce",
-                transport.name()
-            ))
-        })?;
-        let shown = advert.lines();
+        // What this client announces, and also what the pane shows while it waits:
+        // a client that announced an address nobody dialed can say which address,
+        // which is the difference between a visible stall and a blank pane that
+        // looks like a crash.
+        let announcement = transport.to_magic();
 
-        // Waiting first, so the pane says something rather than being blank while
-        // the server finds us.
-        terminal.draw(|frame| {
-            frame.render_widget(widget::Session::waiting(&shown), frame.area())
-        })?;
-
-        // Bound before announcing, so a client that cannot listen says so rather
-        // than announcing an address nobody can dial.
+        // Bound *before* anything puts the announcement on screen. The drawing and
+        // the announcement are the same stream, so a pane that shows its address
+        // before the socket exists is a pane whose address does not answer: a server
+        // reading it would dial a socket nobody is listening on, and if it asked not
+        // to be told twice it would never try again.
         let listener = transport
             .listen()
             .await?
             .ok_or_else(|| std::io::Error::other("the socket transport cannot listen"))?;
 
-        announce(transport.to_magic())?;
+        // The announcement goes out as *drawing*, centered, which is the only way it
+        // gets into the stream: nothing here writes the terminal directly, so the
+        // text a server reads is the same text a user sees. A separate raw write of
+        // the line would be a second copy, uncentered and landing wherever the last
+        // draw left the cursor.
+        terminal.draw(|frame| {
+            frame.render_widget(widget::Session::waiting(&announcement), frame.area())
+        })?;
 
         // A dial that never comes is not an error to report: the client waits, and
         // the pane keeps saying which address it is waiting on.
         let connection = listener.accept().await?;
         handshake(&mut terminal, &*transport, connection).await
     }
-}
-
-/// Write this client's own announcement into its output, once.
-///
-/// The bytes come from the transport, because what goes inside the delimiters is
-/// the transport's own value and only it knows what that is. All this side decides
-/// is *where*: the process's stdout rather than the terminal writer, because the
-/// announcement is not drawing. It is a run of bytes in the stream the pty
-/// forwards, and it has to be there before the server can do anything — written and
-/// flushed before the accept, so a server that dials immediately still sees it.
-fn announce(magic: String) -> std::io::Result<()> {
-    let mut out = std::io::stdout();
-    out.write_all(magic.as_bytes())?;
-    out.flush()
 }
 
 /// Greet the server, then draw until the link ends.

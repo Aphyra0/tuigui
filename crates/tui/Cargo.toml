@@ -11,8 +11,6 @@ easytgp = { workspace = true }
 image = { workspace = true }
 rustix = { workspace = true }
 clap = { workspace = true }
-# Decoding the announcement a client writes into a pane's output.
-base64-turbo = { workspace = true }
 tokio = { workspace = true }
 
 [[bin]]
