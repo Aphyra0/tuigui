@@ -960,14 +960,15 @@ dependencies = [
 name = "gui"
 version = "0.1.0"
 dependencies = [
+ "base64-turbo",
  "clap",
  "easytgp",
  "ffmpeg-sidecar",
  "ratatui",
  "rustix 1.1.5",
  "tokio",
- "tuigui-wire",
  "turbojpeg",
+ "wire",
 ]
 
 [[package]]
@@ -2188,6 +2189,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json"
+version = "1.0.154"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2573,12 +2587,13 @@ dependencies = [
 name = "tui"
 version = "0.1.0"
 dependencies = [
+ "base64-turbo",
  "clap",
  "easytgp",
  "image",
  "rustix 1.1.5",
  "tokio",
- "tuigui-wire",
+ "wire",
 ]
 
 [[package]]
@@ -2589,13 +2604,6 @@ dependencies = [
  "gui",
  "tokio",
  "tui",
-]
-
-[[package]]
-name = "tuigui-wire"
-version = "0.1.0"
-dependencies = [
- "tokio",
 ]
 
 [[package]]
@@ -2955,6 +2963,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
+name = "wire"
+version = "0.1.0"
+dependencies = [
+ "base64-turbo",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2991,6 +3010,12 @@ name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zune-core"

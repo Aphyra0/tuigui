@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/easytgp", "crates/tuigui-wire", "crates/tui", "crates/gui"]
+members = ["crates/easytgp", "crates/wire", "crates/tui", "crates/gui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -41,7 +41,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "proce
 
 # internal
 easytgp = { path = "crates/easytgp" }
-tuigui-wire = { path = "crates/tuigui-wire" }
+wire = { path = "crates/wire" }
 tui = { path = "crates/tui" }
 gui = { path = "crates/gui" }
 

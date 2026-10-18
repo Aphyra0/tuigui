@@ -11,6 +11,7 @@ use tokio::process::{Child, Command};
 
 use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
 
+use crate::bytes::Bytes;
 use crate::proxy::{Proxy, Streams};
 use crate::sink::Sink;
 
@@ -31,6 +32,13 @@ pub struct Pty {
     /// read the terminal's size from its environment inside a muxer's pane.
     cols: u32,
     rows: u32,
+    /// The command's output, as something else can look at it.
+    ///
+    /// Held here rather than handed to a consumer, which is the inversion: the
+    /// pty is the producer and knows nothing about who is watching, and a
+    /// consumer is given [`Pty::bytes`] and subscribes. Nothing in the pty
+    /// changes when a consumer is added.
+    bytes: Bytes,
 }
 
 impl Pty {
@@ -39,6 +47,9 @@ impl Pty {
     /// `stdin` is the keyboard and `sink` the screen. They are taken as arguments
     /// rather than read from the process, which is what lets a test drive this
     /// without a terminal of its own.
+    ///
+    /// Nothing is told where to send what it finds here: whoever wants the
+    /// command's bytes calls [`Pty::bytes`] and subscribes.
     pub fn new(
         command: &[String],
         stdin: impl Read + Send + 'static,
@@ -76,12 +87,29 @@ impl Pty {
         // what it consumes, so it is the `stdin`.
         let dest = Streams::new(sink, stdin, io::stderr());
 
+        // The view is published into from the forwarding thread, so what it
+        // carries is the chunk that was just read: a slice that already exists,
+        // handed on rather than copied.
+        let bytes = Bytes::new();
+        let published = bytes.clone();
+        let proxy = Proxy::new(source, dest).watching(move |chunk| published.publish(chunk));
+
         Ok(Self {
-            proxy: Proxy::new(source, dest),
+            proxy,
             child,
             cols: ws.ws_col as u32,
             rows: ws.ws_row as u32,
+            bytes,
         })
+    }
+
+    /// The command's output, as a view a consumer can subscribe to.
+    ///
+    /// A clone of one `Arc`, so the caller keeps its own handle and the pty keeps
+    /// publishing: subscribing is how a consumer joins, and dropping its handle is
+    /// how it leaves.
+    pub fn bytes(&self) -> Bytes {
+        self.bytes.clone()
     }
 
     /// The grid the command's pty was created with, in cells.

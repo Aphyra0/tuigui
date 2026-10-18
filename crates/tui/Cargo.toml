@@ -6,11 +6,13 @@ license.workspace = true
 description = "Server side: run a command in a pty and paint remotely-sent frames onto the real terminal"
 
 [dependencies]
-tuigui-wire = { workspace = true }
+wire = { workspace = true }
 easytgp = { workspace = true }
 image = { workspace = true }
 rustix = { workspace = true }
 clap = { workspace = true }
+# Decoding the announcement a client writes into a pane's output.
+base64-turbo = { workspace = true }
 tokio = { workspace = true }
 
 [[bin]]
