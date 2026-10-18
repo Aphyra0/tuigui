@@ -25,9 +25,7 @@ mod proxy;
 mod pty;
 mod raw;
 mod server;
-mod session;
 mod sink;
-mod transport;
 
 use std::io::{self, Read, Write};
 
@@ -39,9 +37,7 @@ pub use bytes::Bytes;
 pub use pty::Pty as Command;
 pub use proxy::Streams;
 pub use server::Server as ImageServer;
-pub use session::{Session, Sessions};
 pub use sink::Sink as Screen;
-pub use transport::InfluxByPath;
 
 // A session, as the command line describes it. `run` is where it starts.
 //
@@ -80,27 +76,24 @@ impl Tui {
         let _raw = Raw::install()?;
         let sink = Sink::new(stdout);
 
-        // The pty first, because the server is built around what the pty produces:
-        // the pty is the producer and the server subscribes to it. There is no
-        // socket to bind and no session file to write — a client names its own
-        // channel, and this side only answers.
+        // The pty first, because the server is built around what the pty produces: the pty
+        // is the producer and the server reads it. There is no socket to bind and no session
+        // file to write — a client names its own channel, and this side only answers.
         let pty = Pty::new(&self.command, stdin, sink.clone())?;
 
-        // The scan runs on the pty's forwarding thread, so what it finds is
-        // offered on a blocking channel rather than awaited: that thread has no
-        // runtime to await on, and must not wait for one.
-        let (found_tx, found_rx) = std::sync::mpsc::channel();
-        let mut announcement = announce::Announcement::new(found_tx);
-        pty.bytes().subscribe(move |chunk| announcement.feed(chunk));
-
-        let server = Server::new(sink, found_rx);
+        // One subscription, read by the server's own loop. Reading it there rather than on
+        // the pty's forwarding thread is what lets the same loop wait on the clients too: a
+        // scan on that thread would have to hand its finds over from it, and the finds would
+        // be a third thing to select on.
+        let output = pty.bytes().subscribe();
+        let server = Server::new(sink, output);
 
         tokio::select! {
-            // The command's half: its own select races the bytes against the
-            // child, so this is one arm of the whole session.
+            // The command's half: its own select races the bytes against the child, so this
+            // is one arm of the whole session.
             session = pty.run() => session,
-            // Nothing is watching the pty's output any more, so no client can be
-            // found and there is no session left to serve.
+            // Nothing is reading the pty's output any more, so no client can be found and
+            // there is no session left to serve.
             served = server.run() => served,
         }
     }

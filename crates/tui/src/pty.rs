@@ -87,9 +87,9 @@ impl Pty {
         // what it consumes, so it is the `stdin`.
         let dest = Streams::new(sink, stdin, io::stderr());
 
-        // The view is published into from the forwarding thread, so what it
-        // carries is the chunk that was just read: a slice that already exists,
-        // handed on rather than copied.
+        // The publisher is handed to the forwarding thread, so what it carries is the
+        // chunk that was just read: a slice that already exists, offered to whoever
+        // subscribed rather than copied for a reader that may not be there.
         let bytes = Bytes::new();
         let published = bytes.clone();
         let proxy = Proxy::new(source, dest).watching(move |chunk| published.publish(chunk));
@@ -103,11 +103,10 @@ impl Pty {
         })
     }
 
-    /// The command's output, as a view a consumer can subscribe to.
+    /// The command's output, as a handle a reader subscribes to.
     ///
     /// A clone of one `Arc`, so the caller keeps its own handle and the pty keeps
-    /// publishing: subscribing is how a consumer joins, and dropping its handle is
-    /// how it leaves.
+    /// publishing: subscribing is how a reader joins.
     pub fn bytes(&self) -> Bytes {
         self.bytes.clone()
     }

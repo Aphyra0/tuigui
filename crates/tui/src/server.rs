@@ -1,177 +1,208 @@
 //! The image server: a client tells it where it is, and it dials.
 //!
-//! The server does **not** listen. The client owns the channel and announces it;
-//! this side's only job is to notice the announcement and dial back.
+//! The server does **not** listen. The client owns the channel and announces it; this side's
+//! only job is to notice the announcement and dial back.
 //!
 //! ```text
-//!   pty output ──▶ scan ──▶ a link ──▶ dial ──▶ greet/Pong ──▶ frames
+//!   pty output ──▶ scan ──▶ a transport ──▶ connect ──▶ Ping/Pong ──▶ frames
 //! ```
 //!
-//! Everything above the scan is asynchronous and runs on the server's own task,
-//! never on the pty's forwarding thread: that thread runs on the path of every byte
-//! the command writes, and blocking it on a dial would stall the command's output.
+//! # One loop, two things to wait on
+//!
+//! The pty's output, where a client announces itself, and the clients already attached,
+//! whose messages arrive whenever they do. Neither can wait on the other, so they are one
+//! `select!`.
+//!
+//! The connect is in the arm that found the announcement, because that is where the
+//! transport is: it was just built from the text a client wrote, and it is the only thing
+//! that knows how to reach it. [`Transport::connect`] is what dials *and* greets, so what
+//! comes back is a peer that has answered rather than a socket that opened.
 
 use std::io;
-use std::sync::{Arc, Mutex};
+
+use std::future::Future;
+use std::pin::Pin;
+
+use tokio::sync::mpsc::Receiver;
 
 use wire::message::Message;
 use wire::transport::{Connection, Transport};
 
-use crate::session::{Session, Sessions};
+use crate::announce::Announcement;
 use crate::sink::Sink;
 
-/// The server: the scan of what the pty forwards, and the clients it finds.
+/// What the pty produces, and what the scan finds in it.
+///
+/// The two together because they are one thing from the server's side: the scanner stepts
+/// over chunks, and a chunk is what `next` waits for. Splitting them would be a caller that
+/// has to remember which of the two it is holding.
+pub struct Announcements {
+    /// The pty's output, read here so the loop that scans is the loop that waits.
+    output: Receiver<Vec<u8>>,
+    /// The scan of it.
+    scanner: Announcement,
+}
+
+impl Announcements {
+    pub fn new(output: Receiver<Vec<u8>>) -> Self {
+        Self {
+            output,
+            scanner: Announcement::new(),
+        }
+    }
+
+    /// Wait for the next client to announce itself.
+    ///
+    /// A transport, not a chunk: the chunks are how a client is found and are nobody else's
+    /// business, so what comes out of here is the thing that knows how to reach one. Chunks
+    /// that announce nobody are looped over and never seen — they are the command's own
+    /// output, and there are a great many of them.
+    ///
+    /// `None` means the pty is gone, which is the end of the session rather than a failure.
+    pub async fn next(&mut self) -> Option<Box<dyn Transport>> {
+        loop {
+            let chunk = self.output.recv().await?;
+            if let Some(transport) = self.scanner.feed(&chunk).into_iter().next() {
+                return Some(transport);
+            }
+        }
+    }
+}
+
+/// One client the server has attached.
+///
+/// A [`Connection`] is one link; a `Session` is a client the server has attached, which is a
+/// link and nothing more for now. It exists as a type of its own because the two are
+/// different facts and will diverge — what a client draws into, its grid.
+///
+/// Every session is established. The handshake happens inside [`Transport::connect`], so a
+/// connection only exists once a peer has answered the greeting, and there is no
+/// half-attached client to be told apart from a whole one.
+pub struct Session {
+    pub connection: Connection,
+}
+
+/// The server: the clients it has dialed, and what the pty has produced.
 pub struct Server {
     /// The one writer to the screen, shared with the pty's proxy.
     ///
-    /// Held but not yet written to: once frames are drawn they go out through
-    /// this, which is what keeps a frame from landing in the middle of the
-    /// command's output.
+    /// Held but not yet written to: once frames are drawn they go out through this, which is
+    /// what keeps a frame from landing in the middle of the command's output.
     sink: Sink,
-    /// Where a found link arrives from the scan.
+    /// What the pty has produced, and where a client announces itself.
+    announcements: Announcements,
+    /// Every client attached to this session.
     ///
-    /// Blocking, because the sender is the pty's forwarding thread: it is not a
-    /// task and has nothing to await on. [`Server::run`] moves the waiting to a
-    /// thread of its own for that reason.
-    found: std::sync::mpsc::Receiver<Connection>,
-    /// Every client the server has dialed.
-    ///
-    /// Shared because each client is read by its own task, and what the server
-    /// knows about a client has to outlive the borrow of its link.
-    sessions: Arc<Mutex<Sessions>>,
+    /// Owned by the loop and nowhere else: reading a link needs it, so a link in a map
+    /// beside the loop reading it would be a link in two places.
+    sessions: Vec<Session>,
 }
 
 impl Server {
-    pub fn new(sink: Sink, found: std::sync::mpsc::Receiver<Connection>) -> Self {
+    /// Serve a pty's output.
+    pub fn new(sink: Sink, output: Receiver<Vec<u8>>) -> Self {
         Self {
             sink,
-            found,
-            sessions: Arc::new(Mutex::new(Sessions::new())),
+            announcements: Announcements::new(output),
+            sessions: Vec::new(),
         }
     }
 
-    /// Dial every client the scan finds, until the channel closes.
+    /// How many clients are attached.
+    pub fn clients(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Serve until the pty's output ends.
     pub async fn run(self) -> io::Result<()> {
-        // Not written yet, but the field is the reason a second writer to the
-        // screen cannot exist: once frames are drawn they go through here.
+        // Not written yet, but the field is the reason a second writer to the screen cannot
+        // exist: once frames are drawn they go through here.
         let _sink = self.sink;
-        let sessions = self.sessions;
+        let mut announcements = self.announcements;
+        let mut sessions = self.sessions;
 
-        // The scan's channel is blocking, so it gets a thread rather than a
-        // runtime worker: waiting on it is not an await. A bounded channel back to
-        // the runtime keeps the two apart, and `try_send` keeps this thread from
-        // ever blocking on the server.
-        let (found_tx, mut found) = tokio::sync::mpsc::channel::<Connection>(16);
-        let scanning = self.found;
-        std::thread::spawn(move || {
-            while let Ok(connection) = scanning.recv() {
-                if found_tx.try_send(connection).is_err() {
-                    eprintln!("tui: not dialing a client; the server is behind");
+        loop {
+            // What to do, decided here and acted on below. The block is load-bearing: the reads
+            // borrow `sessions`, and the match under this needs it mutable. Scoping the reads
+            // to this block is what ends one borrow before the other begins.
+            //
+            // Rebuilding the reads each pass costs nothing, and dropping the ones that did not
+            // finish loses nothing: every read here is cancel-safe, so a socket keeps whatever
+            // it has and the next pass finds it.
+            // What to do, decided here and acted on below. The scoping is load-bearing: the
+            // reads borrow `sessions` immutably, and the match under this needs it mutable, so
+            // one borrow has to end before the other starts. Building the reads in a branch
+            // rather than in a helper is what keeps that borrow inside it.
+            let action = if sessions.is_empty() {
+                // Nothing to read, so there is nothing to race: waiting on the announcement
+                // alone is the same thing without an empty `select_all`, which asserts.
+                Action::Announced(announcements.next().await)
+            } else {
+                let reads: Vec<_> = sessions
+                    .iter()
+                    .map(|session| {
+                        Box::pin(session.connection.recv())
+                            as Pin<Box<dyn Future<Output = io::Result<Option<Message>>> + Send + '_>>
+                    })
+                    .collect();
+
+                tokio::select! {
+                    // A client announced itself, and what came back knows how to reach it. The
+                    // dial is what turns that into a client, and it greets while it dials, so a
+                    // peer that never answers is a client that is not attached.
+                    transport = announcements.next() => Action::Announced(transport),
+                    // A client said something.
+                    (outcome, index, _rest) = futures_util::future::select_all(reads) => {
+                        Action::Said { outcome, index }
+                    }
                 }
-            }
-        });
+            };
 
-        while let Some(connection) = found.recv().await {
-            dial(connection, sessions.clone());
-        }
-        Ok(())
-    }
-}
-
-/// Dial a found link, then serve it.
-///
-/// Spawned rather than awaited: a slow dial must not stall the loop, so one
-/// client's unreachable channel does not stop the next client from being found.
-fn dial(connection: Connection, sessions: Arc<Mutex<Sessions>>) {
-    tokio::spawn(async move {
-        // The transport that recognized the announcement is the one holding the
-        // framing, and it is what dials: a link does not know how to reach its own
-        // kind of peer, and looking one up by name later could find a different
-        // one.
-        let Some(transport) = connection.dialing_transport() else {
-            eprintln!("tui: a link arrived already dialed, which nothing produces");
-            return;
-        };
-        match connection.connect().await {
-            Ok(connected) => serve(transport, connected, sessions),
-            Err(e) => eprintln!("tui: could not dial a client that announced itself: {e}"),
-        }
-    });
-}
-
-/// Serve one client, on its own task.
-fn serve(transport: Arc<dyn Transport>, connection: Connection, sessions: Arc<Mutex<Sessions>>) {
-    tokio::spawn(serve_client(transport, connection, sessions));
-}
-
-/// Greet a client, then read what it sends until it disconnects.
-///
-/// The greeting goes first, before any reading: a client draws nothing until it
-/// hears a ping, so sending it late would leave a pane blank while the server
-/// waits for a message the client is waiting to be told to send.
-async fn serve_client(
-    transport: Arc<dyn Transport>,
-    connection: Connection,
-    sessions: Arc<Mutex<Sessions>>,
-) {
-    let Some(mut session) = Session::new(connection, transport.clone()) else {
-        eprintln!("tui: a transport handed over a link that is not connected");
-        return;
-    };
-    let peer = session.peer().to_string();
-    let label = transport.label();
-
-    if let Err(e) = session.greet().await {
-        eprintln!("tui: could not greet {peer}: {e}");
-        return;
-    }
-    // Attached *after* the greeting went out, and before any answer: the point of
-    // `established` is to tell a client that has answered from one that has not,
-    // so a client has to be known while it still has not.
-    sessions.lock().unwrap_or_else(|e| e.into_inner()).attach(&session, label);
-
-    loop {
-        match session.recv().await {
-            Ok(Some(message)) => {
-                let established = sessions
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .record(&peer, &message);
-                if established {
-                    eprintln!("tui: {peer} is established over {}", session.transport_name());
-                }
-                report(&message);
-            }
-            // A disconnect is the normal end of a client, not a failure.
-            Ok(None) => break,
-            Err(e) => {
-                eprintln!("tui: {peer} ended: {e}");
-                break;
+            match action {
+                Action::Announced(Some(transport)) => match transport.connect().await {
+                    Ok(connection) => sessions.push(Session { connection }),
+                    Err(e) => eprintln!("tui: could not reach an announced client: {e}"),
+                },
+                // The pty is gone, so the session is over and there is nothing left to serve.
+                Action::Announced(None) => return Ok(()),
+                Action::Said { outcome, index } => match outcome {
+                    Ok(Some(message)) => report(&message),
+                    // The client closed between messages, which is the normal end of one.
+                    Ok(None) => {
+                        sessions.remove(index);
+                        eprintln!("tui: a client disconnected");
+                    }
+                    Err(e) => {
+                        eprintln!("tui: client {index} ended: {e}");
+                        sessions.remove(index);
+                    }
+                },
             }
         }
     }
-    if sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .detach(&peer)
-        .is_some()
-    {
-        eprintln!("tui: {peer} disconnected");
-    }
 }
 
-/// Say what a client sent, for the messages the server has nothing else to do
-/// with yet.
-///
-/// `Pong` is not here: it is the handshake, and the registry already acts on it.
+/// What the loop decided to do, once the borrows the decision was made under are gone.
+enum Action {
+    /// The wait for an announcement finished, one way or another.
+    Announced(Option<Box<dyn Transport>>),
+    /// A client's read finished.
+    Said {
+        outcome: io::Result<Option<Message>>,
+        index: usize,
+    },
+}
+
+/// Say what a client sent, for the messages the server has nothing else to do with yet.
 fn report(message: &Message) {
     match message {
         Message::Frame(body) => {
-            eprintln!("tui: dropped a {} byte frame (no display yet)", body.len());
+            eprintln!(
+                "tui: a client sent a {} byte frame (no display yet)",
+                body.len()
+            );
         }
         Message::Error(text) => eprintln!("tui: a client reported: {text}"),
-        // A server does not ping a client, so hearing one back is a client
-        // speaking a protocol we did not give it.
         Message::Ping(_) => eprintln!("tui: a client sent a ping, which only a server sends"),
         Message::Pong => {}
     }

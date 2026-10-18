@@ -33,12 +33,11 @@
 //! in-band cannot go stale.
 
 use std::io::{Read, Write};
-use std::sync::Arc;
 
 use wire::message::Message;
 use wire::transport::{Connection, Transport};
+use wire::unix::UnixSocket;
 
-mod transport;
 mod widget;
 
 /// Where this client listens when nothing else is asked for.
@@ -91,81 +90,78 @@ impl Gui {
         // how a frame of it reaches `tui`, is the next piece of work.
         let _ = &self.path;
 
-        // Drawn to the writer the caller gave, not to `io::stdout()`: the caller is
-        // what knows where this pane's screen is, and writing to the process's own
-        // stdout would ignore it.
+        // Drawn to the writer the caller gave, not to `io::stdout()`: the caller is what
+        // knows where this pane's screen is, and writing to the process's own stdout would
+        // ignore it.
         let backend = ratatui::backend::CrosstermBackend::new(stdout);
         let mut terminal = ratatui::Terminal::new(backend)?;
 
-        let transport: Arc<dyn Transport> = Arc::new(transport::ListenOnPath::new(
-            self.socket.clone().unwrap_or_else(socket_path),
-        ));
+        // The socket, and the address that goes in the announcement. The two are one fact,
+        // which is why the transport produces both.
+        let socket = UnixSocket::new(self.socket.clone().unwrap_or_else(socket_path));
 
-        // What this client announces, and also what the pane shows while it waits:
-        // a client that announced an address nobody dialed can say which address,
-        // which is the difference between a visible stall and a blank pane that
-        // looks like a crash.
-        let announcement = transport.to_magic();
+        // Bound *before* anything puts the address on screen. The drawing and the
+        // announcement are the same stream, so a pane that shows its address before the
+        // socket exists is a pane whose address does not answer: a server reading it would
+        // dial a socket nobody is listening on, and having been told not to dial twice it
+        // would never try again.
+        socket.bind().await?;
 
-        // Bound *before* anything puts the announcement on screen. The drawing and
-        // the announcement are the same stream, so a pane that shows its address
-        // before the socket exists is a pane whose address does not answer: a server
-        // reading it would dial a socket nobody is listening on, and if it asked not
-        // to be told twice it would never try again.
-        let listener = transport
-            .listen()
-            .await?
-            .ok_or_else(|| std::io::Error::other("the socket transport cannot listen"))?;
+        // What this client announces, and also what the pane shows while it waits: a client
+        // that announced an address nobody dialed can say which address, which is the
+        // difference between a visible stall and a blank pane that looks like a crash.
+        let announcement = socket
+            .to_magic()
+            .ok_or_else(|| std::io::Error::other("the socket transport has no address"))?;
 
-        // The announcement goes out as *drawing*, centered, which is the only way it
-        // gets into the stream: nothing here writes the terminal directly, so the
-        // text a server reads is the same text a user sees. A separate raw write of
-        // the line would be a second copy, uncentered and landing wherever the last
-        // draw left the cursor.
+        // The announcement goes out as *drawing*, centered, which is the only way it gets
+        // into the stream: nothing here writes the terminal directly, so the text a server
+        // reads is the same text a user sees.
         terminal.draw(|frame| {
             frame.render_widget(widget::Session::waiting(&announcement), frame.area())
         })?;
 
-        // A dial that never comes is not an error to report: the client waits, and
-        // the pane keeps saying which address it is waiting on.
-        let connection = listener.accept().await?;
-        handshake(&mut terminal, &*transport, connection).await
+        // A dial that never comes is not an error to report: the client waits, and the pane
+        // keeps saying which address it is waiting on. The wait answers the server's
+        // greeting, so what comes back is a link that is established.
+        let connection = socket.accept().await?;
+        draw_until_ended(&mut terminal, connection, announcement).await
     }
 }
 
-/// Greet the server, then draw until the link ends.
+/// Draw until the server closes, reporting what it sends.
 ///
-/// The server pings, and the pong is what tells it this client is really in the
-/// session. Until the ping arrives the pane stays in its waiting colour, so a
-/// connection that was made and then went quiet is visible as exactly that.
-async fn handshake(
+/// Nothing draws frames yet, so a frame is reported rather than shown. The link is already
+/// established — the greeting was answered when the server dialed — so the pane is green
+/// before the first message arrives.
+async fn draw_until_ended(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<impl Write>>,
-    transport: &dyn Transport,
-    mut connection: Connection,
+    connection: Connection,
+    announcement: String,
 ) -> std::io::Result<()> {
+    // Green, and named with what this client announced: the one thing the user is waiting to
+    // see, and the proof that this pane is talking to the session it thinks.
+    terminal.draw(|frame| {
+        frame.render_widget(
+            widget::Session::established(announcement),
+            frame.area(),
+        )
+    })?;
+
     loop {
-        match transport.recv(&mut connection).await? {
-            Some(Message::Ping(label)) => {
-                // Green and named: the one thing the user is waiting to see, and
-                // the proof that this pane is talking to the session it thinks.
-                terminal.draw(|frame| {
-                    frame.render_widget(widget::Session::established(label.clone()), frame.area())
-                })?;
-                transport.send(&mut connection, &Message::Pong).await?;
-            }
-            // Nothing draws frames yet, so a frame is reported rather than shown.
-            Some(Message::Frame(body)) => {
+        match connection.recv().await {
+            Ok(Some(Message::Frame(body))) => {
                 eprintln!("gui: dropped a {} byte frame (no display yet)", body.len());
             }
-            Some(Message::Error(text)) => {
-                // The server reports what *this* client asked for and failed, so
-                // this side is the one that should stop.
+            Ok(Some(Message::Error(text))) => {
+                // The server reports what *this* client asked for and failed, so this side is
+                // the one that should stop.
                 return Err(std::io::Error::other(format!("the server failed: {text}")));
             }
-            // A client does not ping a server.
-            Some(Message::Pong) => eprintln!("gui: the server sent a pong"),
+            Ok(Some(Message::Ping(_))) | Ok(Some(Message::Pong)) => {}
             // The server closed. The session is over, which is not an error.
-            None => return Ok(()),
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e),
         }
     }
 }

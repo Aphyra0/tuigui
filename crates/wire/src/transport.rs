@@ -1,73 +1,49 @@
-//! The transport seam: how a client and a server reach each other.
+//! The transport seam: how a client and a server reach each other, and everything done
+//! on that link.
 //!
-//! The seam is a **byte stream**, not a message channel. [`crate::proto`] owns
-//! framing and runs over whatever stream a transport hands it, so a transport
-//! never implements that framing itself — only "give me a stream". That is what
-//! makes swapping channels cheap and keeps the wire format in one place.
+//! A transport **is** the thing a caller talks to. It is not a factory that hands out
+//! something else to talk to: it holds its own connection, so `send` and `try_recv` need
+//! no argument and a caller that has one has everything — the framing, the address, and
+//! whatever state the channel keeps between messages.
 //!
-//! # What is here, and what is not
-//!
-//! This module is the **shape**: the trait, the link, the advert, the
-//! capabilities. It names no channel and knows no address, so it is the same file
-//! whichever side of the session is compiled.
-//!
-//! The implementations are **per side**, in the binary that needs them:
-//!
-//! | | |
-//! |---|---|
-//! | `tui/src/transport.rs` | the server's: it dials, so it implements `connect` |
-//! | `gui/src/transport.rs` | the client's: it is dialed to, so it implements `listen` |
-//!
-//! They are separate files rather than one shared module because the two halves
-//! of a session need different things from a channel, and a single shared
-//! implementation has to satisfy both — which is how a client ends up carrying
-//! code for dialing a peer it never dials. Each side also decides its own set of
-//! channels and how to announce them, which is policy rather than protocol.
+//! The two sides are peers, not a client and a server in the protocol sense. Either may
+//! dial and either may accept, and which one does is the choice of whoever builds it: a
+//! session between two processes on one machine needs no more than a socket at a known
+//! path, and neither end has to be told which role it plays.
 
-use std::collections::BTreeMap;
+
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::message::Message;
 
 /// What separates a transport's name from its address in an announcement.
 ///
-/// An announcement is a transport's own name, this separator, and the address to
-/// dial:
+/// An announcement is a transport's own name, this separator, and the address to dial:
 ///
 /// ```text
-///   unix : /run/user/1000/tuigui-1234.sock
+///   unix : /run/user/1000/tuigui.sock
 /// ```
 ///
-/// Plain text, and not an escape sequence, because of what is above us. A
-/// multiplexer is a terminal emulator as well as a relay: it parses a pane's output
-/// into a grid of cells and re-renders that grid, so a sequence it does not model
-/// is consumed and never reaches the real terminal. A private OSC announcement dies
-/// there. Text does not: it becomes cells, and cells are what a multiplexer draws.
-///
-/// The cost is that an announcement is no longer *unambiguously* ours. It is a line
-/// of text saying which channel to dial, and a command that printed the same thing
-/// would be treated as one. That is accepted deliberately: the alternative is a
-/// channel that cannot be found behind a muxer at all.
+/// Plain text, and not an escape sequence, because of what is above us. A multiplexer is a
+/// terminal emulator as well as a relay: it parses a pane's output into a grid of cells
+/// and re-draws that grid, so a sequence it does not model is consumed and never reaches
+/// the real terminal. A private OSC announcement dies there. Text does not: it becomes
+/// cells, and cells are what a multiplexer draws.
 pub const ANNOUNCE_SEPARATOR: &str = " : ";
 
 /// The longest address an announcement may carry.
 ///
-/// A cap because the search runs over a stream nobody controls, and an address is
-/// short by construction: a socket path, a pane id. Past it the candidate is
-/// dropped, which loses one announcement and keeps the process alive.
+/// A cap because the search runs over a stream nobody controls, and an address is short by
+/// construction: a socket path, a pane id. Past it the candidate is dropped, which loses
+/// one announcement and keeps the process alive.
 pub const ANNOUNCE_MAX_LEN: usize = 1024;
 
 /// An announcement, in the one place its format is defined.
-///
-/// A transport calls this to say how it can be reached, and a scanner builds the
-/// same string with an empty address to know what to look for. One definition, so a
-/// transport cannot announce one shape and be searched for in another.
 pub fn announcement(name: &str, address: &str) -> String {
     format!("{name}{ANNOUNCE_SEPARATOR}{address}")
 }
@@ -80,796 +56,272 @@ pub fn announcement_prefix(name: &str) -> String {
     announcement(name, "")
 }
 
-/// A future that a transport returns, boxed so it can be a trait method.
-///
-/// Only the transport's own `async fn`s need this. The stream itself does not:
-/// `AsyncRead`/`AsyncWrite` are poll-based and already object-safe.
+/// A future a transport returns, boxed so it can be a trait method.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A bidirectional byte stream.
 ///
-/// A blanket implementation, never written by hand. It exists so that
-/// `Box<dyn Stream>` reads as one type instead of three bounds.
+/// A blanket implementation, never written by hand. It exists so that `Box<dyn Stream>`
+/// reads as one type instead of three bounds.
 pub trait Stream: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Stream for T {}
 
 /// One message, framed on a plain byte stream.
 ///
-/// A stream has no message boundaries, so the reader has to be told how much to
-/// read: one tag byte and a body, with the body's length in a 4-byte prefix.
-/// [`Message::encode`] alone would rely on the write boundary surviving, which is
-/// true of a datagram and false of `SOCK_STREAM`.
-///
-/// Generic over the stream rather than taking a link, so a test with one half of
-/// a pair can drive it directly.
-pub fn write_message<'a, S>(stream: &'a mut S, message: &Message) -> BoxFuture<'a, io::Result<()>>
+/// A stream has no message boundaries, so the reader has to be told how much to read: one
+/// tag byte and a body, with the body's length in a 4-byte prefix. [`Message::encode`]
+/// alone would rely on the write boundary surviving, which is true of a datagram and false
+/// of `SOCK_STREAM`.
+pub async fn write_message<S>(stream: &mut S, message: &Message) -> io::Result<()>
 where
     S: AsyncWrite + Send + Unpin + ?Sized,
 {
-    // Encoded now rather than inside the future: the message is only needed for
-    // its bytes, and taking them up front means the returned future borrows the
-    // stream alone.
     let body = message.encode();
-    Box::pin(async move {
-        let len = (body.len() as u32).to_be_bytes();
-        stream.write_all(&len).await?;
-        stream.write_all(&body).await?;
-        stream.flush().await
-    })
+    let len = (body.len() as u32).to_be_bytes();
+    stream.write_all(&len).await?;
+    stream.write_all(&body).await?;
+    stream.flush().await
 }
 
-/// The other half of [`write_message`].
-pub fn read_message<S>(stream: &mut S) -> BoxFuture<'_, io::Result<Option<Message>>>
-where
-    S: AsyncRead + Send + Unpin + ?Sized,
-{
-    Box::pin(async move {
-        let mut len = [0u8; 4];
-        match stream.read_exact(&mut len).await {
-            Ok(_) => {}
-            // A clean close between messages is the end of a client, not a
-            // corruption: nothing was half-read.
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
-        }
-        let len = u32::from_be_bytes(len) as usize;
-        let mut body = vec![0u8; len];
-        stream.read_exact(&mut body).await?;
-        Ok(Some(Message::decode(&body)?))
-    })
-}
-
-/// A link between two ends, and which of the three states it is in.
+/// The framing state for one link: bytes in, whole messages out.
 ///
-/// The states exist because a connection is *negotiated*, not just opened. A
-/// client learns it should connect from an advert, which names a transport; the
-/// transport is what knows how to dial it. So the request carries the transport
-/// rather than a bare address, and dialing is a step that can fail on its own.
+/// Reading a message to completion inside one future cannot be used in a `select!`: a peer
+/// that sends a length and then stalls would hold the whole task. So a transport feeds
+/// this whatever a read returned, and asks it whether a message has come out — which never
+/// waits for a byte that has not arrived.
 ///
-/// ```text
-///   Requested { transport, advert }   asked for, not yet dialed
-///          │  .connect()
-///          ▼
-///   Connected { stream, transport, peer }
-///          │  .close()
-///          ▼
-///   Closed
-/// ```
-///
-/// Reading and writing work only in `Connected`; anything else is an error, not a
-/// silent no-op. A caller that writes to a link that was never dialed has a bug,
-/// and it should hear about it rather than have bytes vanish.
-pub enum Connection {
-    /// Asked for, not dialed. Holds the transport that will dial it.
+/// Bytes rather than a stream because the read belongs to the transport: only it knows how
+/// its own IO works, and a caller that had to hand back a stream could not be the thing
+/// holding the routing.
+#[derive(Debug, Default)]
+pub struct Framing {
+    /// Length-prefix bytes, as they arrive.
     ///
-    /// `dyn Transport` rather than a name or an address: the transport is the
-    /// only thing that knows how to reach its own kind of peer, and looking it up
-    /// again by name later would let the two disagree.
-    Requested {
-        transport: Arc<dyn Transport>,
-        advert: Advert,
-    },
-    /// Dialed and usable.
-    Connected {
-        stream: Box<dyn Stream>,
-        transport: &'static str,
-        peer: String,
-    },
-    /// Ended. Terminal: a closed link is not reopened, a new one is requested.
-    Closed,
+    /// Needed because one read can return fewer than four bytes, and dropping the rest
+    /// would desynchronize the stream rather than delay it.
+    pending_len: Vec<u8>,
+    /// The length prefix, once four of its bytes have arrived.
+    len: Option<u32>,
+    /// The body, as much of it as has arrived.
+    body: Vec<u8>,
+    /// A whole message that came out, waiting for its caller to take it.
+    ///
+    /// Held rather than returned by `push`, because one read can carry more than one
+    /// message: the second one must not be lost between calls.
+    ready: VecDeque<Message>,
 }
 
-/// Shows the state and, when connected, where it came from.
-///
-/// Never the stream's contents.
-impl std::fmt::Debug for Connection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Requested { transport, advert } => f
-                .debug_struct("Connection::Requested")
-                .field("transport", &transport.name())
-                .field("advert", advert)
-                .finish(),
-            Self::Connected {
-                transport, peer, ..
-            } => f
-                .debug_struct("Connection::Connected")
-                .field("transport", transport)
-                .field("peer", peer)
-                .finish_non_exhaustive(),
-            Self::Closed => f.write_str("Connection::Closed"),
+impl Framing {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed bytes that were read, and take whatever whole messages they completed.
+    ///
+    /// Never waits and never reads: what came in is all it works with, so a caller that
+    /// has nothing to feed has nothing to do. Messages come out in the order they arrived.
+    pub fn push(&mut self, mut bytes: &[u8]) -> io::Result<Vec<Message>> {
+        let before = self.ready.len();
+        // One pass over what was read, consuming a prefix at a time. A read that carries
+        // two messages must yield both.
+        while !bytes.is_empty() || self.needs_body() {
+            if self.len.is_none() {
+                let need = 4 - self.pending_len.len();
+                let take = need.min(bytes.len());
+                self.pending_len.extend_from_slice(&bytes[..take]);
+                bytes = &bytes[take..];
+                if self.pending_len.len() < 4 {
+                    break;
+                }
+                let mut len = [0u8; 4];
+                len.copy_from_slice(&self.pending_len[..4]);
+                self.pending_len.clear();
+                self.len = Some(u32::from_be_bytes(len));
+            }
+
+            let len = self.len.expect("set just above, or by an earlier push") as usize;
+            let need = len.saturating_sub(self.body.len());
+            let take = need.min(bytes.len());
+            self.body.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.body.len() < len {
+                break;
+            }
+
+            let body = std::mem::take(&mut self.body);
+            self.len = None;
+            self.ready.push_back(Message::decode(&body)?);
+            // A read that ended exactly on a message boundary has nothing left to do.
+            if bytes.is_empty() && !self.needs_body() {
+                break;
+            }
+        }
+        Ok(self.ready.split_off(before).into())
+    }
+
+    /// Take one whole message, if one is ready.
+    ///
+    /// `None` is not an error and not the end: nothing complete has arrived yet.
+    pub fn next(&mut self) -> Option<Message> {
+        self.ready.pop_front()
+    }
+
+    /// Whether a message is waiting.
+    pub fn has_message(&self) -> bool {
+        !self.ready.is_empty()
+    }
+
+    /// Whether half a message is held.
+    ///
+    /// A peer mid-message is worth distinguishing from a quiet one: the first is progress
+    /// and the second is not, and a log that could not tell them apart would be useless
+    /// when a client stalls.
+    pub fn partial(&self) -> bool {
+        !self.pending_len.is_empty() || self.len.is_some() || !self.body.is_empty()
+    }
+
+    /// Whether a length has been read and its body is still short.
+    fn needs_body(&self) -> bool {
+        match self.len {
+            Some(len) => self.body.len() < len as usize,
+            None => false,
         }
     }
+}
+
+/// A link to one peer: the transport carrying it, and who is at the other end.
+///
+/// A struct rather than an enum with states. The states existed because dialing is a step
+/// that can fail on its own; that step belongs to [`Transport::connect`], which includes
+/// the handshake, so what a caller gets back is a link that is *established* — there is no
+/// half-dialed link to pass around and nothing for a state machine to describe.
+///
+/// Sending and receiving go through the transport, which holds the framing and any
+/// routing: a socket writes a length prefix, a transport carrying several peers decides
+/// which one a message is for. Nothing here decides either.
+pub struct Connection {
+    transport: Box<dyn Transport>,
 }
 
 impl Connection {
-    /// A link that has been asked for but not dialed.
-    pub fn requested(transport: Arc<dyn Transport>, advert: Advert) -> Self {
-        Self::Requested { transport, advert }
-    }
-
-    /// A link that is up.
-    pub fn connected(
-        stream: impl Stream + 'static,
-        transport: &'static str,
-        peer: impl Into<String>,
-    ) -> Self {
-        Self::Connected {
-            stream: Box::new(stream),
-            transport,
-            peer: peer.into(),
-        }
-    }
-
-    /// Dial a requested link, yielding a connected one.
-    ///
-    /// The transport does the work; this only moves between states. Connecting an
-    /// already-connected link returns it unchanged rather than redialing, so a
-    /// caller need not track which state it is in.
-    pub async fn connect(self) -> io::Result<Self> {
-        match self {
-            Self::Requested { transport, advert } => {
-                let dialed = transport.connect(&advert).await?;
-                // The transport must hand back something connected: a
-                // `Requested` from `connect` would be a transport that returned
-                // the work it was asked to do.
-                match dialed {
-                    Self::Connected { .. } => Ok(dialed),
-                    other => Err(io::Error::other(format!(
-                        "{} returned {other:?} instead of a connected link",
-                        transport.name()
-                    ))),
-                }
-            }
-            // Already dialed: nothing to do, and redialing would drop the stream.
-            other => Ok(other),
-        }
-    }
-
-    /// The transport that will dial this link, if it has not been dialed yet.
-    ///
-    /// Cloned rather than taken, because the link still needs it to dial. A
-    /// caller that must keep sending *after* the dial wants its own handle:
-    /// [`Transport::send`] and [`Transport::recv`] live on the transport, and a
-    /// connected link no longer carries it.
-    pub fn dialing_transport(&self) -> Option<Arc<dyn Transport>> {
-        match self {
-            Self::Requested { transport, .. } => Some(transport.clone()),
-            _ => None,
-        }
-    }
-
-    /// End the link. Idempotent, and safe on a link that never connected.
-    pub fn close(&mut self) {
-        *self = Self::Closed;
-    }
-
-    pub fn is_connected(&self) -> bool {
-        matches!(self, Self::Connected { .. })
-    }
-
-    /// The transport that produced this link, once there is one.
-    ///
-    /// `None` while requested: the transport is known then too, but it is the one
-    /// that *will* dial, not the one that did, and reporting it as provenance
-    /// would claim a connection that does not exist yet.
-    pub fn transport(&self) -> Option<&'static str> {
-        match self {
-            Self::Connected { transport, .. } => Some(transport),
-            _ => None,
-        }
-    }
-
-    /// Who is on the other end, for logs. Not an address: a peer-to-peer link has
-    /// a key rather than a host, and a socket's path is not what a user acts on.
-    pub fn peer(&self) -> Option<&str> {
-        match self {
-            Self::Connected { peer, .. } => Some(peer),
-            _ => None,
-        }
-    }
-
-    /// The stream, or an error naming the state that has none.
-    fn stream(&mut self) -> io::Result<&mut Box<dyn Stream>> {
-        match self {
-            Self::Connected { stream, .. } => Ok(stream),
-            Self::Requested { .. } => Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "the link was requested but never dialed",
-            )),
-            Self::Closed => Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "the link is closed",
-            )),
-        }
-    }
-}
-
-impl AsyncRead for Connection {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        match self.get_mut().stream() {
-            Ok(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
-            Err(e) => Poll::Ready(Err(e)),
-        }
-    }
-}
-
-impl AsyncWrite for Connection {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        match self.get_mut().stream() {
-            Ok(stream) => Pin::new(&mut **stream).poll_write(cx, buf),
-            Err(e) => Poll::Ready(Err(e)),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut().stream() {
-            Ok(stream) => Pin::new(&mut **stream).poll_flush(cx),
-            Err(e) => Poll::Ready(Err(e)),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut().stream() {
-            Ok(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
-            Err(e) => Poll::Ready(Err(e)),
-        }
-    }
-}
-
-/// What a transport promises.
-///
-/// One struct rather than a method per question, because a caller that has to
-/// choose between channels needs the whole picture at once, and a
-/// transport-by-transport table elsewhere would drift from it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Capabilities {
-    /// Both ends run in one process.
-    pub in_process: bool,
-    /// Traffic never leaves this machine.
-    pub local: bool,
-    /// Opaque to anyone without the peer's key.
-    pub encrypted: bool,
-    /// Establishing the link may need a third-party relay.
-    pub may_relay: bool,
-    /// Told to the user when this transport is the one that worked.
-    ///
-    /// `None` means the user does not need to know. Anything surprising
-    /// (traffic leaving the machine, a relay in the path) sets this, because a
-    /// user should choose a surprising route rather than discover one.
-    pub warn: Option<&'static str>,
-}
-
-impl Capabilities {
-    /// Lower is better. Derived, so adding a transport needs no ordering table
-    /// anywhere else.
-    pub fn rank(&self) -> u8 {
-        match (self.in_process, self.local, self.may_relay) {
-            (true, _, _) => 0,
-            (_, true, _) => 1,
-            (_, _, false) => 2,
-            (_, _, true) => 3,
-        }
-    }
-}
-
-/// How a transport says it can be reached.
-///
-/// `params` is open on purpose: a socket needs a path, a peer-to-peer transport
-/// needs a key and possibly a relay, and neither should force the other's
-/// vocabulary into a shared struct.
-///
-/// `transport` is owned rather than `&'static str` because an advert travels: it
-/// is written into a pane's output and read back by a different process, and a
-/// name that came from a stream cannot borrow from a constant. A
-/// [`Transport::name`] is still `&'static str`: that side is compile-time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Advert {
-    /// The [`Transport::name`] this describes.
-    pub transport: String,
-    pub params: BTreeMap<String, String>,
-}
-
-impl Advert {
-    pub fn new(transport: impl Into<String>) -> Self {
+    pub fn new(transport: impl Transport + 'static) -> Self {
         Self {
-            transport: transport.into(),
-            params: BTreeMap::new(),
+            transport: Box::new(transport),
         }
     }
 
-    pub fn with(mut self, key: &str, value: impl Into<String>) -> Self {
-        self.params.insert(key.to_string(), value.into());
-        self
+    /// The transport carrying this link.
+    pub fn transport(&self) -> &dyn Transport {
+        &*self.transport
     }
 
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.params.get(key).map(String::as_str)
+    /// Send one message.
+    pub async fn send(&self, message: &Message) -> io::Result<()> {
+        self.transport.send(message).await
     }
 
-    /// The lines this advert becomes.
+    /// Read one message, waiting for a whole one.
     ///
-    /// `transport=` first, then that transport's own keys. The order is not
-    /// cosmetic: the reader treats `transport=` as the start of a new advert, so
-    /// a param emitted before it would attach to the previous one.
-    pub fn lines(&self) -> String {
-        let mut body = format!("transport={}\n", self.transport);
-        for (key, value) in &self.params {
-            body.push_str(&format!("{key}={value}\n"));
-        }
-        body
-    }
-
-    /// Parse the same lines back into an advert.
-    ///
-    /// One parser for the announcement a client emits and any advert a caller
-    /// holds, so the two halves cannot describe a transport differently.
-    pub fn parse(text: &str) -> Option<Self> {
-        let mut lines = text.lines().filter(|line| !line.trim().is_empty());
-        let transport = lines.next()?.split_once('=')?;
-        if transport.0.trim() != "transport" {
-            return None;
-        }
-        let mut advert = Self::new(transport.1.trim());
-        for line in lines {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            advert
-                .params
-                .insert(key.trim().to_string(), value.trim().to_string());
-        }
-        Some(advert)
+    /// `None` means the peer closed between messages, which is the normal end of one.
+    pub async fn recv(&self) -> io::Result<Option<Message>> {
+        self.transport.recv().await
     }
 }
 
-/// A transport: the factory that produces [`Connection`]s, and the framing they
-/// carry.
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The transport and where it goes, never the bytes.
+        f.debug_struct("Connection")
+            .field("transport", &self.transport.name())
+            .field("address", &self.transport.address())
+            .finish()
+    }
+}
+
+/// A transport: one channel, and everything a caller does over it.
 ///
-/// `listen` returns `Option` because not every transport can accept, and which of
-/// `connect`/`listen` a side actually uses is that side's business: the trait
-/// describes what a channel *can* do, not what this end of it is for.
+/// A transport that carries more than one peer — an ssh connection multiplexing several
+/// clients — puts the routing inside itself. That is why sending and receiving are methods
+/// here rather than on the link: they have to consult the routing, and the routing is the
+/// transport's.
 pub trait Transport: Send + Sync {
-    /// Stable key. Matched against an [`Advert`], and how a caller selects this
+    /// Stable key. Matched against an announcement, and how a caller selects this
     /// transport by name.
     fn name(&self) -> &'static str;
 
-    /// What this transport promises.
-    fn capabilities(&self) -> Capabilities;
+    /// Where this transport is reachable, as the text that goes in an announcement.
+    ///
+    /// `None` means it cannot be announced, which makes it unreachable: a channel nothing
+    /// can find is a channel with no peer.
+    fn address(&self) -> Option<String>;
 
-    /// What this transport calls itself on the peer's screen.
+    /// The announcement this transport writes so a peer can find it.
     ///
-    /// A label, not an address: the peer shows it so a user can tell one session
-    /// from another, so it has to be short, readable, and distinct.
-    fn label(&self) -> String;
-
-    /// How this transport says it can be reached.
-    ///
-    /// `None` means there is nothing to announce, which makes the transport
-    /// undialable: a channel nothing can find is a channel with no peer. A
-    /// transport that exists must therefore answer this.
-    fn advert(&self) -> Option<Advert>;
-
-    /// The text this transport writes into a pane so a peer can find it.
-    ///
-    /// **The transport's own**, both halves: it builds the text here and parses one
-    /// back with [`Transport::from_magic`]. A unix socket writes its name and a
-    /// path; a transport with several logical clients on one connection writes
-    /// whatever tells them apart.
-    ///
-    /// Text, and not an escape sequence, because of what a peer's output passes
-    /// through: see [`ANNOUNCE_SEPARATOR`].
-    fn to_magic(&self) -> String;
+    /// The transport's own, both halves: it builds the text and reads one back with
+    /// [`Transport::from_magic`]. Nothing outside looks inside.
+    fn to_magic(&self) -> Option<String> {
+        self.address().map(|address| announcement(self.name(), &address))
+    }
 
     /// The transport a peer's announcement describes, if it is one of ours.
     ///
-    /// The other half of [`Transport::to_magic`], and the only place an
-    /// announcement is understood. The scanner splits the line into the name and
-    /// what follows it, so a transport reads only the two parts it wrote and never
-    /// the framing.
-    ///
-    /// Returns a transport rather than a bare address because the instance is what
-    /// carries the routing: two peers of the same kind still have to be told apart,
-    /// and whatever distinguishes them is written here and read here.
-    ///
-    /// `None` for a name that is not ours, which is not an error: most output
-    /// belongs to the command, and a scanner offers the same line to every transport
-    /// in turn.
+    /// The other half of [`Transport::to_magic`], and the only place an announcement is
+    /// understood. `None` for a name that is not ours, which is not an error: most output
+    /// belongs to the command, and a scanner offers the same name to every transport.
     fn from_magic(name: &str, address: &str) -> Option<Self>
     where
         Self: Sized;
 
-    /// Dial the peer an advert describes.
-    fn connect<'a>(&'a self, advert: &'a Advert) -> BoxFuture<'a, io::Result<Connection>>;
-
-    /// Start accepting peers, if this transport can.
+    /// Connect to a peer, and establish the link.
     ///
-    /// `Ok(None)` means "this transport is dial-only", which is a fact about the
-    /// transport rather than a failure.
-    fn listen<'a>(&'a self) -> BoxFuture<'a, io::Result<Option<Listener>>>;
-
-    /// Send one message over `link`.
+    /// The whole handshake, not just a socket: this dials, greets with a [`Message::Ping`],
+    /// and waits for the [`Message::Pong`] answer. Only a link that came back established is
+    /// returned, so a caller gets either a peer it can talk to or the reason it cannot —
+    /// never a link that is up but unproven, which is a state every caller would otherwise
+    /// have to check for.
     ///
-    /// On the transport rather than on [`Connection`] because framing is a
-    /// property of how the bytes travel, not of the link's state: a transport
-    /// that is a plain byte stream frames one way, and one that is a sequence of
-    /// requests frames another. A `Connection` is only ever the enum.
+    /// The greeting is here and not in the caller because it is not optional: a peer that
+    /// never answers is not a peer, and the half that owns the channel is the half that knows
+    /// how to wait on it.
+    fn connect(&self) -> BoxFuture<'_, io::Result<Connection>>;
+
+    /// Wait for a peer to connect, and establish the link.
+    ///
+    /// The other end of [`Transport::connect`], and its mirror: this waits for the greeting,
+    /// answers it with a [`Message::Pong`], and returns only a link that has been established.
+    /// A caller gets a peer that has proven itself or the reason there is none.
+    ///
+    /// The answering is here for the same reason the greening is there: a channel whose
+    /// greeting was never answered is a channel the other end is still waiting on, and the
+    /// half that holds the link is the half that must not leave it hanging.
+    fn accept(&self) -> BoxFuture<'_, io::Result<Connection>>;
+
+    /// Send one message.
     ///
     /// One message per call, so the peer always has a whole one to read.
-    fn send<'a>(&'a self, link: &'a mut Connection, message: &Message)
-        -> BoxFuture<'a, io::Result<()>>;
-
-    /// Receive one message, blocking until a whole one arrives.
     ///
-    /// `None` means the peer closed, which is the normal end of a client rather
-    /// than an error.
-    fn recv<'a>(&'a self, link: &'a mut Connection) -> BoxFuture<'a, io::Result<Option<Message>>>;
-}
+    /// The message gets its own lifetime rather than sharing `&self`'s: the returned future
+    /// borrows both, and one `'_` for two inputs is the ambiguity that makes an implementor's
+    /// `async move` fail to name what it returns.
+    fn send<'a>(&'a self, message: &'a Message) -> BoxFuture<'a, io::Result<()>>;
 
-/// An accepting side of a transport.
-pub struct Listener {
-    inner: Box<dyn Accept>,
-    transport: &'static str,
-}
-
-impl Listener {
-    pub fn new(inner: impl Accept + 'static, transport: &'static str) -> Self {
-        Self {
-            inner: Box::new(inner),
-            transport,
-        }
-    }
-
-    pub fn transport(&self) -> &'static str {
-        self.transport
-    }
-
-    /// Wait for the next peer.
-    pub fn accept(&self) -> BoxFuture<'_, io::Result<Connection>> {
-        self.inner.accept()
-    }
-}
-
-/// The boxable half of a [`Listener`].
-///
-/// A trait object needs one method with no generic parameters, so the concrete
-/// listeners implement this and `Listener` wraps it.
-pub trait Accept: Send + Sync {
-    fn accept(&self) -> BoxFuture<'_, io::Result<Connection>>;
+    /// Read one message, waiting for a whole one.
+    ///
+    /// **Blocking**, and that is the point rather than an oversight: a peer has to *send* a
+    /// message, so a read that returns the instant it is asked asks before the peer has had a
+    /// chance to write. There is no delay to poll around — a message either arrives or the
+    /// peer is gone — so this waits, and a caller that cannot wait is the one that is wrong.
+    ///
+    /// `Ok(None)` means the peer closed between messages, which is the normal end of one.
+    fn recv(&self) -> BoxFuture<'_, io::Result<Option<Message>>>;
 }
 
 /// An in-process pair of streams, for a session with both halves in one program.
 ///
-/// Here rather than beside an implementation because there is no channel and no
-/// address: it is two ends of one buffer, and the only thing it needs from this
-/// module is [`Stream`].
+/// Here and not in a transport because there is no channel and no address: it is two ends
+/// of one buffer.
 pub fn in_process(capacity: usize) -> (impl Stream, impl Stream) {
     tokio::io::duplex(capacity)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    use crate::message::Message;
-
-    /// Bytes written at one end come out the other, unmodified.
-    ///
-    /// The property the whole abstraction exists to preserve: whatever carries
-    /// them, the caller sees a byte stream. Asserted through `Connection`, so the
-    /// delegate impls are exercised too, not just the inner stream.
-    #[tokio::test]
-    async fn bytes_cross_a_connection_unchanged() {
-        let (a, b) = in_process(1024);
-        let mut b = Connection::connected(b, "test", "other");
-        let mut a = Connection::connected(a, "test", "self");
-        // Not newline-terminated and not text: a transport that normalized either
-        // would show up here.
-        let input: &[u8] = &[0x00, 0xff, 0x1b, b'[', 0x9b, 0x07];
-        a.write_all(input).await.unwrap();
-        a.flush().await.unwrap();
-
-        let mut got = vec![0u8; input.len()];
-        b.read_exact(&mut got).await.unwrap();
-        assert_eq!(got, input);
-    }
-
-    /// Framing puts one whole message at a time on a stream, and reads it back.
-    ///
-    /// A stream has no message boundaries, so the property to pin down is that two
-    /// messages in one write still arrive as two, with nothing of one inside the
-    /// other.
-    #[tokio::test]
-    async fn framed_messages_survive_being_packed_together() {
-        let (a, b) = in_process(1024);
-        let mut sender = Connection::connected(a, "test", "self");
-        let mut receiver = Connection::connected(b, "test", "other");
-
-        // Written back to back with no yield between them, so the reader sees one
-        // buffer holding both.
-        write_message(&mut sender, &Message::Ping("a".into()))
-            .await
-            .unwrap();
-        write_message(&mut sender, &Message::Ping("b".into()))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            read_message(&mut receiver).await.unwrap(),
-            Some(Message::Ping("a".into()))
-        );
-        assert_eq!(
-            read_message(&mut receiver).await.unwrap(),
-            Some(Message::Ping("b".into()))
-        );
-    }
-
-    /// A peer that closes between messages reads as the end of a client, not a
-    /// corruption.
-    #[tokio::test]
-    async fn a_clean_close_reads_as_none() {
-        let (a, b) = in_process(64);
-        let mut receiver = Connection::connected(b, "test", "other");
-        drop(a);
-        assert_eq!(read_message(&mut receiver).await.unwrap(), None);
-    }
-
-    /// Ranking is derived from capabilities, so the order is not a table to keep
-    /// in sync by hand.
-    #[test]
-    fn rank_orders_in_process_first_and_relayed_last() {
-        let memory = caps(true, true, false);
-        let unix = caps(false, true, false);
-        let direct = caps(false, false, false);
-        let relayed = caps(false, false, true);
-
-        assert!(memory.rank() < unix.rank());
-        assert!(unix.rank() < direct.rank());
-        assert!(direct.rank() < relayed.rank());
-    }
-
-    /// An advert and its lines agree, whichever direction they are read in.
-    ///
-    /// The client writes these lines into its output and the server reads them
-    /// back, so a round trip that lost a param would be a client that announced
-    /// something other than what it listens on.
-    #[test]
-    fn adverts_round_trip_through_their_own_lines() {
-        let advert = Advert::new("unix")
-            .with("socket", "/tmp/tuigui.sock")
-            .with("session", "3f9a1c2b");
-        let parsed = Advert::parse(&advert.lines()).expect("its own lines parse");
-        assert_eq!(parsed, advert);
-    }
-
-    /// A body that is not an advert is rejected rather than guessed at.
-    #[test]
-    fn a_body_that_is_not_an_advert_is_rejected() {
-        assert!(Advert::parse("").is_none());
-        assert!(Advert::parse("socket=/tmp/x\n").is_none(), "no transport=");
-        // `transport=` last is not an advert either: the first line is the name.
-        assert!(Advert::parse("socket=/tmp/x\ntransport=unix\n").is_none());
-    }
-
-    /// A stub transport, so the state machine is tested without a real channel.
-    struct Stub {
-        caps: Capabilities,
-        /// How many times `connect` was called, to prove a dial really happened.
-        attempts: Arc<AtomicUsize>,
-        works: bool,
-    }
-
-    impl Transport for Stub {
-        fn name(&self) -> &'static str {
-            "stub"
-        }
-        fn capabilities(&self) -> Capabilities {
-            self.caps
-        }
-        fn label(&self) -> String {
-            "stub : 00000000".into()
-        }
-        fn advert(&self) -> Option<Advert> {
-            Some(Advert::new("stub"))
-        }
-        fn to_magic(&self) -> String {
-            self.label()
-        }
-        fn from_magic(name: &str, address: &str) -> Option<Self> {
-            (name == "stub" && address == "00000000").then(|| Self {
-                caps: caps(false, true, false),
-                attempts: Arc::new(AtomicUsize::new(0)),
-                works: true,
-            })
-        }
-        fn connect<'a>(&'a self, _advert: &'a Advert) -> BoxFuture<'a, io::Result<Connection>> {
-            Box::pin(async move {
-                self.attempts.fetch_add(1, Ordering::SeqCst);
-                if !self.works {
-                    return Err(io::Error::other("stub refused"));
-                }
-                let (ours, _theirs) = in_process(64);
-                Ok(Connection::connected(ours, "stub", "stub"))
-            })
-        }
-        fn listen<'a>(&'a self) -> BoxFuture<'a, io::Result<Option<Listener>>> {
-            Box::pin(async { Ok(None) })
-        }
-        fn send<'a>(
-            &'a self,
-            link: &'a mut Connection,
-            message: &Message,
-        ) -> BoxFuture<'a, io::Result<()>> {
-            write_message(link, message)
-        }
-        fn recv<'a>(
-            &'a self,
-            link: &'a mut Connection,
-        ) -> BoxFuture<'a, io::Result<Option<Message>>> {
-            read_message(link)
-        }
-    }
-
-    fn stub(works: bool) -> (Arc<Stub>, Arc<AtomicUsize>) {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        (
-            Arc::new(Stub {
-                caps: caps(false, true, false),
-                attempts: attempts.clone(),
-                works,
-            }),
-            attempts,
-        )
-    }
-
-    /// A requested link dials into a connected one.
-    #[tokio::test]
-    async fn a_requested_link_becomes_connected_when_dialed() {
-        let (transport, attempts) = stub(true);
-        let requested = Connection::requested(transport, Advert::new("stub"));
-        assert!(!requested.is_connected(), "a request is not a link yet");
-
-        let connected = requested.connect().await.expect("the stub accepts");
-        assert!(connected.is_connected());
-        assert_eq!(connected.transport(), Some("stub"));
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-    }
-
-    /// A link that has not been dialed exposes the transport that will dial it,
-    /// so a caller can keep it to frame the messages it is about to send.
-    #[test]
-    fn a_requested_link_hands_out_the_transport_that_will_dial_it() {
-        let (transport, _) = stub(true);
-        let requested = Connection::requested(transport, Advert::new("stub"));
-        assert_eq!(
-            requested.dialing_transport().map(|t| t.name()),
-            Some("stub")
-        );
-
-        // A closed link has no dialing left to do, and says so rather than
-        // claiming the transport that produced it.
-        let mut closed = Connection::Closed;
-        assert!(closed.dialing_transport().is_none());
-        closed.close();
-        assert!(closed.dialing_transport().is_none());
-    }
-
-    /// Dialing a link that is already up does not redial it.
-    ///
-    /// Redialing would replace the stream, dropping whatever was buffered on the
-    /// one the caller already holds. A caller should not have to know which state
-    /// it is in to be safe.
-    #[tokio::test]
-    async fn connecting_a_connected_link_is_a_no_op() {
-        let (transport, attempts) = stub(true);
-        let connected = Connection::requested(transport, Advert::new("stub"))
-            .connect()
-            .await
-            .expect("first dial");
-        let again = connected.connect().await.expect("second connect is free");
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            1,
-            "the transport must not be asked twice"
-        );
-        assert!(again.is_connected());
-    }
-
-    /// A dial that fails leaves no link behind.
-    #[tokio::test]
-    async fn a_failed_dial_does_not_produce_a_link() {
-        let (transport, _) = stub(false);
-        let requested = Connection::requested(transport, Advert::new("stub"));
-        let err = requested.connect().await.expect_err("the stub refuses");
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-    }
-
-    /// Reading and writing a link that is not connected is an error, not a no-op.
-    ///
-    /// A caller that writes into a link that was never dialed has a bug. Silently
-    /// discarding the bytes would hide it.
-    #[tokio::test]
-    async fn io_on_an_unconnected_link_is_an_error() {
-        let (transport, _) = stub(true);
-
-        let mut requested = Connection::requested(transport, Advert::new("stub"));
-        let err = requested
-            .write_all(b"nobody is listening")
-            .await
-            .expect_err("a request has no stream");
-        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
-
-        let mut closed = Connection::Closed;
-        let err = closed
-            .write_all(b"nobody is listening")
-            .await
-            .expect_err("a closed link has no stream");
-        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
-        assert!(!closed.is_connected());
-    }
-
-    /// Closing is idempotent and works on a link that never connected.
-    #[test]
-    fn closing_is_idempotent() {
-        let mut link = Connection::Closed;
-        link.close();
-        assert!(!link.is_connected());
-        assert_eq!(link.transport(), None);
-        assert_eq!(link.peer(), None);
-    }
-
-    /// The one definition of an announcement, and the prefix a scanner searches by.
-    ///
-    /// Two halves of a session are different programs, so the shape has to be agreed
-    /// rather than remembered: a transport announces with [`announcement`] and a
-    /// scanner looks for [`announcement_prefix`], and both come from here.
-    #[test]
-    fn an_announcement_is_its_name_and_its_address() {
-        assert_eq!(announcement("unix", "/tmp/tuigui.sock"), "unix : /tmp/tuigui.sock");
-        // The prefix includes the separator, which is what keeps a name used as an
-        // ordinary word from matching: only the name *followed by the separator*
-        // starts an announcement.
-        assert_eq!(announcement_prefix("unix"), "unix : ");
-        assert_eq!(
-            announcement_prefix("unix"),
-            &announcement("unix", "anything")[..announcement_prefix("unix").len()]
-        );
-    }
-
-    fn caps(in_process: bool, local: bool, may_relay: bool) -> Capabilities {
-        Capabilities {
-            in_process,
-            local,
-            encrypted: !local,
-            may_relay,
-            warn: None,
-        }
-    }
-}

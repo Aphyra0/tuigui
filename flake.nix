@@ -153,6 +153,10 @@
               })
               pkgs.pkg-config
               pkgs.rust-analyzer
+              # `just`, for the recipes in the justfile: building and running the
+              # three binaries is a fixed set of invocations, and a shell script
+              # would be the same thing with no documentation.
+              pkgs.just
               pkgs.wayland
               pkgs.wayland-protocols
               pkgs.wayland-scanner

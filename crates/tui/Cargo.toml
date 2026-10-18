@@ -12,6 +12,9 @@ image = { workspace = true }
 rustix = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+# `select_all` and `StreamExt`, for reading every attached client in one loop
+# without spawning a task per client. Not already reachable through tokio.
+futures-util = { version = "0.3", features = ["alloc"] }
 
 [[bin]]
 name = "tui"
