@@ -501,112 +501,218 @@ pub fn id_placeholder_rgb(id: u32) -> [u8; 3] {
     [r, g, b]
 }
 
-/// The scalar the client draws in a grid cell when a multiplexer is in the way.
+/// The scalar a client draws in a grid cell when a multiplexer is in the way.
 ///
-/// A placeholder cell carries its image id in the foreground *color*, which only
-/// survives if the bytes reach the terminal unmodified. Inside a multiplexer they
-/// do not: herdr parses its panes' output into cells and re-renders them, so it
-/// reads a `U+10EEEE` cell as a glyph it must draw and blanks it
-/// (`herdr src/pane/terminal.rs`, `ghostty_buffer_symbol_into`), because the
-/// image it would draw is one herdr never received.
+/// The characters a client draws in a grid cell, one per image of the pair.
 ///
-/// So the client draws this character instead, in [`MARKER_RGB`], and the wrapper
-/// rewrites each cell into a real placeholder: it is the only side that sees the
-/// bytes after the multiplexer re-rendered them, and the only side that knows the
-/// live image id.
-pub const MARKER: char = '\u{2588}';
-
-/// The marker's UTF-8 bytes, for the scanner. `U+2588` is three bytes.
-pub const MARKER_UTF8: [u8; 3] = [0xe2, 0x96, 0x88];
-
-/// The foreground a marker cell is drawn in, as `(r, g, b)`.
+/// A cell cannot be a placeholder itself: a multiplexer parses its panes into
+/// cells and re-renders them, and `U+10EEEE` is special-cased there
+/// (`herdr src/pane/terminal.rs`, `ghostty_buffer_symbol_into` blanks it) because
+/// the image it would draw is one the multiplexer never received.
 ///
-/// Pure magenta. The marker is a full block, so its *foreground* is what fills
-/// the cell: a background would be hidden behind the glyph, which is how a
-/// magenta grid first rendered as default-colored blocks.
-pub const MARKER_RGB: (u8, u8, u8) = (255, 0, 255);
+/// So the client draws one of these instead, and the wrapper replaces it with a
+/// placeholder as the bytes leave the pty.
+///
+/// Control pictures: `U+2400` and `U+2401` are the conventional *depictions* of
+/// `NUL` and `SOH`, so they are printable, single-width, in the BMP, and no real
+/// text contains them. The byte alone is not what identifies a cell, though: a
+/// marker is only a marker when the two combining diacritics that carry its row
+/// and column follow it, which ordinary text never does.
+pub const MARKERS: [char; 2] = ['\u{2400}', '\u{2401}'];
 
-/// The SGR parameters that paint a marker's foreground, inside `ESC [ <p> m`.
-pub fn marker_fg_params() -> String {
-    format!("38;2;{};{};{}", MARKER_RGB.0, MARKER_RGB.1, MARKER_RGB.2)
+/// The markers' UTF-8, three bytes each, for the scanner.
+pub const MARKER_UTF8: [[u8; 3]; 2] = [[0xe2, 0x90, 0x80], [0xe2, 0x90, 0x81]];
+
+/// Which slot a byte names, if it begins one of the markers.
+///
+/// The lead byte is enough inside the scanner's loop, because the two markers have
+/// distinct leads (`E2 90 80` and `E2 90 81`), but the caller must still check the
+/// whole sequence: `E2 90 80` is also the prefix of other codepoints.
+pub fn marker_slot(char: char) -> Option<usize> {
+    MARKERS.iter().position(|m| *m == char)
 }
+
 
 /// Rewrite marker cells into kitty placeholder cells, streaming.
 ///
-/// The pane's bytes arrive in arbitrary chunks, so a cell can be split across
-/// two of them: the marker in one, its diacritics in the next. A rewrite that
-/// looked at each chunk alone would turn half a cell into a placeholder with no
-/// row or column, which the terminal would resolve in the wrong place rather
-/// than reject. The tail is therefore held until the rest arrives.
+/// The pane's bytes arrive in arbitrary chunks, so a cell can be split across two
+/// of them: the marker in one, its diacritics in the next. A rewrite that looked
+/// at each chunk alone would turn half a cell into a placeholder with no row or
+/// column, which the terminal would resolve in the wrong place rather than
+/// reject. The tail is therefore held until the rest arrives.
+///
+/// Two substitutions are made per cell: the scalar becomes the placeholder, and
+/// the marker colour becomes the id of the image the caller says belongs to that
+/// slot. The colour has to be rewritten because the client writes a marker
+/// colour, not an id: nothing else knows the mapping.
+/// Rewrite marker cells into kitty placeholder cells, streaming.
+///
+/// The pane's bytes arrive in arbitrary chunks, so a cell can be split across two
+/// of them: the marker in one, its diacritics in the next. A rewrite that looked
+/// at each chunk alone would turn half a cell into a placeholder with no row or
+/// column, which the terminal would resolve in the wrong place rather than
+/// reject. The tail is therefore held until the rest arrives.
+///
+/// No color is parsed and none is tracked. The marker character *is* the slot, so
+/// the only thing that has to arrive intact is the character itself, and a
+/// multiplexer preserves characters by definition while it may re-render colors.
 #[derive(Default)]
 pub struct MarkerRewriter {
     /// Bytes held back because they may begin a cell that is not complete yet.
     pending: Vec<u8>,
+    /// The image id each slot currently maps to, or `None` while unassigned.
+    ///
+    /// Set by the caller, which owns the id namespace: the client only ever says
+    /// *which slot*, never which image.
+    slots: [Option<u32>; 2],
 }
+
+/// The most bytes a cell can occupy: a 3-byte marker, two diacritics, and slack
+/// for a diacritic above the BMP (4 bytes each).
+///
+/// Used to bound what is held while waiting for a cell to complete, so a stream
+/// that keeps ending on a marker cannot make `pending` grow without limit.
+const MAX_CELL_BYTES: usize = 3 + 4 + 4;
 
 impl MarkerRewriter {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Rewrite `chunk` for image `id`, returning what to send to the terminal.
+    /// Point a slot at an image id, or clear it.
     ///
-    /// A cell is a marker followed by exactly two diacritics, which the client
-    /// always writes: the scalar names the image, the pair gives the row and the
-    /// column. Anything else is forwarded untouched, so ordinary text costs
-    /// nothing but the comparison.
-    pub fn push(&mut self, chunk: &[u8], id: u32) -> Vec<u8> {
+    /// Called when the server has finished an image and knows its id, so the next
+    /// cells drawn for that slot resolve against it. Nothing else tells the
+    /// terminal which image a slot means.
+    pub fn assign(&mut self, slot: usize, id: Option<u32>) {
+        if let Some(s) = self.slots.get_mut(slot) {
+            *s = id;
+        }
+    }
+
+    /// Rewrite every marker cell in `chunk`, returning what to send to the
+    /// terminal.
+    ///
+    /// A cell is one of [`MARKERS`] followed by exactly two combining diacritics,
+    /// which is what the client draws: the marker names the slot, and the pair
+    /// gives the row and column. Anything else is forwarded untouched, so ordinary
+    /// text costs nothing but the comparison.
+    ///
+    /// A cell whose slot has no image yet is forwarded as the marker character it
+    /// is. Drawing nothing would be a hole in the grid; the marker at least shows
+    /// a cell is there and waiting.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.pending.extend_from_slice(chunk);
         let mut out = Vec::with_capacity(self.pending.len());
         let mut i = 0;
         while i < self.pending.len() {
-            let rest = &self.pending[i..];
-            if !rest.starts_with(&MARKER_UTF8) {
-                out.push(rest[0]);
-                i += 1;
-                continue;
-            }
-            let mut j = MARKER_UTF8.len();
+            let (slot, marker_len) = match self.marker_at(i) {
+                Some(found) => found,
+                None => {
+                    // A marker split across reads: the bytes here begin one but do
+                    // not complete it. Forwarding them would destroy the marker
+                    // (the terminal would see three stray characters, not a
+                    // placeholder), so the tail is held for the rest to arrive.
+                    // Bounded, so a stream that ends on a partial marker still
+                    // makes progress instead of accumulating forever.
+                    if self.marker_partial(i) && self.pending.len() - i <= MAX_CELL_BYTES {
+                        self.pending.drain(..i);
+                        return out;
+                    }
+                    out.push(self.pending[i]);
+                    i += 1;
+                    continue;
+                }
+            };
+            let mut j = marker_len;
             let mut marks = 0;
             while marks < 2 {
-                match scalar_len(rest.get(j).copied()) {
-                    Some(len) if rest.len() >= j + len => {
-                        // Only a combining mark continues a cell. A letter after
-                        // a marker is not this protocol, so forwarding it as text
+                match scalar_len(self.pending.get(i + j).copied()) {
+                    Some(len) if self.pending.len() >= i + j + len => {
+                        // Only a combining mark continues a cell. A letter after a
+                        // marker is not this protocol, so forwarding it as text
                         // beats inventing a cell around it.
-                        if !is_diacritic(&rest[j..j + len]) {
+                        if !is_diacritic(&self.pending[i + j..i + j + len]) {
                             break;
                         }
                         j += len;
                         marks += 1;
                     }
-                    // Not enough bytes yet: hold the cell and stop. The bytes
-                    // from `i` on stay in `pending` for the next call.
+                    // Not enough bytes yet: hold the cell and stop. The bytes from
+                    // `i` on stay in `pending` for the next call.
+                    //
+                    // Bounded: a marker at the end of every chunk would otherwise
+                    // accumulate forever, so once what is held is larger than a
+                    // cell could be, the oldest bytes are ordinary text and are
+                    // forwarded rather than kept.
                     _ => {
+                        if self.pending.len() - i > MAX_CELL_BYTES {
+                            out.push(self.pending[i]);
+                            i += 1;
+                            continue;
+                        }
                         self.pending.drain(..i);
                         return out;
                     }
                 }
             }
             if marks < 2 {
-                out.extend_from_slice(&MARKER_UTF8);
-                i += MARKER_UTF8.len();
+                out.extend_from_slice(&self.pending[i..i + marker_len]);
+                i += marker_len;
                 continue;
             }
-            let (r, g, b) = id_to_color(id);
-            // The id in the foreground, as a placeholder cell needs it, and the
-            // marker color on the *default* background rather than left set: the
-            // image is drawn over the cell, so a colored background would show
-            // through wherever it is transparent. Each cell restates the full
-            // pair, because the rewrite cannot know what the pane left set.
-            out.extend_from_slice(format!("\x1b[49;38;2;{r};{g};{b}m").as_bytes());
-            out.extend_from_slice(&PLACEHOLDER_UTF8);
-            out.extend_from_slice(&rest[MARKER_UTF8.len()..j]);
-            out.extend_from_slice(format!("\x1b[39;{}m", marker_fg_params()).as_bytes());
+            match self.slots.get(slot).copied().flatten() {
+                Some(id) => {
+                    let (r, g, b) = id_to_color(id);
+                    // The id in the foreground, which is what the terminal
+                    // resolves a placeholder by, then the placeholder scalar and
+                    // the cell's own diacritics. No background is set: a
+                    // multiplexer may have left one behind and a transparent image
+                    // would show it.
+                    out.extend_from_slice(format!("\x1b[38;2;{r};{g};{b};49m").as_bytes());
+                    out.extend_from_slice(&PLACEHOLDER_UTF8);
+                    out.extend_from_slice(&self.pending[i + marker_len..i + j]);
+                    // Back to the default, so the id does not leak into the cells
+                    // after this one: a pane emits a style only where it changes,
+                    // and an inherited id color would make every later cell resolve
+                    // against the wrong image.
+                    out.extend_from_slice(b"\x1b[39m");
+                }
+                None => {
+                    out.extend_from_slice(&self.pending[i..i + j]);
+                }
+            }
             i += j;
         }
         self.pending.drain(..i);
         out
+    }
+
+    /// The slot a marker starts at `at`, and how many bytes it occupies.
+    ///
+    /// Returns `None` when the bytes there are not a whole marker, which includes
+    /// the case of a marker split across reads: the caller treats those as
+    /// ordinary bytes, and the next read will carry the rest.
+    fn marker_at(&self, at: usize) -> Option<(usize, usize)> {
+        MARKER_UTF8
+            .iter()
+            .enumerate()
+            .find(|(_, bytes)| self.pending[at..].starts_with(*bytes))
+            .map(|(slot, bytes)| (slot, bytes.len()))
+    }
+
+    /// Whether the bytes at `at` are the start of a marker that has not finished
+    /// arriving.
+    ///
+    /// Distinct from [`marker_at`](Self::marker_at) being `None`: a byte that is
+    /// not a marker lead is ordinary text and goes out immediately, while a
+    /// partial marker must be held, because the terminal has no way to reassemble
+    /// three stray characters into one.
+    fn marker_partial(&self, at: usize) -> bool {
+        let tail = &self.pending[at..];
+        MARKER_UTF8
+            .iter()
+            .any(|bytes| tail.len() < bytes.len() && bytes.starts_with(tail))
     }
 }
 
@@ -1054,6 +1160,30 @@ mod tests {
         assert_eq!(s.found[0].rgb, Some((0, 0, 1)));
         assert_eq!(s.found[0].id, Some(1));
     }
+    /// The two markers are distinct, printable, and single-width.
+    ///
+    /// They are what the client draws and the wrapper recognizes, so they have to
+    /// survive a multiplexer's cell model: printable and one cell wide keeps them
+    /// storeable, and distinctness is what tells the two images apart.
+    #[test]
+    fn the_markers_are_distinct_and_printable() {
+        assert_eq!(MARKERS.len(), 2, "one marker per image of the pair");
+        assert_ne!(MARKERS[0], MARKERS[1], "the markers must differ");
+        for marker in MARKERS {
+            assert!(
+                !marker.is_control(),
+                "a control character is not stored in a cell by a multiplexer"
+            );
+        }
+        // The byte sequences the scanner matches must be the markers' own UTF-8.
+        assert_eq!(MARKER_UTF8[0], MARKERS[0].to_string().as_bytes());
+        assert_eq!(MARKER_UTF8[1], MARKERS[1].to_string().as_bytes());
+        for (slot, marker) in MARKERS.iter().enumerate() {
+            assert_eq!(marker_slot(*marker), Some(slot));
+        }
+        assert_eq!(marker_slot('A'), None, "ordinary text is not a marker");
+    }
+
 
     /// A cell with no explicit foreground references no image, and must report
     /// that rather than defaulting to something plausible.
@@ -1211,53 +1341,125 @@ mod tests {
         assert_eq!(cell, "\u{10EEEE}\u{0305}\u{0305}");
     }
 
-    /// A marker cell becomes a placeholder cell that names the live image.
+    /// A marker cell becomes a placeholder naming the image that slot maps to.
     ///
-    /// This is the whole point of the marker: the client draws text a muxer
-    /// re-renders unchanged, and the wrapper is the side that turns it into the
-    /// cell the terminal can resolve.
+    /// The client writes a marker character, never an id, so the rewrite does two
+    /// things: replaces the marker with the scalar a multiplexer would blank, and
+    /// puts the mapped id in the foreground, which is what the terminal resolves a
+    /// placeholder by.
     #[test]
-    fn a_marker_cell_becomes_a_placeholder_for_the_live_image() {
+    fn a_marker_cell_becomes_a_placeholder_naming_the_mapped_image() {
         let mut w = MarkerRewriter::new();
-        let cell = format!("{}{}{}", MARKER, DIACRITICS[0], DIACRITICS[1]);
-        let out = w.push(cell.as_bytes(), 7);
+        w.assign(0, Some(7));
 
-        // Blue holds the low byte, so id 7 is `38;2;0;0;7`.
+        let cell = format!("{}{}{}", MARKERS[0], DIACRITICS[0], DIACRITICS[1]);
+        let out = w.push(cell.as_bytes());
+        let text = String::from_utf8(out.clone()).expect("the rewrite emits UTF-8");
+
+        let (r, g, b) = id_to_color(7);
         assert!(
-            out.starts_with(b"\x1b[49;38;2;0;0;7m"),
-            "the id must be set as the foreground: {out:?}"
+            text.contains(&format!("\x1b[38;2;{r};{g};{b}")),
+            "the cell must be recolored to the mapped id: {text:?}"
         );
         assert!(
             out.windows(4).any(|win| win == PLACEHOLDER_UTF8),
-            "the marker must become the placeholder scalar: {out:?}"
+            "the marker must become the placeholder scalar: {text:?}"
         );
-        // The marker background is cleared again, so the image is not drawn over
-        // magenta and the next cell still re-establishes its own pair.
         assert!(
-            out.ends_with(format!("\x1b[39;{}m", marker_fg_params()).as_bytes()),
-            "the marker color must be restored after the cell: {out:?}"
+            !out.windows(3).any(|win| win == MARKER_UTF8[0]),
+            "no marker may be left behind: {text:?}"
+        );
+        // The diacritics decide the cell's position, so they must be untouched.
+        assert!(
+            text.contains(&format!("{}{}", DIACRITICS[0], DIACRITICS[1])),
+            "the row and column must survive: {text:?}"
+        );
+    }
+
+    /// The two slots map to different images, and the marker chooses which.
+    #[test]
+    fn the_marker_chooses_which_image_a_cell_names() {
+        let mut w = MarkerRewriter::new();
+        w.assign(0, Some(5));
+        w.assign(1, Some(9));
+
+        let first = format!("{}{}{}", MARKERS[0], DIACRITICS[0], DIACRITICS[0]);
+        let second = format!("{}{}{}", MARKERS[1], DIACRITICS[0], DIACRITICS[0]);
+        let out = w.push(format!("{first}{second}").as_bytes());
+
+        let (a, b, c) = id_to_color(5);
+        let (x, y, z) = id_to_color(9);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains(&format!("\x1b[38;2;{a};{b};{c}")), "slot 0's id: {text:?}");
+        assert!(text.contains(&format!("\x1b[38;2;{x};{y};{z}")), "slot 1's id: {text:?}");
+        assert_eq!(
+            out.windows(4).filter(|win| *win == PLACEHOLDER_UTF8).count(),
+            2,
+            "both cells must resolve: {text:?}"
+        );
+    }
+
+    /// A cell whose slot has no image yet is forwarded as the marker it is.
+    ///
+    /// It must resolve to *nothing* rather than to whatever the previous frame
+    /// left behind: drawing nothing is a hole, which is visible and correct, while
+    /// drawing a stale image is neither.
+    #[test]
+    fn a_cell_in_an_unmapped_slot_is_left_as_its_marker() {
+        let mut w = MarkerRewriter::new();
+        let cell = format!("{}{}{}", MARKERS[0], DIACRITICS[0], DIACRITICS[0]);
+        let out = w.push(cell.as_bytes());
+        assert!(
+            out.windows(3).any(|win| win == MARKER_UTF8[0]),
+            "an unmapped cell must stay a marker: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            !out.windows(4).any(|win| win == PLACEHOLDER_UTF8),
+            "an unmapped cell must not become a placeholder"
+        );
+    }
+
+    /// A run of cells needs no style tracking: every cell carries its own marker.
+    ///
+    /// This is the property that makes the character scheme simpler than a color
+    /// one. A pane emits a color only where it changes, so a color-coded grid
+    /// needed the rewrite to remember the last one; a character is part of the
+    /// cell, so there is nothing to remember.
+    #[test]
+    fn every_cell_of_a_run_carries_its_own_marker() {
+        let mut w = MarkerRewriter::new();
+        w.assign(0, Some(3));
+        let cell = format!("{}{}{}", MARKERS[0], DIACRITICS[0], DIACRITICS[0]);
+        let out = w.push(format!("{cell}{cell}{cell}").as_bytes());
+        assert_eq!(
+            out.windows(4).filter(|win| *win == PLACEHOLDER_UTF8).count(),
+            3,
+            "every cell must resolve: {:?}",
+            String::from_utf8_lossy(&out)
         );
     }
 
     /// A cell split across two reads is rewritten once, whole.
     ///
-    /// The pty delivers arbitrary chunks. Rewriting a marker whose diacritics
-    /// have not arrived would produce a placeholder with no row or column, which
-    /// the terminal resolves at the wrong position instead of rejecting.
+    /// The pty delivers arbitrary chunks, so a marker can arrive without its
+    /// diacritics. Rewriting then would produce a placeholder with no row or
+    /// column, which the terminal resolves in the wrong place rather than rejects.
     #[test]
     fn a_cell_split_across_chunks_becomes_one_placeholder() {
         let mut w = MarkerRewriter::new();
-        let cell = format!("{}{}{}", MARKER, DIACRITICS[3], DIACRITICS[5]);
+        w.assign(0, Some(1));
+        let cell = format!("{}{}{}", MARKERS[0], DIACRITICS[3], DIACRITICS[5]);
         let bytes = cell.as_bytes();
         let (first, second) = bytes.split_at(4);
 
-        let out_first = w.push(first, 1);
+        let out_first = w.push(first);
         assert!(
             !out_first.windows(4).any(|win| win == PLACEHOLDER_UTF8),
             "half a cell must not be rewritten: {out_first:?}"
         );
 
-        let out_second = w.push(second, 1);
+        let out_second = w.push(second);
         let mut all = out_first;
         all.extend_from_slice(&out_second);
         assert_eq!(
@@ -1267,24 +1469,102 @@ mod tests {
         );
     }
 
-    /// Ordinary text and bytes that are not cells pass through untouched.
+    /// A cell whose *marker itself* is split across reads is still one cell.
+    ///
+    /// Seen in a live run: a chunk ended in the middle of the marker's three
+    /// bytes, and forwarding the first byte as text left the rest to be read as
+    /// three stray characters, so the cell never resolved. The partial marker has
+    /// to be held just like an incomplete cell.
+    #[test]
+    fn a_marker_split_within_its_bytes_is_still_a_cell() {
+        for cut in 1..3 {
+            let mut w = MarkerRewriter::new();
+            w.assign(0, Some(1));
+            let cell = format!("{}{}{}", MARKERS[0], DIACRITICS[3], DIACRITICS[5]);
+            let bytes = cell.as_bytes();
+            let (first, second) = bytes.split_at(cut);
+
+            let out_first = w.push(first);
+            let out_second = w.push(second);
+            let mut all = out_first;
+            all.extend_from_slice(&out_second);
+            assert_eq!(
+                all.windows(4).filter(|win| *win == PLACEHOLDER_UTF8).count(),
+                1,
+                "a marker cut at {cut} must still resolve: {all:?}"
+            );
+            assert!(
+                !all.windows(3).any(|win| win == MARKER_UTF8[0]),
+                "no raw marker may survive a cut at {cut}: {all:?}"
+            );
+        }
+    }
+
+    /// A partial marker that never completes is still released as text.
+    ///
+    /// The bound that keeps a stream ending on a marker from accumulating has to
+    /// cover a partial marker too, or a single trailing `0xe2` would stall the
+    /// output forever.
+    #[test]
+    fn a_partial_marker_that_never_completes_is_released() {
+        let mut w = MarkerRewriter::new();
+        w.assign(0, Some(1));
+        let out = w.push(&[0xe2]);
+        assert!(out.is_empty(), "a lone marker lead must be held: {out:?}");
+
+        let mut out = w.push(b"abcdefghijkl");
+        assert!(
+            out.starts_with(&[0xe2]),
+            "the held lead must eventually come out: {out:?}"
+        );
+    }
+
+    /// Ordinary text is forwarded untouched.
     #[test]
     fn text_around_a_cell_is_forwarded_unchanged() {
         let mut w = MarkerRewriter::new();
-        let cell = format!("{}{}{}", MARKER, DIACRITICS[0], DIACRITICS[0]);
-        let input = format!("ab{cell}cd");
-        let out = w.push(input.as_bytes(), 1);
+        w.assign(0, Some(1));
+        let cell = format!("{}{}{}", MARKERS[0], DIACRITICS[0], DIACRITICS[0]);
+        let out = w.push(format!("ab{cell}cd").as_bytes());
         let text = String::from_utf8_lossy(&out);
         assert!(text.starts_with("ab"), "{text:?}");
         assert!(text.ends_with("cd"), "{text:?}");
     }
 
     /// A marker with an ordinary letter after it is not a cell.
+    ///
+    /// The marker character alone is not enough to identify a cell: a real text
+    /// could contain it, and only the two combining diacritics make it one.
     #[test]
     fn a_marker_followed_by_a_letter_is_left_alone() {
         let mut w = MarkerRewriter::new();
-        let input = format!("{MARKER}x");
-        let out = w.push(input.as_bytes(), 1);
+        w.assign(0, Some(1));
+        let input = format!("{}x", MARKERS[0]);
+        let out = w.push(input.as_bytes());
         assert_eq!(String::from_utf8_lossy(&out), input);
+    }
+
+    /// Plain marker characters in content are not rewritten.
+    ///
+    /// A marker is only a cell with its diacritics, so a lone one is ordinary
+    /// text. The one at the end of the chunk is held, because its diacritics may
+    /// be the first thing in the next read; a following read that cannot complete
+    /// it releases it as text.
+    #[test]
+    fn a_lone_marker_is_not_a_cell() {
+        let mut w = MarkerRewriter::new();
+        w.assign(0, Some(1));
+        let first = format!("{} {}", MARKERS[0], MARKERS[1]);
+        let mut out = w.push(first.as_bytes());
+        // The trailing marker is held, so only the first two are out so far.
+        assert_eq!(String::from_utf8_lossy(&out), format!("{} ", MARKERS[0]));
+
+        // More ordinary text that does not complete it: the held marker is text.
+        out.extend_from_slice(&w.push(b"x"));
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            format!("{} {}x", MARKERS[0], MARKERS[1]),
+            "a marker that never completes must still be forwarded"
+        );
     }
 }

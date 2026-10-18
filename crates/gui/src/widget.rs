@@ -1,18 +1,18 @@
-//! The client's TUI: a `StatefulWidget` that paints the Unicode placeholder
-//! grid and overlays a stats readout on top of it.
+//! The client's TUI: a `StatefulWidget` that paints a full screen of colored
+//! background cells and overlays a stats readout on top of it.
 //!
 //! A widget rather than a bare `terminal.draw(|f| ...)` closure, for the same
-//! reason `gobo-renderer`'s renderer is one: the drawing state (the image id,
-//! the counters, the measured timings) has to survive between frames, and
-//! ratatui's `StatefulWidget` is the mechanism for exactly that. Passing the
-//! state as arguments to a closure would mean threading it through every call
-//! site, and the overlay would have nowhere natural to live.
+//! reason a renderer takes its state explicitly: the drawing state (the slot, the
+//! counters, the measured timings) has to survive between frames, and ratatui's
+//! `StatefulWidget` is the mechanism for exactly that. Passing the state as
+//! arguments to a closure would mean threading it through every call site, and
+//! the overlay would have nowhere natural to live.
 //!
 //! # Why the grid is the whole screen
 //!
-//! Placeholder cells are ordinary text, so any cell *not* filled with a
-//! placeholder is a hole the image cannot cover. The grid therefore fills the
-//! full area, and the stats overlay is drawn on top of it.
+//! The image is drawn over the full rectangle, so any cell left unwritten is a
+//! hole it cannot cover. The grid therefore fills the full area, and the stats
+//! overlay is drawn on top of it.
 
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::StatefulWidget;
 
 use tuigui_wire::p2p;
-use tuigui_wire::session;
 
 /// The stats overlay's height in rows.
 pub const OVERLAY_HEIGHT: u16 = 3;
@@ -38,24 +37,25 @@ pub struct GridWidget;
 /// What the widget needs that only the caller has: the image the cells must
 /// reference, and the numbers to display.
 pub struct GridState {
-    /// The id the server assigned. Every cell encodes it in its foreground
-    /// color, so this must not change for the life of the grid: a new id would
-    /// need every cell repainted, and would break the in-place frame edits the
-    /// server relies on.
+    /// The id the server assigned.
+    ///
+    /// Unused by the drawing itself: the grid is colored background cells, not a
+    /// placeholder grid, so no cell encodes an id. Kept because the handshake and
+    /// the server's reports still carry it.
     pub image_id: u32,
-    /// Which cell to draw, as the server decided when it published the session.
+    /// Which half of the double buffer the grid should paint.
     ///
-    /// The server knows whether anything re-renders this client's bytes, which
-    /// is what decides between a placeholder the terminal resolves itself and a
-    /// marker the server rewrites.
-    pub grid: session::GridMode,
-    /// Set when the server moved to the other image and every cell must be
-    /// repainted with the new id.
+    /// The client decides this and nothing else about the swap: it flips the slot
+    /// after sending each frame, and the server maps the slot to whichever image
+    /// it finished. Flipping has to repaint, because a pane re-renders only cells
+    /// whose content changed, and the slot is what the colors are derived from.
+    pub slot: usize,
+    /// Set when the grid's painted content changed and the screen must be
+    /// updated.
     ///
-    /// The server alternates between two images so a frame never lands in pixels
-    /// the cells are already resolving against. The cost is this repaint: the id
-    /// is part of each cell's color, so a grid still naming the previous image
-    /// draws nothing.
+    /// The client's own buffer is otherwise identical between frames, so a draw
+    /// without this would write nothing and the slot change would never reach the
+    /// terminal.
     pub repaint_grid: bool,
     /// Client-side counters and timings.
     pub stats: Stats,
@@ -74,7 +74,7 @@ impl StatefulWidget for GridWidget {
         // A grid the protocol cannot address is an error, not a thing to paper
         // over with a plausible-looking fallback cell. Painting the reason where
         // the image would be is the only way the user finds out.
-        if let Err(e) = fill_placeholders(area, buf, state.image_id, state.grid) {
+        if let Err(e) = fill_background(area, buf, state.slot) {
             buf.set_line(
                 area.x,
                 area.y,
@@ -97,84 +97,54 @@ impl StatefulWidget for GridWidget {
     }
 }
 
-/// Fill `area` with grid cells for `image_id`.
+/// Fill `area` with spaces carrying randomly chosen background colors.
 ///
-/// In [`GridMode::Placeholder`] a cell is the placeholder scalar alone, with the
-/// image id in the foreground color: the terminal resolves it with no help. In
-/// [`GridMode::Marker`] a cell is a magenta block, which is what has to survive a
-/// multiplexer's re-render, and the wrapper rewrites it into the placeholder form
-/// once it can apply the id for real.
-fn fill_placeholders(
-    area: Rect,
-    buf: &mut Buffer,
-    image_id: u32,
-    mode: session::GridMode,
-) -> Result<(), String> {
-    let (r, g, b) = match mode {
-        // The id itself, in 24-bit color. Getting the byte order wrong renders
-        // nothing at all: the terminal looks up a different image id and finds
-        // no image, without any error to show for it.
-        session::GridMode::Placeholder => p2p::id_to_color(image_id),
-        session::GridMode::Marker => p2p::MARKER_RGB,
-    };
-    let fg = Color::Rgb(r, g, b);
-
-    // Every row and column index must exist in the table. Checked up front so
-    // the failure names the size rather than showing a grid of wrong cells.
-    let max = area.width.max(area.height) as usize;
-    if max > p2p::DIACRITICS.len() {
-        return Err(format!(
-            "grid {}x{} needs diacritic index {max} but the table has {} entries: the \
-             terminal is too large to address with Unicode placeholders",
-            area.width,
-            area.height,
-            p2p::DIACRITICS.len(),
-        ));
-    }
-
+/// The Unicode placeholder grid this replaced was slow: two combining diacritics
+/// per cell meant three scalars, and the terminal spent its time shaping and
+/// measuring them for every cell of every repaint. A space with a background is
+/// one glyph, one cell, and no shaping.
+///
+/// The colors carry no information. They are picked from `state.slot` so that
+/// flipping the slot changes every cell, which is what makes a repaint visible:
+/// a pane re-renders only the cells whose content changed, and a grid of identical
+/// cells would never repaint.
+///
+/// This is a bench marker, not a protocol. It draws a picture-shaped thing so the
+/// cost of painting a full screen can be measured in isolation; the frame stream
+/// is not connected to it.
+fn fill_background(area: Rect, buf: &mut Buffer, slot: usize) -> Result<(), String> {
+    // A tiny, cheap hash of (x, y, slot): deterministic, so two runs are
+    // comparable, and slot-dependent, so a flip is a visible change.
     for y in 0..area.height {
         for x in 0..area.width {
-            // Row and column count from the top-left of `area`. It is the full
-            // screen today, but stating it relative to `area` keeps the indices
-            // correct if the grid is ever drawn into a smaller rect.
+            let h = color_hash(x, y, slot);
             let cell = &mut buf[(area.x + x, area.y + y)];
-            // Infallible here: both indices were bounds-checked above.
-            let symbol = cell_symbol(y, x, mode).ok_or_else(|| {
-                format!("no diacritic for row {y} column {x} within a {}x{} grid", area.width, area.height)
-            })?;
-            cell.set_symbol(&symbol);
-            // Foreground, not background: both cells are glyphs, so what fills
-            // the cell is the glyph's own color. A background would sit behind
-            // the block and never show.
-            cell.set_fg(fg);
-            cell.set_bg(Color::Reset);
+            cell.set_char(' ');
+            cell.set_fg(Color::Reset);
+            cell.set_bg(Color::Rgb(
+                (h >> 16) as u8,
+                (h >> 8) as u8,
+                h as u8,
+            ));
         }
     }
     Ok(())
 }
 
-/// The text of one grid cell: the cell's scalar, then row and column.
+/// A scattered 24-bit color for cell `(x, y)` in `slot`.
 ///
-/// `None` when an index is outside the table. Returning the fallback diacritic
-/// instead would draw a valid-looking cell that shows the wrong part of the
-/// image, which is worse than admitting the index does not exist.
-fn cell_symbol(row: u16, col: u16, mode: session::GridMode) -> Option<String> {
-    let scalar = match mode {
-        session::GridMode::Placeholder => p2p::PLACEHOLDER,
-        session::GridMode::Marker => p2p::MARKER,
-    };
-    Some(format!(
-        "{}{}{}",
-        scalar,
-        diacritic(row as usize)?,
-        diacritic(col as usize)?,
-    ))
-}
-
-/// The diacritic for a row or column index, or `None` if the table has no such
-/// index.
-fn diacritic(n: usize) -> Option<char> {
-    p2p::DIACRITICS.get(n).copied()
+/// A small integer hash rather than a random number generator: no state to carry
+/// between frames, and a cell's color is a function of its position, so the
+/// picture is stable across repaints except for the slot.
+fn color_hash(x: u16, y: u16, slot: usize) -> u32 {
+    let mut h = (x as u32)
+        .wrapping_mul(0x9E37_79B1)
+        ^ (y as u32).wrapping_mul(0x85EB_CA6B)
+        ^ (slot as u32).wrapping_mul(0xC2B2_AE35);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2545_F491);
+    h ^= h >> 13;
+    h.wrapping_mul(0x27D4_EB2D) ^ (h >> 16)
 }
 
 /// Draw the stats readout into `area`.
@@ -187,13 +157,10 @@ pub fn render_stats(area: Rect, buf: &mut Buffer, state: &GridState) {
     // partly outside the buffer would otherwise panic on the first out-of-range
     // cell, which is a rough way to learn the terminal shrank.
     let area = area.intersection(buf.area);
-    // The marker background, so a cell the overlay writes keeps the one thing
-    // that identifies it as part of the grid. ratatui diffs against its own last
-    // frame, so a cell whose symbol changes is resent: without this the overlay
-    // would strip the marker from exactly the columns it covers, and the wrapper
-    // would find no cell there.
-    let (r, g, b) = p2p::MARKER_RGB;
-    let marker_bg = Color::Rgb(r, g, b);
+    // No background: the overlay's own text is written in a color that names no
+    // slot, so the wrapper forwards those cells as ordinary text rather than
+    // turning them into placeholders. The grid cells underneath keep their slot
+    // color and still resolve.
     for (i, line) in stats_lines(state).into_iter().enumerate() {
         let y = area.y + i as u16;
         if y >= area.y + area.height {
@@ -213,7 +180,6 @@ pub fn render_stats(area: Rect, buf: &mut Buffer, state: &GridState) {
                 let cell = &mut buf[(area.x + x as u16, y)];
                 cell.set_char(ch);
                 cell.set_fg(span.style.fg.unwrap_or(Color::White));
-                cell.set_bg(marker_bg);
                 x += 1;
             }
             if x >= width {
@@ -390,77 +356,57 @@ fn human_bytes(n: u64) -> String {
 mod tests {
     use super::*;
 
-    /// The first cell is the marker plus the first two diacritics.
+    /// Every cell is a space with a background color.
     ///
-    /// Deliberately *not* the placeholder scalar: the client draws text a
-    /// multiplexer re-renders unchanged, and the wrapper turns each marker into
-    /// the placeholder cell, in the one place that knows the live image id.
+    /// The Unicode grid this replaced cost three scalars per cell; a space with a
+    /// background is one glyph, which is the whole point of the change.
     #[test]
-    fn the_first_cell_is_the_marker_with_row_and_column_zero() {
-        assert_eq!(
-            cell_symbol(0, 0, session::GridMode::Marker).as_deref(),
-            Some("\u{2588}\u{0305}\u{0305}")
-        );
-    }
-
-    /// With no multiplexer in the path there is nothing to rewrite a marker, so
-    /// the cells are placeholders the terminal resolves itself.
-    #[test]
-    fn a_placeholder_grid_uses_the_placeholder_scalar() {
-        assert_eq!(
-            cell_symbol(0, 0, session::GridMode::Placeholder).as_deref(),
-            Some("\u{10EEEE}\u{0305}\u{0305}")
-        );
-    }
-
-    /// Row and column advance independently, each from its own index.
-    #[test]
-    fn row_and_column_are_encoded_separately() {
-        let m = session::GridMode::Marker;
-        assert_eq!(cell_symbol(1, 0, m).as_deref(), Some("\u{2588}\u{030D}\u{0305}"));
-        assert_eq!(cell_symbol(0, 1, m).as_deref(), Some("\u{2588}\u{0305}\u{030D}"));
-    }
-
-    /// Every cell of a marker grid is drawn in the marker color, which is the
-    /// signal the wrapper keys on to find cells at all.
-    ///
-    /// The foreground, not the background: the cell is a full block, so a
-    /// background would sit behind the glyph and never show.
-    #[test]
-    fn every_marker_cell_is_drawn_in_the_marker_color() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 3));
+    fn every_cell_is_a_colored_space() {
         let area = Rect::new(0, 0, 4, 3);
-        fill_placeholders(area, &mut buf, 9, session::GridMode::Marker)
-            .expect("a small grid fits");
-        let (r, g, b) = p2p::MARKER_RGB;
-        let want = Color::Rgb(r, g, b);
+        let mut buf = Buffer::empty(area);
+        fill_background(area, &mut buf, 0).expect("a small grid fits");
         for y in 0..3 {
             for x in 0..4 {
-                assert_eq!(buf[(x, y)].fg, want, "cell ({x},{y}) lost the marker");
-                assert_eq!(buf[(x, y)].bg, Color::Reset, "cell ({x},{y}) set a bg");
+                let cell = &buf[(x, y)];
+                assert_eq!(cell.symbol(), " ", "cell ({x},{y})");
+                assert!(
+                    matches!(cell.bg, Color::Rgb(..)),
+                    "cell ({x},{y}) must carry a background color"
+                );
             }
         }
     }
 
-    /// A placeholder grid carries the image id in the cell color instead, since
-    /// the terminal resolves those cells with no help from the wrapper.
+    /// The two slots paint different colors, which is what carries a swap.
+    ///
+    /// A pane re-renders only the cells whose content changed, so if both slots
+    /// painted the same colors the flip would never reach the screen.
     #[test]
-    fn every_placeholder_cell_carries_the_image_id() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 2, 2));
-        let area = Rect::new(0, 0, 2, 2);
-        fill_placeholders(area, &mut buf, 42, session::GridMode::Placeholder)
-            .expect("a small grid fits");
-        let (r, g, b) = p2p::id_to_color(42);
-        assert_eq!(buf[(0, 0)].fg, Color::Rgb(r, g, b));
+    fn the_two_slots_paint_different_colors() {
+        let area = Rect::new(0, 0, 8, 8);
+        let mut first = Buffer::empty(area);
+        let mut second = Buffer::empty(area);
+        fill_background(area, &mut first, 0).expect("fits");
+        fill_background(area, &mut second, 1).expect("fits");
+        let differing = (0..8).flat_map(|y| (0..8).map(move |x| (x, y))).any(|(x, y)| {
+            first[(x, y)].bg != second[(x, y)].bg
+        });
+        assert!(differing, "the slots must paint different colors");
     }
 
-    /// Past the end of the table there is no valid diacritic, and the caller
-    /// must be told so rather than handed a fallback that paints the wrong cell.
+    /// A cell's color is a function of its position, not of hidden state.
+    ///
+    /// Deterministic so two runs are comparable; a random generator would make
+    /// one frame's cost incomparable with the next, which is the measurement this
+    /// grid exists for.
     #[test]
-    fn a_row_past_the_table_is_reported_not_faked() {
-        let far = p2p::DIACRITICS.len() + 100;
-        assert_eq!(diacritic(far), None);
-        assert_eq!(cell_symbol(far as u16, 0, session::GridMode::Marker), None);
+    fn a_cells_color_is_stable_for_same_position_and_slot() {
+        assert_eq!(color_hash(3, 7, 0), color_hash(3, 7, 0));
+        assert_ne!(
+            color_hash(3, 7, 0),
+            color_hash(7, 3, 0),
+            "row and column must not be interchangeable"
+        );
     }
 
     /// The overlay is drawn inside its area and no further, so it cannot
@@ -470,7 +416,7 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 8));
         let state = GridState {
             image_id: 1,
-            grid: session::GridMode::Placeholder,
+            slot: 0,
             repaint_grid: false,
             stats: Stats::default(),
             server: None,
@@ -488,7 +434,7 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 8));
         let state = GridState {
             image_id: 1,
-            grid: session::GridMode::Placeholder,
+            slot: 0,
             repaint_grid: false,
             stats: Stats::default(),
             server: None,
@@ -508,7 +454,7 @@ mod tests {
         stats.record_send(10, Duration::ZERO, Duration::ZERO);
         let state = GridState {
             image_id: 1,
-            grid: session::GridMode::Placeholder,
+            slot: 0,
             repaint_grid: false,
             stats,
             server: Some(p2p::ServerStats {
@@ -540,7 +486,7 @@ mod tests {
     fn the_server_line_says_when_there_is_no_report_yet() {
         let state = GridState {
             image_id: 1,
-            grid: session::GridMode::Placeholder,
+            slot: 0,
             repaint_grid: false,
             stats: Stats::default(),
             server: None,

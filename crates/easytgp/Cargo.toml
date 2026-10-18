@@ -6,7 +6,6 @@ license.workspace = true
 description = "Terminal graphics protocol (TGP) wire format encoder/decoder"
 
 [dependencies]
-gobo-core = { workspace = true }
 derive_builder = { workspace = true }
 rustix = { workspace = true }
 png = { workspace = true }

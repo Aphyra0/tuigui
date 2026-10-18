@@ -1,5 +1,5 @@
 [package]
-name = "tuigui-tui"
+name = "tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,7 +10,8 @@ tuigui-wire = { workspace = true }
 easytgp = { workspace = true }
 image = { workspace = true }
 rustix = { workspace = true }
-tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "sync", "time", "macros"] }
+clap = { workspace = true }
+tokio = { workspace = true }
 
 [[bin]]
 name = "tui"

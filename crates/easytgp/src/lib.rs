@@ -35,28 +35,16 @@ mod id {
     use idalloc::Slab;
     use static_init::dynamic;
 
-    /// Locked lazy global slab. Access via `IDAl.write()` / `IDAl.read()`.
+    /// The id slab, and nothing else.
+    ///
+    /// This used to clear `ECHO` and `ICANON` on stdin, print a screen clear, and
+    /// `unwrap` all of it, inside a static initializer. Three problems with one
+    /// cause: a global initializer runs on whatever thread first touches the
+    /// slab, and a panic there cannot unwind, so a process whose stdin is not a
+    /// terminal was aborted rather than told why. None of it is an allocator's
+    /// business; the caller owns the terminal.
     #[dynamic]
     static mut I: Slab<Id> = {
-        // read current config
-        let mut t = rustix::termios::tcgetattr(std::io::stdin()).unwrap(); // any tty fd works: 0=stdin
-
-        // // disable echo only (leave everything else)
-        t.local_modes.remove(rustix::termios::LocalModes::ECHO);
-        t.local_modes.remove(rustix::termios::LocalModes::ICANON);
-
-        // // COMMIT — write it back to the fd (this is the missing line)
-        rustix::termios::tcsetattr(std::io::stdin(), rustix::termios::OptionalActions::Now, &t)
-            .unwrap();
-
-        // option 2 — also clear scrollback (kitty/xterm support this)
-
-        // println!("\x1b[2J\x1b[H");
-
-        use std::io::Write;
-        print!("\x1b[2J\x1b[3J\x1b[H");
-        std::io::stdout().flush().unwrap();
-
         let mut slab = Slab::<Id>::new();
         // skip 0 as an id.
         slab.next();
@@ -236,6 +224,17 @@ impl From<Reply> for Result<Reply, TGPError> {
 
         Ok(value)
     }
+}
+
+/// Report a reply this library could not interpret.
+///
+/// The reply path cannot return an error: a [`PendingTransfer`] is a `Future`
+/// whose `Output` is an image, so a malformed reply cannot become an `Err`
+/// without changing the type of every transmit. Writing to stderr keeps it
+/// visible, which matters because the alternative is an image whose cells
+/// silently draw nothing.
+fn log_reply_error(message: &str) {
+    eprintln!("easytgp: {message}");
 }
 
 pub struct PendingTransfer<F: Format> {
@@ -815,13 +814,22 @@ impl<F: Format + 'static> ImageRequest<F> {
         let id = DynId::new(id::alloc());
 
         PendingTransfer::new(self.exec_transmit('I', id.assigned()), |r| {
+            // The id comes from the terminal, so this is the only place that
+            // learns it. A missing one used to panic, which took the whole
+            // process down over a reply this layer failed to interpret. `DynId`
+            // has no "unknown" state and `PendingTransfer` is a `Future` whose
+            // `Output` is an image, so there is no `Err` to return: id 0 is
+            // reported instead, which names no image and so draws nothing rather
+            // than drawing the wrong thing.
             let id: u32 = r
                 .message
-                .expect("reply with allocated i")
-                .get_from_key('i')
-                .unwrap()
-                .parse()
-                .unwrap();
+                .as_ref()
+                .and_then(|m| m.get_from_key('i'))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if id == 0 {
+                log_reply_error("transmit: the terminal's reply carried no image id");
+            }
 
             DynImage {
                 id: DynId::Assigned(Arc::new(id)),

@@ -10,14 +10,15 @@
 //! (a shell at a prompt) does not hold the terminal forever after the client has
 //! finished.
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
-
-use tuigui_tui::Config as ServerConfig;
+use std::path::PathBuf;
 
 /// Default socket. Under `/tmp` because a session is machine-scoped and
 /// short-lived, matching the session file the server publishes next to it.
 const DEFAULT_SOCKET: &str = "/tmp/tuigui.sock";
+
+const USAGE: &str = "usage: tuigui [--socket P] <client args...>\n\
+     e.g. tuigui play /tmp/clip.mp4\n\
+     e.g. tuigui placeholders";
 
 /// Where the server publishes its connection details.
 ///
@@ -34,7 +35,7 @@ fn session_path() -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct Config {
     /// The client to run, which is what produces the frames.
-    pub client: tuigui_gui::Command,
+    pub client: gui::Command,
     /// Unix socket for the server to listen on.
     pub socket: String,
 }
@@ -72,68 +73,73 @@ impl Config {
             return Err(USAGE.into());
         }
         Ok(Self {
-            client: tuigui_gui::command_from_args(rest.into_iter())?,
+            client: gui::command_from_args(rest.into_iter())?,
             socket,
         })
     }
 }
 
-const USAGE: &str = "usage: tuigui [--socket P] <client args...>\n\
-     e.g. tuigui play /tmp/clip.mp4\n\
-     e.g. tuigui placeholders";
-
-/// The command the server runs: the user's shell, so the frames land on top of
-/// a normal prompt. `SHELL` is honored, with `sh` as the portable fallback.
-fn default_server_command() -> Vec<String> {
-    vec![std::env::var("SHELL").unwrap_or_else(|_| "sh".into())]
-}
-
-/// Start the server, run the client, then stop the server.
-pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+/// Start the session: the server owns this terminal, and the command inside it
+/// is this same binary re-entered as the client.
+///
+/// The client has to be *inside* the pty, not beside the server on the same
+/// terminal. The server is the only writer of the real terminal, and its rewrite
+/// of the grid into placeholder cells only sees what comes out of the pty: a
+/// client drawing directly would have its marker cells delivered unrewritten, so
+/// the terminal would show blocks and never an image. Piping the client through
+/// the pty also makes the server the only reader of fd 0, so a quit key reaches
+/// exactly one place.
+pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let path = session_path();
 
-    // Remove the previous session first. Otherwise `wait_for_session` is
-    // satisfied by a stale file from an earlier run and the client connects to
-    // a socket nobody is listening on, which reads as a confusing handshake
-    // failure rather than "the server is not up yet".
+    // Remove the previous session first. Otherwise a stale file from an earlier
+    // run makes the client connect to a socket nobody is listening on, which
+    // reads as a confusing handshake failure rather than "the server is not up
+    // yet".
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("removing stale {}: {e}", path.display()).into()),
     }
 
-    let server_config = ServerConfig {
-        socket: config.socket.clone(),
-        session_path: Some(path.clone()),
-        command: default_server_command(),
+    let session = tui::Tui {
+        socket: config.socket,
+        session_path: Some(path),
+        command: server_command(&client_argv(&config.client)),
     };
-
-    // The server runs until the wrapped command exits, so it cannot share this
-    // thread: the client owns the terminal from here on.
-    let handle = tuigui_tui::spawn(server_config)?;
-    wait_for_session(&path, Duration::from_secs(10))?;
-
-    let client_res = tuigui_gui::run(config.client);
-
-    // The client holds the screen until interrupted, so reaching here means it
-    // finished or failed. Either way nothing will draw again, and the wrapped
-    // shell would sit at a prompt inside a pty nobody reads, so stop it.
-    handle.stop();
-    client_res
+    // Nothing is drawn from this thread: the client runs inside the pty, which is
+    // what puts its grid through the rewrite. This only waits for the session to
+    // end, which happens when the client inside it exits.
+    //
+    // `std::io`'s handles, not tokio's: the session takes plain streams and puts
+    // the blocking reads on their own thread, so there is nothing async about
+    // them to wrap.
+    Ok(session.run(std::io::stdin(), std::io::stdout()).await?)
 }
 
-/// Block until `path` exists, or fail.
+/// The command the server runs: this same binary, re-entered to run the client.
+fn server_command(client: &[String]) -> Vec<String> {
+    let mut cmd = vec![
+        std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "tuigui".into()),
+    ];
+    cmd.push(INTERNAL_CLIENT_FLAG.into());
+    cmd.extend(client.iter().cloned());
+    cmd
+}
+
+/// The flag `tuigui` uses to re-enter itself as the pty's client.
 ///
-/// A real synchronization point: the client reads the socket path and the grid
-/// size out of this file, so starting it earlier would have it connect to
-/// nothing.
-fn wait_for_session(path: &Path, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if path.exists() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(20));
+/// A flag rather than an environment variable: the pty's command line is what the
+/// server execs, and an environment marker would be inherited by anything the
+/// client itself spawns (ffmpeg), making the re-entry ambiguous.
+pub const INTERNAL_CLIENT_FLAG: &str = "--client";
+
+/// The client's own argv, as a command line, for the pty.
+fn client_argv(client: &gui::Command) -> Vec<String> {
+    match client {
+        gui::Command::Placeholders => vec!["placeholders".into()],
+        gui::Command::Play(path) => vec!["play".into(), path.clone()],
     }
-    Err(format!("no session at {} within {timeout:?}", path.display()).into())
 }

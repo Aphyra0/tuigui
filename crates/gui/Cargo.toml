@@ -1,5 +1,5 @@
 [package]
-name = "tuigui-gui"
+name = "gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -20,7 +20,6 @@ ratatui = { workspace = true }
 turbojpeg = { version = "1.5", default-features = false, features = ["pkg-config", "require-simd"] }
 ffmpeg-sidecar = { workspace = true }
 rustix = { workspace = true }
-tokio = { version = "1", features = ["rt-multi-thread", "io-util", "sync", "time"] }
 
 [[bin]]
 name = "gui"

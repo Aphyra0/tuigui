@@ -234,7 +234,7 @@ fn placeholders() -> Result<(), Box<dyn std::error::Error>> {
     // clients.
     let mut state = widget::GridState {
         image_id: id,
-        grid: s.grid,
+        slot: 0,
         repaint_grid: false,
         stats: widget::Stats::default(),
         server: None,
@@ -244,9 +244,8 @@ fn placeholders() -> Result<(), Box<dyn std::error::Error>> {
     res?;
     say("grid held; frames appear as the server receives them");
     // Hold the screen so the cells stay put; the image lives as long as they do.
-    loop {
-        std::thread::sleep(Duration::from_secs(3600));
-    }
+    hold_until(&mut || link.server_gone());
+    Ok(())
 }
 
 /// Draw one frame of the grid and overlay, timing the redraw.
@@ -282,7 +281,7 @@ fn play(video: &str) -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let mut state = widget::GridState {
         image_id: id,
-        grid: s.grid,
+        slot: 0,
         repaint_grid: false,
         stats: widget::Stats::default(),
         server: None,
@@ -347,11 +346,24 @@ fn play(video: &str) -> Result<(), Box<dyn std::error::Error>> {
 
         state.stats.record_send(bytes, encode, send);
 
-        // The overlay is the only thing that normally changes between frames, so
-        // redraw only when there is something new to show: a counter boundary,
-        // or a swap that changed the id every cell encodes.
-        if state.repaint_grid || state.stats.sent_frames % p2p::STATS_EVERY == 0 {
+        // Ask for the other half of the pair, and repaint so the pane sees the
+        // change: the server has this frame, and the next one belongs in the
+        // image the cells do not name. The client never learns which image that
+        // is; it only says that the frame moved on.
+        state.slot = 1 - state.slot;
+        state.repaint_grid = true;
+
+        // Repaint *before* the next frame is sent, not after. A swap means the
+        // server has finished one image and will write the next frame into the
+        // other, so the cells have to be pointing at that other image by then.
+        // Drawing after the send would let a frame be written into an image the
+        // screen is still showing.
+        if state.repaint_grid {
             state.repaint_grid = false;
+            draw(&mut terminal, &mut state)?;
+        } else if state.stats.sent_frames % p2p::STATS_EVERY == 0 {
+            // The overlay is otherwise the only thing that changes between frames,
+            // so it is redrawn on a counter boundary.
             draw(&mut terminal, &mut state)?;
         }
     }
@@ -362,12 +374,31 @@ fn play(video: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Keep the grid: the image lives only as long as the cells that reference
     // it, so restoring the terminal here would blank it the moment playback
     // ends. Hold instead, like `placeholders` does.
-    say("holding the grid; Ctrl-C to exit");
+    say("holding the grid; q or Ctrl-C to exit");
+    hold_until(&mut || sink.server_gone());
+    Ok(())
+}
+
+/// Hold the grid until the server ends the session.
+///
+/// The client never reads the keyboard, and must not: its stdin is the pty when it
+/// runs inside the server's pty (`tuigui`), so a read there steals every keystroke
+/// and mouse report before the server's input loop can forward them on. An earlier
+/// version read stdin here to notice a `q`, and that is exactly what broke keys
+/// and mouse.
+///
+/// The connection is the signal instead, and it is the right one: the server owns
+/// the terminal and the input, so when it stops there is nothing left to draw for.
+fn hold_until(server_gone: &mut impl FnMut() -> bool) {
     loop {
-        std::thread::sleep(Duration::from_secs(3600));
+        if server_gone() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
+/// Put stdin in non-blocking mode, so reading it never parks the hold loop.
 /// Apply every message the server has waiting, without blocking for more.
 ///
 /// Non-blocking by contract: the caller is in a send loop, and a server with
@@ -386,7 +417,6 @@ fn drain_replies(
             p2p::Msg::Image { id } => {
                 if id != state.image_id {
                     state.image_id = id;
-                    state.repaint_grid = true;
                 }
             }
             // Surfaced immediately: pushing more frames at a server that has
@@ -444,8 +474,14 @@ const JPEG_QUALITY: i32 = 80;
 fn spawn_ffmpeg(path: &Path) -> Frames {
     use ffmpeg_sidecar::command::FfmpegCommand;
 
+    // `-nostdin` is required, not tidiness. The sidecar pipes ffmpeg's stdin
+    // (`command.rs`: `inner.stdin(Stdio::piped())`) and never writes to it, so
+    // ffmpeg sees an immediate EOF; without `-nostdin` it treats that as "the
+    // input is over" and sits polling a closed stdin forever instead of decoding
+    // the file it was given. That is invisible when the client has no stdin of
+    // its own, and fatal when it runs inside a pty, where there is one.
     let mut cmd = FfmpegCommand::new();
-    cmd.input(path.as_os_str());
+    cmd.args(["-nostdin"]).input(path.as_os_str());
     let frames = cmd
         .rawvideo()
         .spawn()
@@ -499,8 +535,35 @@ impl io::Write for Sink {
 }
 
 impl Sink {
+    /// Whether the server has closed its end of the connection.
+    ///
+    /// A client holding the grid has nothing else to watch: the server owns the
+    /// terminal and its own stdin, so this is the only signal that the session is
+    /// over. Reading zero bytes, or a closed socket, both mean it ended.
+    ///
+    /// Never blocks: a zero-length peek returns immediately whether or not any
+    /// data is waiting.
+    fn server_gone(&mut self) -> bool {
+        match self {
+            Sink::Unix(s) => {
+                // `recv(MSG_PEEK)` rather than `UnixStream::peek`, which is still
+                // unstable. A peek leaves any waiting message in place, so the
+                // reply this client still has to read is not consumed.
+                let mut byte = [0u8; 1];
+                match rustix::net::recv(s, &mut byte[..], rustix::net::RecvFlags::PEEK) {
+                    // A closed connection.
+                    Ok((_, 0)) => true,
+                    // Data waiting, or nothing to report: either way live.
+                    Ok(_) => false,
+                    Err(e) => e != rustix::io::Errno::WOULDBLOCK,
+                }
+            }
+        }
+    }
+
     /// Read the next message, blocking.
     fn read_msg(&mut self) -> io::Result<p2p::Msg> {
+
         match self {
             Sink::Unix(s) => p2p::Msg::read(s),
         }

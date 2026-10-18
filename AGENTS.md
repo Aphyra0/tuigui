@@ -40,22 +40,42 @@ A full rebuild of `ring` / `rustls` / the TLS stack costs minutes. Avoid it.
   `.py` files. Python is banned in this project — full stop.
 - **Do not use `curl`** through the shell. Use the fetch/download tools.
 - **Do not commit** unless the user explicitly asks.
-- **Do not add a silent fallback for a failed read.** `unwrap_or_default`,
-  `unwrap_or`, and `?` on a metric, id, or parse that decides behavior hides the
-  bug behind a plausible value. Return `Option`/`Result` and let the caller
-  decide; when reporting, say "unmeasured" rather than `0`.
+- **Never invent a value a read did not produce.** No `unwrap_or`,
+  `unwrap_or_default`, `unwrap_or_else` (except on a poisoned lock, where the
+  guarded value is still valid), `.unwrap_or(<literal>)`, `ok()`, `Default` as a
+  stand-in for a failure, or `?` on a metric, id, or parse that decides behavior.
+  Each of these hides the failure behind a plausible value and turns a bug into
+  silently wrong behavior. Return `Option`/`Result` and let the caller decide.
+  When reporting, say "unmeasured" rather than `0`. This is enforced in review:
+  a default value for a failed read is a rejected change, not a style nit.
 
 ## Editing workflow
 
+- **Use `view`, `grep` and `edit`/`multiedit`. Never edit with another language.**
+  No `python`, no `python3`, no `perl -0pi`, no `sed -i`, no `awk` splices, no
+  heredoc-fed scripts. Python is banned outright (see Hard prohibitions); the
+  others are banned for edits because a script cannot be inspected before it
+  runs, and every time one has been used in this repo it has corrupted a file
+  (duplicated blocks, cut functions in half, missing braces).
 - Read the relevant context of a file before editing it. Match whitespace and
   indentation exactly.
-- Prefer `edit`/`multiedit`. If the file keeps churning mtime (edit tool fails
-  with "file modified since last read"), re-`view` the exact region first, then
-  use `perl -0pi`/`sed` with exact anchors, and verify immediately with
-  `git diff`.
+- For a whole function, method or type, prefer `lsp_replace_symbol`: it finds the
+  boundaries itself and cannot fail on whitespace.
+- If `edit` fails with "file modified since last read", re-`view` the exact
+  region and try `edit` again with the text the view shows. Do not switch to a
+  script.
 - After every destructive edit, verify braces (`grep -o '{' | wc -l` vs `}`)
   and rebuild.
 - Never use `apply_patch` (does not exist).
+
+## Builds that actually build the thing
+
+- `cargo build --examples` builds **only** examples: it replaces the default
+  target selection. To get binaries and examples use `--bins --examples`.
+- Cargo will not recreate a deleted binary if its fingerprint is satisfied, so a
+  build that reports `Finished` in under a second may not have produced anything.
+  Verify the file exists and is newer than the source.
+- Never leave a background build running.
 
 ## Behavior
 

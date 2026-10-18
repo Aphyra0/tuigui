@@ -1,9 +1,0 @@
-[package]
-name = "gobo-widget"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "Reusable TUI widgets"
-
-[dependencies]
-gobo-core = { workspace = true }

@@ -68,6 +68,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // One reader of the pty, which both logs and answers. Splitting those across
     // threads would let one thread's ack land inside another's escape.
+    //
+    // A second handle is kept out here for key injection: the reader owns the
+    // master, and writing input is a different direction from reading output.
+    let injector = master.try_clone()?;
     let reader_terminal = terminal.clone();
     let reader = std::thread::spawn(move || {
         let mut buf = [0u8; 16384];
@@ -94,6 +98,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Optional key injection, so a test can exercise what the pty's *user* does.
+    // `TUI_FAKE_SEND=<seconds>:<text>` writes `text` to the master after the
+    // delay, which is how a quit key reaches a program that reads its own stdin.
+    if let Ok(spec) = std::env::var("TUI_FAKE_SEND") {
+        if let Some((secs, text)) = spec.split_once(':') {
+            let secs: f64 = secs.parse().unwrap_or(2.0);
+            let text = text.to_string();
+            std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+            let mut master_w = injector;
+            master_w.write_all(text.as_bytes())?;
+            master_w.flush()?;
+        }
+    }
     let status = child.wait()?;
     // The reader ends when the pty closes, which is when the last holder of the
     // slave exits; a grandchild that inherited it would keep it open, so it is
