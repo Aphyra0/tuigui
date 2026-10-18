@@ -1,205 +1,163 @@
-# tuigui — GUI apps in the terminal
+# DESIGN — what tuigui is
 
-A program that runs real GUI applications on a headless display server and streams
-their windows into a terminal at native resolution, using the kitty graphics
-protocol (TGP).
+Status: partly built. This is the shape of the whole thing; what exists today is
+the transport and the session between its two ends. What each piece is, and
+whether it is built, is in [Where this stands](#where-this-stands).
 
 ## Problem statement
 
-Terminals are text grids, but modern ones can display exact pixels through TGP.
-The gap is glue: nothing today combines a headless display server, damage-based
-capture, and a TGP delta emitter into one tool. tuigui is that tool.
+Terminals are text grids, but modern ones can display exact pixels through the
+kitty graphics protocol. The gap is glue: nothing combines a headless display
+server, damage-based capture, and a TGP delta emitter into one tool that works in
+a pane — including a pane inside a multiplexer, and including over ssh.
 
-Goal: run any X11 or Wayland app; see it pixel-accurate at terminal resolution;
-interact with it from the terminal over SSH at interface-class bandwidth
-(1–5 Mbit/s) with no external dependencies on the client beyond a TGP terminal.
+Goal: run any X11 or Wayland app; see it pixel-accurate; interact with it from the
+terminal at interface-class bandwidth with nothing on the client side but a
+terminal that speaks TGP.
 
 ## Architecture
 
 ```
-                 ┌─────────────────────────────────────────────┐
-                 │ host process                                │
- app ──────►     │                                             │
- (X11/Wayland)   │  display head ──► capture ──► tile store ──►│──► TGP emitter ──► PTY
-                 │  (Xvfb / wlroots   (damage-driven)          │    (tiles, blits,      stdout
- input ◄─────────│  headless)       pixel diffs in 64px tiles  │     pacing)            terminal
- (PTX → XTEST /  │                                             │
-  virtual seat)  └─────────────────────────────────────────────┘
+   the app's machine                          the terminal
+ ┌──────────────────────────────────────┐   ┌──────────────────────────────┐
+ │ compositor ──▶ capture ──▶ tiles ─────┼───┼─▶ TGP escapes ──▶ screen       │
+ │ (headless,                            │   │   (owned by `tui`)            │
+ │  Xwayland for X11)                    │   │                               │
+ │                                       │   │                               │
+ │ input ◄───────────────────────────────┼───┼── keys and mouse              │
+ └──────────────────────────────────────┘   └──────────────────────────────┘
+                          `gui` announces itself; `tui` dials it
 ```
 
-Pipeline stages:
+The two ends are **client** and **server**, and they are not on opposite sides of
+a client/server boundary in the protocol sense: either may dial and either may
+accept, and the exchange is the same with the order reversed.
 
-1. **Display head** — app runs against a private headless display server.
-   - X11: `Xvfb`, private `:N`.
-   - Wayland: headless wlroots backend (headless output, `wlr-screencopy`).
-2. **Capture with damage** — never full screenshots; subscribe to damage events.
-   - X11: `XDamage` + `MIT-SHM` pixmaps for zero-copy reads.
-   - Wayland: `wlr-screencopy` damage events.
-   - Window-level capture with offset bookkeeping so a moved window shifts its
-     tile map instead of invalidating everything.
-3. **Tile store** — the window framebuffer divided into 64×64 px tiles
-   (grid-snapped). Each tile keeps: last transmitted copy, a small XOR history,
-   and a dirty counter. Scroll support: keep a 64px granular scroll history per
-   tile column so a scrolled terminal converges in ~1–2 frames.
-4. **TGP emitter** — converts tile decisions into escape sequences, gated by
-   protocol pacing (see Scheduling).
+- **`tui`** owns the terminal. It runs a command on a pty it creates, forwards
+  every byte of that pty to the real terminal, and reads it for one thing: the
+  client's announcement. It paints the pixels, because it is the side holding the
+  fd to the real screen and it is the only side that can.
+- **`gui`** runs on the app's side. It binds a channel, announces it into its own
+  output, waits to be dialed, and produces frames.
+- **`easytgp`** is the pixel layer both use: the TGP encoding itself.
+- **`wire`** is what the two agree on: the messages, the channel, and the framing.
+- **`tuigui`** is one command that starts the server and the client inside it, for
+  the common case where both are on this machine.
 
-## Pixel channels
+Putting the server *outside* the multiplexer is the decision everything else
+follows from. `tui` is the parent of the muxer's pty, not a pane inside it, so it
+writes its own graphics escapes to the real terminal directly and the muxer only
+ever sees text. That is what makes graphics survive a muxer: not passthrough,
+which is fragile and terminal-dependent, but never needing it.
 
-Each window is one TGP image, from one 32-bit RGBA framebuffer.
+## The pieces
 
-- **Surface lifecycle**: app create window → 1 image id, `c=,r=` sized to its
-  cell rect. Window move → re-place with same `(i,p)`. Window resize →
-  re-transmit the image (`i=` re-transmit wipes placements), re-place.
-  Window destroy → `a=d,d=i,i=ID,A` (release data too).
-- **Flicker**: every visible draw happens either as an in-place frame patch or a
-  same-`(i,p)` re-placement, so window content never blinks; only the first
-  placement of a new window appears (optionally pre-covered by a "starting…"
-  tile from the tile map).
-- **Z**: window stack maps to TGP z values (10·layer + index, negative for the
-  wallpaper). Overlapping semi-transparent windows alpha-blend, matching the
-  compositor's output pixel-exactly.
-- **Sub-cell positioning**: window origin = cursor cell + `X=`,`Y=` pixel offset.
-- **Cursor (window decoration)**: composed by the host compositor into the
-  framebuffer, so it's part of the stream. The *mouse pointer* is not composited
-  by headless backends — overlay it as a separate 1-image sprite, or clone the
-  X11 core cursor; Wayland headless wlroots has no HW cursor plane, so streaming
-  it separately is the plan.
+### The channel
 
-## Renderer (the codec)
+A transport owns its connection and everything done over it; see
+[TRANSPORT.md](TRANSPORT.md) for why it is shaped that way and why a read waits
+rather than polls.
 
-There is no codec. TGP accepts raw RGBA, zlib, or PNG payloads; the terminal
-cannot decode anything else. The "codec" is: tile the framebuffer, only ever
-transmit *changed tiles*, deflate them, and use TGP animations as the delta
-mechanism. Lossless-only: no DCT, no motion compensation.
+Today there is exactly one, `UnixSocket`: both ends on one machine. The
+announcement and the handshake are in [CONNECT.md](CONNECT.md).
 
-### Tile stage
+The channel carries **frames as opaque bytes**. It does not know what a tile is,
+which is what lets the pixel layer change without the session changing.
 
-- Every invalidation is snapped to the 64×64 tile grid.
-- Adjacent dirty tiles coalesce into one rect: escape overhead (~30 bytes per
-  command + base64 rounding) only amortizes over reasonably chunky rects.
-- Adjacent-frame identical tiles are never re-sent.
-- Per-tile XOR against last transmitted copy, then deflate (`o=z`). Empty XOR =
-  skip (zero cost).
+### `easytgp` — the pixels
 
-### Scroll
+Every pixel decision lives here, and both ends use it: the producer to transmit
+frames, the server to put them on the screen.
 
-Scrolls are rare full-height events; simplest implementation today: the big
-blit (`a=c` row-shift) is not implemented in v0.1 — scroll invalidates all
-tiles it touches. If profiling later shows scroll as the bandwidth hot path,
-the documented optimization is: `a=c` blit rows [dy..H]→[0..H−dy] server-side,
-then one `a=f` patch for the revealed strip. Deferred.
+- **Images and placements.** An image id names pixel data; a placement puts it at
+  a cell, optionally offset within it. One id, many placements.
+- **The id namespace is positional.** A tile's id says where it sits rather than
+  when it was drawn, so a resize does not renumber the picture and the terminal
+  can keep what it already holds.
+- **Re-transmitting an id replaces its data and its placements.** That is how a
+  tile is updated with no delete traffic, and what makes a frame a sequence of
+  transmits rather than a scene.
+- **Moves are placements.** A picture that only moved costs a placement per tile
+  and no pixels.
+- **Shared memory (`t=s`)** carries the pixels locally without base64 or
+  compression, and it is one object per tile: a terminal reads an object and
+  unlinks it, so an object can be placed exactly once. One object per frame was
+  tried twice and does not work.
+- **Atomic frames** (`?2026h` … `?2026l`) so a frame made of many commands commits
+  at once rather than tearing, and one write per frame.
+- **Replies and acks are accounted for**, which is what makes pacing possible
+  rather than guessed.
 
-### Streaming modes
+### The compositor
 
-Two supported streaming modes, selected per stream:
+An in-process Wayland compositor on a headless backend, with **Xwayland** inside
+it so X11 applications run too. Both app kinds then reach the same path: a client
+surface, damage, pixels in our own address space.
 
-- **Frame-chain (mode A)** — gapless `a=f,c=<prev>` delta frames accumulate;
-  terminal paces via `a=a,s=2` (loading mode). Periodic keyframe: full
-  re-transmit with the same `i` (TGP re-transmit wipes old data + placements;
-  this is the keyframe operation), re-place with the same `(i,p)`. Keyframes
-  every N seconds (default 10 s) and on quota pressure (kitty: 320 MB image
-  quota per buffer; animated frames get 5×, spilled to disk; LRU eviction of
-  images without placements under pressure).
-- **In-place edit (mode B)** — single frame, edited in place via
-  `a=f,i=ID,c=1,r=1,x,y,s,v`. Constant memory, no keyframe problem. Conceptually
-  clean; first prototype must verify on real kitty/ghostty that in-place edits
-  trigger correct repaints (untested against real terminals — known risk).
+Owning it rather than shelling out deletes a process boundary and a protocol
+round-trip in each direction, and it means "capture" is a buffer read rather than
+a screencopy through a shm pool. [COMP.md](COMP.md) is the design.
 
-### Scheduling / backpressure
+### The terminal side
 
-- Emitter keeps an in-flight budget of tiles (bounded memory) and gates on TGP
-  acks (`i=…;OK`) with `q` unset on pacing-critical commands.
-- Viewport tiles are sent first. Damage accumulated while a tile is queued
-  coalesces (never serialize stale frames behind old ones).
-- RTT from ack latency sets the tile budget: target ≤ 200 ms of undelivered
-  pixels in flight; when over budget, coalesce more aggressively and skip
-  intermediate states (final-state-only redraws).
+`tui` runs the command on a pty and forwards it verbatim. The command is a normal
+terminal program and cannot tell that it is wrapped.
 
-## Input
+The pty's output is **published**, not pushed: the pty hands out a handle to what
+it produces and readers subscribe. Two do — the scan, and the terminal — and each
+gets every chunk, so neither can consume bytes the other never saw. A callback
+would run a reader's work on the forwarding thread and leave it unable to wait on
+anything else, and the server's loop has to wait on its clients too.
 
-Decoded from the PTY on stdin; injected into the headless display server.
+The one writer to the screen is a single serialized `Sink`, which is what stops a
+frame landing in the middle of the command's output.
 
-- **Keyboard**: kitty keyboard protocol (`CSI u`) preferred: keysyms, modifiers,
-  press/release — complete encoding. Fallback ECMA-48/legacy sequences.
-- **Mouse**: SGR mouse mode for buttons/wheel/drag, cell-resolution. Optional
-  SGR-Pixels (mode 1016) where supported, for pixel coordinates. These numbers
-  are applied to *placement geometry*, not pixels (cell × cell_size + X,Y).
-- **Injection**: X11: `XTEST`. Wayland: virtual input (libei or
-  `zwp_virtual_keyboard`/pointer-manager).
-- **Clipboard**: OSC 52 set/get (get needs terminal opt-in), bridged to
-  `xclip`/`wl-copy` in the head display.
-- **IME**: provided by the host terminal; by the time bytes reach the PTY they
-  are final text/keysyms, so the head display server needs no IME.
+### The app side
 
-## Encoding details
+`gui` binds a socket, draws its own address into the pane, waits to be dialed,
+answers the greeting, and then produces frames. It draws to the writer its caller
+handed it rather than to the process's stdout, which is what lets `tuigui` start
+it inside the server's pty.
 
-- Pixel data: 32-bit RGBA (`f=32`), NOT pre-multiplied alpha, once zlib
-  decompressed. `o=z` zlib-deflate applied before base64.
-- Direct transport (`t=d`) over SSH with 4096-char base64 chunks (`m=1`/`m=0`).
-  Chunks of a command are contiguous; no other graphics command interleaved.
-- Probe via `a=q` + `CSI c` (DA1): graphics ack ⇒ TGP present; only DA1 ⇒ no.
-- Geometry via `TIOCGWINSZ` (`ws_xpixel/ws_ypixel`) and `CSI 16t` cell size.
-- Tempo of images: id space is per-window images (`i=1..`); patches use
-  `a=f,i=ID,c=1,r=1` (mode B) or chain `c=<prev>` (mode A).
+## Bandwidth
 
-## Unicode placeholders / multiplexer survival
+The target is interface-class content: windows, text, menus. High-entropy content
+(video, games) exceeds any lossless scheme by an order of magnitude. That is a
+scope boundary rather than a defect, and it is why the tile decision is lossless
+and has no DCT in it.
 
-- Primary mode: direct placements; a multiplexer in the path breaks TGP.
-- Fallback: virtual placements (`U=1`, quiet `q=2`) + `U+10EEEE` placeholder
-  cells (fg = image id, underline = placement id, diacritics = row/col) so
-  tmux/herdr move the placements as text redraws happen.
+## Where this stands
 
-## Scope and non-goals
+**Built**
 
-- One host binary; host must run on the same machine as the apps.
-- Client requirements: terminal with TGP (kitty, ghostty, wezterm, Konsole).
-  No client binary — everything rides the existing SSH session's PTY.
-- Non-goals for v1: pixel-precise hover for apps needing sub-cell mouse
-  accuracy, audio, drag-and-drop, passthrough of legacy sixel.
+- the transport, the announcement, the handshake, and the session between the two
+  ends: a client draws its pane, announces itself, a server finds it and dials it,
+  and both ends know the link is live
+- `tui`: pty ownership, byte forwarding, the announcement scan, the server loop,
+  and the one serialized writer to the screen
+- `gui`: argument handling, binding and announcing, answering the greeting, and
+  the terminal surface it draws on
+- `tuigui`: both halves as one command
+- `easytgp`: the TGP encoding, exercised by its own examples
 
-## Milestones
+**Not built**
 
-- **M0 probe** — capability probe + TGP smoke test (send-png style), geometry
-  detection. Acceptance: PNG displays in kitty and ghostty; probe works.
-- **M1 capture** — Xvfb + XDamage + MIT-SHM capture loop; frame dump to PNG on
-  damage. Acceptance: typing in an xterm under Xvfb produces damage events.
-- **M2 delta emitter** — tile store, XOR+deflate tile deltas, gapless `a=f`
-  chain, keyframing, ack-gated scheduler. Acceptance: a text editor streamed
-  over a rate-limited link runs < 1.5 Mbit/s sustained.
-- **M3 input** — kitty keyboard protocol + SGR mouse → XTEST injection; wheel,
-  drag, and modifier correctness. Acceptance: GUI app fully operable from
-  the terminal.
-- **M4 windowing** — multi-window app composition, z-order, per-window streams,
-  move/resize (same-`(i,p)` re-placement), window sprite overlay.
-- **M5 Wayland head** — headless wlroots backend via `wlr-screencopy`, virtual
-  input (libei). Acceptance: a GTK4 app runs and is interactive.
-- **M6 robustness** — placeholders (tmux/herdr survival), quota keyframes,
-  mode B in-place edits, re-probe on terminal reset, logging.
+- **wiring `easytgp` to the session.** `gui` reads no runnable and produces no
+  frames; `tui` draws nothing and drops a frame it is sent. The pixel layer exists
+  and the session exists, and the two are not joined. This is the next piece.
+- **the compositor.** `smithay` and `xwayland` are pinned in `Cargo.toml` and the
+  crate does not exist yet. [COMP.md](COMP.md) is the plan.
+- **any transport but a local socket.** The remote case needs a second one; see
+  [CONNECT.md](CONNECT.md). The shape of it is in [REMOTE.md](REMOTE.md) and
+  [SSH_SEAM.md](SSH_SEAM.md).
+- **input.** Keys reach the command because the pty forwards them, but nothing
+  routes them to an application.
 
-## Risks / open questions
+## Related
 
-- **In-place edits (mode B) repaint semantics on real terminal** — verify early
-  (M2 spike); fall back to frame-chain mode A otherwise. Risk: moderate.
-- **High-entropy content**: video/game footage exceeds lossless capacity by
-  30–100×; interface content is the target. Document, don't solve. Risk: none
-  (scope boundary, not a defect).
-- **Quota**: kitty 320 MB image quota per buffer; streaming must keyframe on
-  pressure. Risk: low after keyframing.
-- **Terminal quirks**: TGP implementations differ (ghostty/wezterm/Konsole);
-  the acceptable set for M0–M6 is kitty + ghostty; others best-effort.
-- **Mouse granularity**: cell coordinates only, unless mode 1016 available.
-  Hover-precision apps (sliders, drawing) are degraded. Mitigation: document.
-- **Terminal reset wipes placements**: re-probe and rebuild the scene after
-  reset (detect via a periodic quiet probe or DA1 re-send).
-
-## Prior art
-
-- **term.everything** — Wayland compositor outputting to terminal (closest prior
-  art); inputs handled inside the compositor.
-- **sixel-streamer** — Xvfb + ffmpeg x11grab → sixel over TCP; proves the
-  capture→encode→terminal pipeline, palette-limited output.
-- **notcurses** — damage-tracked rect updates for kitty/sixel at library scale.
-- **mpv vo_kitty** — full-frame TGP streaming; shows the naive approach's cost.
-- **kitty graphics protocol spec** — `docs/kitty-graphics-protocol.rst` in this
-  repo is the canonical reference.
+| | |
+|---|---|
+| [COMP.md](COMP.md) | the compositor, with Xwayland. Planned. |
+| [REMOTE.md](REMOTE.md) | the app on another machine from the terminal. Planned. |
+| [SSH_SEAM.md](SSH_SEAM.md) | attaching a forward to an ssh we do not own, for that. Planned. |
+| [EMULATOR.md](EMULATOR.md) | a terminal that accepts a compressed stream. An idea to hand to a terminal, not a plan here. |

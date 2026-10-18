@@ -28,8 +28,9 @@ pub struct Pty {
     child: Child,
     /// The grid the pty was created with, in cells.
     ///
-    /// The client needs it: it publishes the session file, and a client cannot
-    /// read the terminal's size from its environment inside a muxer's pane.
+    /// Read from this terminal rather than inherited by the command, and kept here so a
+    /// client can be told the size it is drawing into: a muxer's pane does not pass its
+    /// own geometry down through the environment.
     cols: u32,
     rows: u32,
     /// The command's output, as something else can look at it.

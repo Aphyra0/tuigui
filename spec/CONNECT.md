@@ -1,98 +1,100 @@
-# CONNECT — dialing the client over the pty
+# CONNECT — how the two ends find each other
 
-Status: proposal (design only, nothing built).
+Status: **built** for one machine. The remote case is unbuilt and needs a second
+transport; see [TRANSPORT.md](TRANSPORT.md) for the channel itself.
 
 ## The idea
 
-The server already sits in the middle of the byte stream, so it can be the one
-that **dials**. A client does not need to know where the server is. It only needs
-to announce itself, and the server — which controls the output buffer — will see
-the announcement and use it to connect back.
+The server sits in the middle of the byte stream, so it can be the one that
+**dials**. A client does not need to know where the server is. It only needs to
+announce itself, and the server — which is already reading every byte the pane
+produces — sees the announcement and connects back.
 
-The client **stdouts its endpoint id**. The server strips it off the output
-stream, and now has everything it needs to dial the client over iroh.
-
-This reverses today's direction. Today the server binds and publishes a session
-file, and the client reads that file and dials. Here the client publishes and the
-server dials.
+This reverses the original direction. The server used to bind a socket and
+publish a session file, and the client read that file and dialed. Now the client
+publishes and the server dials.
 
 ## Why the server can see it at all
 
 The server owns the last buffer before the real terminal. Everything the wrapped
-command (and any multiplexer inside it) writes comes through the server's output
-pump. That is the only reason the announcement reaches the server without any
-side channel: it travels up the same path as normal text.
+command — and any multiplexer inside it — writes comes through one pty, and the
+server reads it. That is the only reason the announcement reaches the server
+without a side channel: it travels up the same path as normal text.
 
-The requirement that falls out of this is that the pump must **not** forward the
-announcement onward, or it would be drawn on screen. It has to recognize the
-announcement, consume it, and pass everything else through byte for byte.
-
-Today the pump is a raw copy and does no parsing at all (`tuigui-tui`
-`Out::pump`). This is the one new component the idea needs.
+The clean form of this is a **subscription, not a callback**: the pty hands out a
+handle to what it produces, and the server reads it. The pty does not know who is
+reading, so adding a reader is not a change to the pty. Two readers exist — the
+scan and the terminal — and each gets every chunk, so neither can consume bytes
+the other never saw.
 
 ## The announcement
 
-One OSC sequence, using a private dispatch number:
-
-```
-ESC ] 3 0 0 0 1 ; <base64 payload> BEL
+```text
+   unix : /run/user/1000/tuigui.sock
 ```
 
-OSC because it has a numeric namespace and an explicit terminator, so it is
-unambiguous to find and to delimit. If the stripper ever fails to recognize it,
-terminals ignore an unknown OSC rather than corrupting the screen.
+One line of text, written into the pane's output as *drawing*. It began as a
+private OSC sequence, which is invisible and unambiguously ours, and that is
+wrong for the case this exists for: a multiplexer parses a pane's output into a
+grid of cells and re-draws it, so an OSC it does not model is dropped and never
+read. Text is not dropped. The client makes its announcement by drawing it, so
+the text the server reads is the same text the user sees.
 
-Payload: the client's iroh `EndpointId`, and nothing else is required.
+The announcement carries no secret and proves nothing. What it gives is a
+**channel to dial**, and the identity that matters comes from the handshake on
+that channel.
 
 ## The handshake
 
-1. The client starts an iroh endpoint and learns its own `EndpointId`.
-2. The client writes the announcement to stdout.
-3. The server strips the announcement inside its output pump.
-4. The server dials that `EndpointId`.
-5. The server checks `conn.remote_id()` equals the advertised id.
+Both ends are peers; either may dial and either may accept. The exchange is the
+same with the order reversed:
 
-Step 5 is the entire authorization. iroh's connection is TLS and `remote_id()`
-returns the peer key from the certificate, so a matching value proves the dialer
-holds the private key for that endpoint. The advertised id is trustworthy
-*because of where it arrived*: it came over the pty, which only the server and the
-wrapped command can see.
+```text
+   dialer                              acceptor
+   ──────                              ────────
+   connect to the announced address    wait for a connection
+   send Ping(label)                    recv → Ping
+   recv → Pong                         send Ping's answer
+   ⇒ an established link               ⇒ an established link
+```
 
-No shared secret is needed. The advertisement carries the policy ("expect this
-key"); iroh carries the proof.
+Only an established link is returned to the caller. A peer that never answers is
+a peer that is not there, and there is no such thing as a link that is up but
+unproven — that state was removed rather than left for every caller to check.
 
-## What iroh provides, and what it does not
-
-Provided, for free:
-
-- Finding the peer's address, hole punching, relay fallback, dialing by key
-  alone. The client is reachable by `EndpointId` with no IP or port.
-- Encryption, and the peer's verified identity via `remote_id()`.
-
-Not provided:
-
-- Authorization. Any key can dial an endpoint. Knowing *which* key connected is
-  not the same as deciding it *may*. That decision is step 5.
-- Anything about the client→server direction. `remote_id()` authenticates the
-  dialer, so when the server dials, it is the *server* that gets verified. The
-  client still needs its own reason to trust the connection, e.g. the nonce it
-  put in the advertisement being echoed back.
+On one machine this is the whole of the authorization: a unix socket in a
+directory only the user can reach is enforced by the kernel at `connect` time.
 
 ## Locality
 
-The same announcement works on one machine, where the socket path is the
-transport instead of iroh. The mechanism is unchanged: the client announces,
-the server strips and dials.
+One machine needs nothing beyond the socket: the client picks a path under
+`XDG_RUNTIME_DIR` — private to the user, cleared on logout — binds it, and says so
+in the pane. Nothing has to be provisioned and nothing survives a crash.
 
-On one machine no secret is needed either, because a unix socket in a directory
-only the user can reach is enforced by the kernel at `connect` time.
+## Across machines
+
+Unbuilt. The announcement travels fine, since a pane's output crosses ssh like
+any other text; what is missing is a channel on the far side to dial. The
+candidate is ssh: it is already there, it is authenticated, and its port
+forwarding gives a socket on whichever end needs one.
+
+Two things make it different from the local case, and both are open:
+
+- **The forward must exist before the announcement is read**, and the ssh is
+  owned by whoever started the session rather than by us. `SSH_SEAM.md` is the
+  proposal for that.
+- **A second transport would bring ranking back.** Today there is exactly one
+  channel, so nothing has to choose.
+- **The address would be stable.** The scan remembers addresses so a redraw is
+  not a second client, and never forgets them, which is right for a per-pid
+  socket path and wrong for a stable remote one.
 
 ## Open problem: pane provenance
 
 A pty has a single master fd, and a multiplexer multiplexes all its panes onto
-it. So the announcement arrives with **no indication of which pane wrote it**.
+it. So an announcement arrives with **no indication of which pane wrote it**.
 
-With one pane this does not matter. With several it breaks twice:
+With one client this does not matter. With several it breaks twice:
 
 - The server cannot tell which pane a stream belongs to, so it cannot draw the
   frames in the right place.
@@ -100,5 +102,5 @@ With one pane this does not matter. With several it breaks twice:
   frames it is accepting.
 
 Anything that fixes this needs the client to encode its own pane identity, plus a
-way for the server to corroborate it. That is a separate design. This one should
-be scoped to a single client until it is solved.
+way for the server to corroborate it. That is a separate design, and this one is
+scoped to a single client until it is solved.

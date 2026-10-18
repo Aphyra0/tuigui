@@ -161,24 +161,28 @@ collide.
 
 ## Transport
 
-The tunnel is a swappable boundary, not a foundation:
+The channel is a swappable boundary, not a foundation, and it is
+[TRANSPORT.md](TRANSPORT.md) that defines it — not the ad-hoc trait this section
+used to sketch. What matters here is only that a transport owns its connection
+and carries **opaque bytes**, so a remote one is a second implementation of the
+same trait and nothing above it changes.
 
-```rust
-trait Transport {
-    async fn send_frame(&mut self, frame: EncodedFrame) // drop-on-late
-    async fn send_control(&mut self, msg: Control)
-    async fn recv_control(&mut self) -> Control
-}
-```
+Two candidates, and neither is built:
 
-- **iroh** (QUIC, NAT traversal, relay fallback, encryption) is the right choice
-  when the two machines are true peers with no existing trusted channel, and it
-  gives datagram drop-on-late for free.
-- **SSH / localhost forwarding** is the right choice when you already `ssh` into
-  the remote box, because that channel is already authenticated and pierced. It
-  should be the first implementation: a day of work, no new dependency.
-- The design must not assume either. Anything that needs shm or a local fd lives
-  on the client side of the boundary regardless.
+- **SSH forwarding** is the right first one: the channel is already authenticated
+  and already pierced when you are sitting in a shell on the far side, and the
+  work is a forward rather than a protocol. [SSH_SEAM.md](SSH_SEAM.md) is the
+  problem of attaching it to an ssh we do not own.
+- **iroh** (QUIC, NAT traversal, relay fallback, encryption) is the right one when
+  the two machines are true peers with no existing trusted channel, and it gives
+  datagram drop-on-late for free. It is a new egress, which is a policy question
+  before it is a technical one.
+
+Localhost needs neither: the socket transport covers both ends on one machine.
+
+Whatever is chosen must not assume shared memory crosses it. `t=s` names a
+`/dev/shm` object, which is only meaningful when the terminal is local, so
+anything that needs an shm object or a local fd lives on the side that has one.
 
 ## Reuse from the current repo
 
