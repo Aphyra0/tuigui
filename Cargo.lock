@@ -960,10 +960,12 @@ dependencies = [
 name = "gui"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "easytgp",
  "ffmpeg-sidecar",
  "ratatui",
  "rustix 1.1.5",
+ "tokio",
  "tuigui-wire",
  "turbojpeg",
 ]
@@ -2583,6 +2585,7 @@ dependencies = [
 name = "tuigui"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "gui",
  "tokio",
  "tui",

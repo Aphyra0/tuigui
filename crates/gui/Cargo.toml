@@ -3,7 +3,7 @@ name = "gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Client side: decode frames and stream them to the tui server"
+description = "Client side: draw a runnable's output into the pane the tui server owns"
 
 [dependencies]
 tuigui-wire = { workspace = true }
@@ -20,6 +20,8 @@ ratatui = { workspace = true }
 turbojpeg = { version = "1.5", default-features = false, features = ["pkg-config", "require-simd"] }
 ffmpeg-sidecar = { workspace = true }
 rustix = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
 
 [[bin]]
 name = "gui"

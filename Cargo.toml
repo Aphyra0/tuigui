@@ -59,4 +59,5 @@ path = "src/main.rs"
 [dependencies]
 tui = { workspace = true }
 gui = { workspace = true }
+clap = { workspace = true }
 tokio = { workspace = true }
