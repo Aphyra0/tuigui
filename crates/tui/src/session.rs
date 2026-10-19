@@ -18,6 +18,7 @@ use easytgp::{Controller, DynImage, Format, PlacementRequest};
 use wire::message::Message;
 use wire::transport::Connection;
 
+use crate::error::{Error, Result};
 use crate::sink::Sink;
 use crate::DebugOptions;
 
@@ -123,8 +124,15 @@ impl<F: Format> Session<F> {
     /// reported, and a greeting is not news. Painting waits for the terminal, which
     /// is why this is `async`: the placement of an image is acknowledged, and the
     /// next frame must not be sent before the terminal has the one before it.
-    pub async fn handle_msg(&mut self, message: Message) -> std::io::Result<()> {
-        match message {
+    ///
+    /// Returns nothing, because a failure here is the *client's* to act on: the client
+    /// is the side with a pane and a decision to make about it, and the server has no
+    /// better answer than the one it can send. So every failure — a frame that would
+    /// not decode, a transmit the terminal never acknowledged — goes back as
+    /// [`Message::Error`] and the client exits, which is what a client that cannot
+    /// draw should do.
+    pub async fn handle_msg(&mut self, message: Message) {
+        if let Err(e) = match message {
             Message::Frame(jpeg) => self.paint(&jpeg).await,
             Message::Error(text) => {
                 eprintln!("tui: a client reported: {text}");
@@ -137,6 +145,21 @@ impl<F: Format> Session<F> {
                 Ok(())
             }
             Message::Pong => Ok(()),
+        } {
+            eprintln!("tui: {e}");
+            // Reported rather than returned: the link is the only channel a client listens
+            // on, and a failure it is not told about is a pane that stops changing for no
+            // stated reason. Retried because this is the last thing the peer is ever told —
+            // a report that is itself lost leaves that same silent pane.
+            let report = Message::Error(e.to_string());
+            futures_retry::FutureRetry::new(
+                || self.connection.send(&report),
+                crate::error::ReportFailure,
+            )
+            .await
+            .unwrap_or_else(|(e, attempts)| {
+                panic!("could not report a failure to the client after {attempts} attempts: {e}")
+            });
         }
     }
 
@@ -146,26 +169,28 @@ impl<F: Format> Session<F> {
     /// is decoded here and rebuilt as a request in this session's medium. Which
     /// medium that is is the type parameter, not a runtime choice: [`Format::request`]
     /// is what turns pixels into a request for it.
-    async fn paint(&mut self, jpeg: &[u8]) -> std::io::Result<()> {
+    async fn paint(&mut self, jpeg: &[u8]) -> Result<()> {
         let pixels = if self.state.debug.blue_pixel {
             // The frame is ignored on purpose, so nothing in the wire path, the codec
             // or the decode is exercised: what appears on screen is attributable to
             // the encode, the transmit and the placement alone.
             image::RgbImage::from_pixel(BLUE.0, BLUE.1, image::Rgb([0, 0, 255]))
         } else {
-            let decoded = turbojpeg::decompress(jpeg, turbojpeg::PixelFormat::RGB).map_err(|e| {
-                std::io::Error::other(format!("decoding a {} byte frame: {e}", jpeg.len()))
-            })?;
+            let decoded = turbojpeg::decompress(jpeg, turbojpeg::PixelFormat::RGB)
+                .map_err(|source| Error::Decode {
+                    len: jpeg.len(),
+                    source,
+                })?;
             let (width, height) = (decoded.width as u32, decoded.height as u32);
             // The buffer is moved into the image rather than copied out of it: at
             // frame sizes a copy is the whole frame again.
-            image::RgbImage::from_raw(width, height, decoded.pixels).ok_or_else(|| {
-                std::io::Error::other(format!("{width}x{height} does not match the decoded buffer"))
+            image::RgbImage::from_raw(width, height, decoded.pixels).ok_or(Error::FrameSize {
+                width,
+                height,
             })?
         };
 
-        let request = F::request(&self.state.controller, pixels)
-            .map_err(|e| std::io::Error::other(format!("building a frame request: {e}")))?;
+        let request = F::request(&self.state.controller, pixels).map_err(Error::Stage)?;
 
         let placement = PlacementRequest {
             cols: Some(self.state.cols),
@@ -194,7 +219,7 @@ impl<F: Format> Session<F> {
             self.state
                 .sink
                 .write_all(crossterm::cursor::MoveTo(0, 0).to_string().as_bytes())
-                .map_err(|e| std::io::Error::other(format!("moving the cursor: {e}")))?;
+                .map_err(Error::Screen)?;
         }
 
         // One command, not two. Transmitting and placing separately leaves the image
@@ -205,26 +230,18 @@ impl<F: Format> Session<F> {
         // Timed, because this is the one await in the program that a terminal can leave
         // hanging: the acknowledgement it waits for is a reply a terminal may not send,
         // and a session that stalls here shows an empty pane forever with no clue why.
-        let mut image = tokio::time::timeout(TRANSMIT_TIMEOUT, request.transplace(IMAGE_ID, placement))
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "tui: the terminal did not acknowledge the image transmit within {TRANSMIT_TIMEOUT:?}"
-                )
-            })
-            .map_err(tgp)?;
+        let mut image =
+            tokio::time::timeout(TRANSMIT_TIMEOUT, request.transplace(IMAGE_ID, placement))
+                .await
+                .map_err(|_| Error::TransmitTimeout(TRANSMIT_TIMEOUT))?
+                .map_err(Error::Graphics)?;
 
         // Waited on: until the placement lands nothing is on screen, so a frame that was
         // not placed is a frame the user never sees.
-        image.sync().await.map_err(tgp)?;
+        image.sync().await.map_err(Error::Graphics)?;
         self.state.image = Some(image);
         Ok(())
     }
-}
-
-/// A `tgp` failure as an `io::Error`, for the one layer that reports one.
-fn tgp(e: easytgp::TGPError) -> std::io::Error {
-    std::io::Error::other(format!("the graphics protocol failed: {e}"))
 }
 
 #[cfg(test)]
@@ -355,10 +372,7 @@ mod tests {
             controller,
             sink,
         );
-        session
-            .handle_msg(Message::Frame(jpeg(8, 8)))
-            .await
-            .expect("paint the first frame");
+        session.handle_msg(Message::Frame(jpeg(8, 8))).await;
 
         let first = String::from_utf8(written.lock().unwrap().clone()).expect("escapes are text");
         // One command, `a=T`, that both replaces the pixels and makes the placement.
@@ -383,10 +397,7 @@ mod tests {
         assert!(first.contains("C=1"), "{first:?}");
 
         let after_first = first.len();
-        session
-            .handle_msg(Message::Frame(jpeg(8, 8)))
-            .await
-            .expect("paint a later frame");
+        session.handle_msg(Message::Frame(jpeg(8, 8))).await;
 
         let all = written.lock().unwrap().clone();
         let second = String::from_utf8(all[after_first..].to_vec()).expect("escapes are text");

@@ -21,6 +21,7 @@
 
 mod announce;
 mod bytes;
+mod error;
 mod placeholder;
 mod proxy;
 mod pty;
@@ -36,6 +37,7 @@ use server::Server;
 use sink::Sink;
 
 pub use bytes::Bytes;
+pub use error::{Error, Result};
 pub use proxy::Streams;
 pub use pty::Pty as Command;
 pub use server::Server as ImageServer;

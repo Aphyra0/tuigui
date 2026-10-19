@@ -202,10 +202,11 @@ impl<F: Format> Server<F> {
                 // The pty is gone, so the session is over and there is nothing left to serve.
                 Action::Announced(None) => return Ok(()),
                 Action::Said { outcome, index } => match outcome {
-                    // What a client said is the session's business, not the loop's: the loop
-                    // hands the message over and the session decides what it means. Painting a
-                    // frame is slow enough to be worth not doing inside the borrow.
-                    Ok(Some(message)) => sessions[index].handle_msg(message).await?,
+                    // What a client said is the session's business, not the loop's, and a
+                    // failure is the session's to report: the loop has no better answer, and
+                    // ending the session over one bad frame would take the other clients with
+                    // it.
+                    Ok(Some(message)) => sessions[index].handle_msg(message).await,
                     // The client closed between messages, which is the normal end of one.
                     Ok(None) => {
                         sessions.remove(index);

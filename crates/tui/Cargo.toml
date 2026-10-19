@@ -12,6 +12,11 @@ image = { workspace = true }
 rustix = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+# Retry, for reporting a failure to the client.
+futures-retry = { workspace = true }
+# One error type per failure instead of a string in an `io::Error`, so a caller can tell
+# a dropped frame from a failed transmit.
+thiserror = { workspace = true }
 # The cursor move a real placement needs, as the bytes a terminal expects rather than a
 # sequence spelled out here.
 crossterm = { workspace = true }
