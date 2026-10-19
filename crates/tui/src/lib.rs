@@ -155,9 +155,29 @@ impl Tui {
             .debug
             .no_shm
         {
-            Box::pin(Server::<easytgp::Png>::new(output, cols, rows, self.debug, controller).run())
+            Box::pin(
+                Server::<easytgp::Png>::new(
+                    output,
+                    cols,
+                    rows,
+                    self.debug,
+                    controller,
+                    sink.clone(),
+                )
+                .run(),
+            )
         } else {
-            Box::pin(Server::<easytgp::Shm>::new(output, cols, rows, self.debug, controller).run())
+            Box::pin(
+                Server::<easytgp::Shm>::new(
+                    output,
+                    cols,
+                    rows,
+                    self.debug,
+                    controller,
+                    sink.clone(),
+                )
+                .run(),
+            )
         };
 
         tokio::select! {

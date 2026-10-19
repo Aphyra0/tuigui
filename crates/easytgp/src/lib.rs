@@ -1060,6 +1060,97 @@ impl<F: Format + 'static> ImageRequest<F> {
             .payload(self.data.clone())
             .send_medium(inline)
     }
+
+    /// Transmit under an existing id *and* place it, in one command (`a=T`).
+    ///
+    /// This exists because [`ImageRequest::transmit_as`] followed by
+    /// [`DynImage::place`] is two commands, and the terminal **deletes an image's
+    /// placements when its data is replaced**. Between the two, the image is on screen
+    /// with nothing drawing it, and that gap is a round trip wide — visible as a
+    /// flicker on every frame of a stream. One command leaves no gap to see.
+    ///
+    /// `p=` names the placement it makes, so a later frame replaces that placement
+    /// rather than adding another. Without it the terminal treats each command as a
+    /// request for a *new* placement, which is a leak: one more every frame.
+    ///
+    /// Both halves of the geometry travel together and do not collide: `s`/`v` are the
+    /// transmitted data's size, `c`/`r` are the cell box the image is fitted into.
+    ///
+    /// The returned image holds the placement handle, so [`DynImage::displace`] and
+    /// [`DynImage::delete`] see it — the placement was made by a command that also
+    /// carried pixels, but it is an ordinary placement afterwards.
+    pub fn transplace(self, id: Id, placement: PlacementRequest) -> PendingTransfer<F> {
+        let placement_id = placement.placement_id.unwrap_or_else(id::alloc);
+        let reply = self.exec_transplace(id, &placement, placement_id);
+        let placement = PlacementRequest {
+            placement_id: Some(placement_id),
+            ..placement
+        };
+        // Moved into the closure rather than captured by reference: the closure is
+        // boxed as `'static`, since the reply may arrive much later.
+        PendingTransfer::new(reply, move |_r| DynImage {
+            id: DynId::Assigned(Arc::new(id)),
+            placements: HashSet::from([PlacementHandle {
+                id: DynId::new(placement_id),
+                request: Arc::new(placement),
+            }]),
+            request: self,
+            frames: HashMap::new(),
+            pl_id_alloc: {
+                let mut slab = Slab::new();
+                slab.next();
+                slab
+            },
+            held: None,
+            frame_shm: vec![],
+            pending: vec![],
+        })
+    }
+
+    /// The one command that both replaces an image's pixels and pins its placement.
+    ///
+    /// The keys are [`ImageRequest::exec_transmit`]'s and [`PlacementRequest::exec_place`]'s
+    /// together, with `a=T` in place of the transmit's implicit add: `T` is the
+    /// protocol's "transmit and place", and it is the only action that does both.
+    fn exec_transplace(
+        &self,
+        image_id: Id,
+        placement: &PlacementRequest,
+        placement_id: Id,
+    ) -> ReplyFuture {
+        let medium = self.format.medium();
+        let inline = self.format.is_inline();
+        Message::new()
+            .cd('a', "T")
+            .cd('i', image_id)
+            .cd('p', placement_id)
+            // The transmitted data's size. Not the same keys as the cell box below.
+            .cd_opt('s', self.size.map(|s| s.width))
+            .cd_opt('v', self.size.map(|s| s.height))
+            .push_cd(self.format.to_cd())
+            .cd('t', medium)
+            // The placement: where the image goes, and in what box.
+            .cd_opt('c', placement.cols)
+            .cd_opt('r', placement.rows)
+            .cd_opt('X', placement.offset_x)
+            .cd_opt('Y', placement.offset_y)
+            .cd_opt('x', placement.x)
+            .cd_opt('y', placement.y)
+            .cd_opt('z', placement.z)
+            .cd_opt('w', placement.width)
+            .cd_opt('h', placement.height)
+            // Without this the terminal moves the cursor once per placement, by the
+            // placement's own box: on a stream that is a scroll per frame.
+            .cd_if(placement.fix_cursor, 'C', 1)
+            // A virtual placement is a prototype the client's placeholder cells resolve
+            // against, so the image is anchored to text rather than to where the cursor
+            // happened to be. Transmitting into one is allowed, and is the whole point
+            // of this action here.
+            .cd_if(placement.virtual_placement, 'U', 1)
+            // TODO: I don't like clone here
+            .payload(self.data.clone())
+            .send_medium(inline)
+    }
 }
 
 pub struct DynImage<F: Format> {

@@ -32,6 +32,7 @@ use wire::transport::Transport;
 
 use crate::announce::Announcement;
 use crate::session::Session;
+use crate::sink::Sink;
 use crate::DebugOptions;
 
 /// What the pty produces, and what the scan finds in it.
@@ -91,6 +92,11 @@ pub struct Server<F: Format> {
     rows: u32,
     /// The diagnostic switches, passed to every session it attaches.
     debug: DebugOptions,
+    /// The one writer to the screen, handed to each session.
+    ///
+    /// A session needs it for the cursor move a real placement requires, and it has to
+    /// be the same writer the escapes go through or the move can land out of order.
+    sink: Sink,
     /// Creates image requests, and owns the reply router behind them.
     ///
     /// On the server and not in a session because there is one terminal: the reply
@@ -114,12 +120,14 @@ impl<F: Format> Server<F> {
         rows: u32,
         debug: DebugOptions,
         controller: Arc<Controller>,
+        sink: Sink,
     ) -> Self {
         Self {
             announcements: Announcements::new(output),
             cols,
             rows,
             debug,
+            sink,
             controller,
             sessions: Vec::new(),
         }
@@ -137,6 +145,7 @@ impl<F: Format> Server<F> {
             cols,
             rows,
             debug,
+            sink,
             controller,
             mut sessions,
         } = self;
@@ -186,6 +195,7 @@ impl<F: Format> Server<F> {
                         rows,
                         debug,
                         controller.clone(),
+                        sink.clone(),
                     )),
                     Err(e) => eprintln!("tui: could not reach an announced client: {e}"),
                 },

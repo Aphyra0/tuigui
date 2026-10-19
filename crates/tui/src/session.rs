@@ -18,6 +18,7 @@ use easytgp::{Controller, DynImage, Format, PlacementRequest};
 use wire::message::Message;
 use wire::transport::Connection;
 
+use crate::sink::Sink;
 use crate::DebugOptions;
 
 /// The image id the client's placeholder cells carry, as their foreground colour.
@@ -73,6 +74,12 @@ pub struct State<F: Format> {
     pub image: Option<DynImage<F>>,
     /// Creates image requests, and owns the reply router behind them.
     pub controller: Arc<Controller>,
+    /// The one writer to the screen.
+    ///
+    /// Held so a cursor move lands in the same sequence as the escapes: a real
+    /// placement draws where the cursor is, and a move written by some other writer
+    /// could land between the move and the command that needed it.
+    pub sink: Sink,
 }
 
 /// One client the server has attached.
@@ -95,6 +102,7 @@ impl<F: Format> Session<F> {
         rows: u32,
         debug: DebugOptions,
         controller: Arc<Controller>,
+        sink: Sink,
     ) -> Self {
         Self {
             connection,
@@ -104,6 +112,7 @@ impl<F: Format> Session<F> {
                 debug,
                 image: None,
                 controller,
+                sink,
             },
         }
     }
@@ -158,12 +167,45 @@ impl<F: Format> Session<F> {
         let request = F::request(&self.state.controller, pixels)
             .map_err(|e| std::io::Error::other(format!("building a frame request: {e}")))?;
 
-        // Timed, because this is the one await in the program that a terminal can
-        // leave hanging: the acknowledgement it waits for is a reply a terminal may
-        // not send, and a session that stalls here shows an empty pane forever with
-        // no clue why. A timeout turns that into a stop with a name attached, which
-        // is the difference between a bug and a mystery.
-        let mut image = tokio::time::timeout(TRANSMIT_TIMEOUT, request.transmit_as(IMAGE_ID))
+        let placement = PlacementRequest {
+            cols: Some(self.state.cols),
+            rows: Some(self.state.rows),
+            placement_id: Some(PLACEMENT_ID),
+            // The design's placement is virtual: a prototype with no position of its
+            // own, which the client's placeholder cells resolve against, so the picture
+            // follows text a multiplexer may move. A real placement draws where the
+            // cursor is, which is the experiment — and it is what needs the cursor put
+            // back at the origin below.
+            virtual_placement: !self.state.debug.no_vplacement,
+            // Without this the terminal moves the cursor by the placement's own box
+            // after placing, once per frame: on a stream that is a scroll per frame.
+            fix_cursor: true,
+            ..Default::default()
+        };
+
+        if !placement.virtual_placement {
+            // A real placement draws at the cursor, so the cursor has to be at the
+            // pane's origin before every frame — otherwise the picture lands wherever
+            // the last one left the cursor, and the stream marches down the screen.
+            //
+            // Written through the same sink as the escapes, so no other writer can
+            // land in the middle of it, and as a plain cursor move rather than a
+            // clear: a clear would take the client's cells with it.
+            self.state
+                .sink
+                .write_all(crossterm::cursor::MoveTo(0, 0).to_string().as_bytes())
+                .map_err(|e| std::io::Error::other(format!("moving the cursor: {e}")))?;
+        }
+
+        // One command, not two. Transmitting and placing separately leaves the image
+        // on screen with nothing drawing it in between — the terminal frees an image's
+        // placements when its data is replaced — and that gap is a round trip wide,
+        // which is a visible flicker on every frame.
+        //
+        // Timed, because this is the one await in the program that a terminal can leave
+        // hanging: the acknowledgement it waits for is a reply a terminal may not send,
+        // and a session that stalls here shows an empty pane forever with no clue why.
+        let mut image = tokio::time::timeout(TRANSMIT_TIMEOUT, request.transplace(IMAGE_ID, placement))
             .await
             .unwrap_or_else(|_| {
                 panic!(
@@ -172,28 +214,8 @@ impl<F: Format> Session<F> {
             })
             .map_err(tgp)?;
 
-        // Placed on *every* frame, not only the first, because a transmit under an
-        // existing id **frees that image's placements**: the terminal treats a repeat
-        // transmit as replacing the image wholesale, and its placements go with the
-        // old data. So the first frame shows and the second one deletes the placement
-        // that put it there — a pane that flashes once and then goes blank.
-        //
-        // Re-placing is cheap and it is what makes the picture come back. The
-        // alternative is the animation-frame path (`a=f` plus `a=a,c=`), which adds a
-        // frame instead of replacing the image and therefore keeps the placement; it
-        // is the shape the design wants and this is the shape that works today.
-        image.place(PlacementRequest {
-            cols: Some(self.state.cols),
-            rows: Some(self.state.rows),
-            placement_id: Some(PLACEMENT_ID),
-            // The design's placement is virtual: a prototype with no position of its
-            // own, which the client's placeholder cells resolve against. A real one
-            // draws at the cursor with no help from that text, which is the experiment.
-            virtual_placement: !self.state.debug.no_vplacement,
-            ..Default::default()
-        });
-        // Waited on: until the placement lands nothing is on screen, so a frame that
-        // was not placed is a frame the user never sees.
+        // Waited on: until the placement lands nothing is on screen, so a frame that was
+        // not placed is a frame the user never sees.
         image.sync().await.map_err(tgp)?;
         self.state.image = Some(image);
         Ok(())
@@ -303,14 +325,25 @@ mod tests {
     async fn every_frame_reuses_one_id_and_places_itself_again() {
         let written = Arc::new(Mutex::new(Vec::new()));
         let (keys, keys_writer) = std::io::pipe().expect("a pipe for the input");
-        let terminal = Terminal {
+
+        // One writer into the one buffer, which is what the program does: `tui::run` gives
+        // the same sink to the library that writes the escapes and to the session that
+        // moves the cursor. Two writers here would model an interleaving the `Sink` exists
+        // to prevent, and would put the escapes and the cursor move where nothing can
+        // observe their order.
+        //
+        // TODO: refactor. The test builds the wiring the program builds, by hand, and it is
+        // the one place that knows both halves have to be the same object. `Tui::run` is
+        // where that belongs: a helper that takes a stream and returns the sink and the
+        // controller together would keep the test from being able to get it wrong.
+        let sink = crate::sink::Sink::new(Terminal {
             written: written.clone(),
             keys: Mutex::new(keys_writer),
-        };
+        });
         let controller = Controller::init_with_sink(
             keys,
-            std::io::sink(),
-            Arc::new(Mutex::new(terminal)),
+            sink.clone(),
+            Arc::new(Mutex::new(sink.clone())),
         );
 
         let dir = std::env::temp_dir().join(format!("tui-session-{}", std::process::id()));
@@ -320,6 +353,7 @@ mod tests {
             40,
             DebugOptions::default(),
             controller,
+            sink,
         );
         session
             .handle_msg(Message::Frame(jpeg(8, 8)))
@@ -327,18 +361,26 @@ mod tests {
             .expect("paint the first frame");
 
         let first = String::from_utf8(written.lock().unwrap().clone()).expect("escapes are text");
-        // The image: the fixed id, the frame's size, and the shared memory medium.
+        // One command, `a=T`, that both replaces the pixels and makes the placement.
+        // The two used to be separate, and the terminal frees an image's placements when
+        // its data is replaced -- so between them the picture was on screen with nothing
+        // drawing it, for as long as a round trip takes. That gap is the flicker.
+        assert!(first.contains("a=T"), "one transplace command: {first:?}");
         assert!(first.contains("i=99"), "{first:?}");
         assert!(first.contains("t=s"), "{first:?}");
+        // The transmitted data's size, and the cell box it is fitted into. Both travel
+        // on one command and are different keys.
         assert!(first.contains("s=8"), "{first:?}");
         assert!(first.contains("v=8"), "{first:?}");
-        // The virtual placement: `U=1` with the pane's grid and the placement id,
-        // which is what the client's placeholder cells resolve against.
-        assert!(first.contains("a=p"), "{first:?}");
-        assert!(first.contains("U=1"), "{first:?}");
         assert!(first.contains("c=120"), "{first:?}");
         assert!(first.contains("r=40"), "{first:?}");
+        // The design's placement is virtual, so the client's placeholder cells are what
+        // anchor the image rather than the cursor.
+        assert!(first.contains("U=1"), "{first:?}");
         assert!(first.contains("p=98"), "{first:?}");
+        // Without this the terminal moves the cursor by the placement's box once per
+        // frame, which walks the picture down the screen.
+        assert!(first.contains("C=1"), "{first:?}");
 
         let after_first = first.len();
         session
@@ -348,15 +390,11 @@ mod tests {
 
         let all = written.lock().unwrap().clone();
         let second = String::from_utf8(all[after_first..].to_vec()).expect("escapes are text");
-        // The same id, so the client's cells keep naming the image that is being
-        // updated -- and a placement, because the terminal freed the previous one when
-        // this image was transmitted over. Without the second placement the pane is
-        // blank from here on, which is the failure this asserts against.
+        // The same id, so the client's cells keep naming the image being updated, and its
+        // own placement, under the same placement id -- a repeat transmit replaces the
+        // placement that was there.
+        assert!(second.contains("a=T"), "a later frame transplaces: {second:?}");
         assert!(second.contains("i=99"), "the same id: {second:?}");
-        assert!(
-            second.contains("a=p"),
-            "a later frame places itself again: {second:?}"
-        );
         assert!(
             second.contains("p=98"),
             "under the same placement id: {second:?}"

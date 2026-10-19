@@ -12,6 +12,9 @@ image = { workspace = true }
 rustix = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+# The cursor move a real placement needs, as the bytes a terminal expects rather than a
+# sequence spelled out here.
+crossterm = { workspace = true }
 # Decoding a frame off the wire. The client encodes with the same library, so the
 # two halves agree on the codec by sharing it rather than by documenting one.
 turbojpeg = { version = "1.5", default-features = false, features = ["pkg-config", "require-simd"] }
