@@ -22,14 +22,16 @@ use std::io;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
+use easytgp::Controller;
 use tokio::sync::mpsc::Receiver;
 
 use wire::message::Message;
-use wire::transport::{Connection, Transport};
+use wire::transport::Transport;
 
 use crate::announce::Announcement;
-use crate::sink::Sink;
+use crate::session::Session;
 
 /// What the pty produces, and what the scan finds in it.
 ///
@@ -72,25 +74,28 @@ impl Announcements {
 /// One client the server has attached.
 ///
 /// A [`Connection`] is one link; a `Session` is a client the server has attached, which is a
-/// link and nothing more for now. It exists as a type of its own because the two are
-/// different facts and will diverge — what a client draws into, its grid.
-///
-/// Every session is established. The handshake happens inside [`Transport::connect`], so a
-/// connection only exists once a peer has answered the greeting, and there is no
-/// half-attached client to be told apart from a whole one.
-pub struct Session {
-    pub connection: Connection,
-}
-
-/// The server: the clients it has dialed, and what the pty has produced.
+/// link and what has been learned about the far end — see [`crate::session`]. Every session is
+/// established: the handshake happens inside [`Transport::connect`], so a connection only
+/// exists once a peer has answered the greeting, and there is no half-attached client to be
+/// told apart from a whole one.
 pub struct Server {
-    /// The one writer to the screen, shared with the pty's proxy.
-    ///
-    /// Held but not yet written to: once frames are drawn they go out through this, which is
-    /// what keeps a frame from landing in the middle of the command's output.
-    sink: Sink,
     /// What the pty has produced, and where a client announces itself.
     announcements: Announcements,
+    /// The grid a client's pty was created with, in cells.
+    ///
+    /// Handed to each session, because that is the pane a client draws into and the one piece
+    /// of geometry the server has that a client does not: a pane's size is not passed down
+    /// through its environment.
+    cols: u32,
+    rows: u32,
+    /// Creates image requests, and owns the reply router behind them.
+    ///
+    /// On the server and not in a session because there is one terminal: the reply
+    /// router reads the one keyboard descriptor and the image namespace is the
+    /// terminal's, so both are per process and both outlive any client. It also
+    /// owns where escapes are written, which is the screen this server shares with
+    /// the pty's proxy.
+    controller: Arc<Controller>,
     /// Every client attached to this session.
     ///
     /// Owned by the loop and nowhere else: reading a link needs it, so a link in a map
@@ -99,11 +104,18 @@ pub struct Server {
 }
 
 impl Server {
-    /// Serve a pty's output.
-    pub fn new(sink: Sink, output: Receiver<Vec<u8>>) -> Self {
+    /// Serve a pty's output, with the reply router this side's own escapes need.
+    pub fn new(
+        output: Receiver<Vec<u8>>,
+        cols: u32,
+        rows: u32,
+        controller: Arc<Controller>,
+    ) -> Self {
         Self {
-            sink,
             announcements: Announcements::new(output),
+            cols,
+            rows,
+            controller,
             sessions: Vec::new(),
         }
     }
@@ -115,11 +127,13 @@ impl Server {
 
     /// Serve until the pty's output ends.
     pub async fn run(self) -> io::Result<()> {
-        // Not written yet, but the field is the reason a second writer to the screen cannot
-        // exist: once frames are drawn they go through here.
-        let _sink = self.sink;
-        let mut announcements = self.announcements;
-        let mut sessions = self.sessions;
+        let Server {
+            mut announcements,
+            cols,
+            rows,
+            controller,
+            mut sessions,
+        } = self;
 
         loop {
             // What to do, decided here and acted on below. The block is load-bearing: the reads
@@ -160,13 +174,21 @@ impl Server {
 
             match action {
                 Action::Announced(Some(transport)) => match transport.connect().await {
-                    Ok(connection) => sessions.push(Session { connection }),
+                    Ok(connection) => sessions.push(Session::new(
+                        connection,
+                        cols,
+                        rows,
+                        controller.clone(),
+                    )),
                     Err(e) => eprintln!("tui: could not reach an announced client: {e}"),
                 },
                 // The pty is gone, so the session is over and there is nothing left to serve.
                 Action::Announced(None) => return Ok(()),
                 Action::Said { outcome, index } => match outcome {
-                    Ok(Some(message)) => report(&message),
+                    // What a client said is the session's business, not the loop's: the loop
+                    // hands the message over and the session decides what it means. Painting a
+                    // frame is slow enough to be worth not doing inside the borrow.
+                    Ok(Some(message)) => sessions[index].handle_msg(message).await?,
                     // The client closed between messages, which is the normal end of one.
                     Ok(None) => {
                         sessions.remove(index);
@@ -191,19 +213,4 @@ enum Action {
         outcome: io::Result<Option<Message>>,
         index: usize,
     },
-}
-
-/// Say what a client sent, for the messages the server has nothing else to do with yet.
-fn report(message: &Message) {
-    match message {
-        Message::Frame(body) => {
-            eprintln!(
-                "tui: a client sent a {} byte frame (no display yet)",
-                body.len()
-            );
-        }
-        Message::Error(text) => eprintln!("tui: a client reported: {text}"),
-        Message::Ping(_) => eprintln!("tui: a client sent a ping, which only a server sends"),
-        Message::Pong => {}
-    }
 }

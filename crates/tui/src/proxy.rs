@@ -83,6 +83,19 @@ impl Proxy {
     /// The keyboard direction only makes sense while it runs, so it gets a
     /// thread, and its error is returned from here once that thread is joined.
     pub fn run(self) -> io::Result<()> {
+        // The rewrite is stateful across reads, so the state outlives the closure
+        // that carries it: a character split between two reads has to be held.
+        let mut placeholders = crate::placeholder::Placeholders::new();
+        self.run_with(&mut |bytes| placeholders.rewrite(bytes))
+    }
+
+    /// [`Proxy::run`], rewriting the command's output on the way to the screen.
+    ///
+    /// The transform is what turns a pane's fill into image placeholders, and it
+    /// lives here rather than in a second reader because the stream can only be
+    /// read once: a reader that took the fill out would be a reader the screen
+    /// never saw it from. What is forwarded is what this returns.
+    pub fn run_with(self, transform: &mut dyn FnMut(&[u8]) -> Vec<u8>) -> io::Result<()> {
         let Proxy {
             mut source,
             mut dest,
@@ -90,7 +103,12 @@ impl Proxy {
         } = self;
         let keyboard =
             thread::spawn(move || copy(&mut *dest.stdout, &mut *source.stdin));
-        let shown = copy_watched(&mut *source.stdout, &mut *dest.stdin, watch.take());
+        let shown = copy_transformed(
+            &mut *source.stdout,
+            &mut *dest.stdin,
+            watch.take(),
+            transform,
+        );
         // A panic in the keyboard thread is not a forwarding failure, so it is
         // not reported as one.
         shown.and(keyboard.join().unwrap_or(Ok(())))
@@ -131,6 +149,40 @@ fn copy_watched<R: Read + ?Sized, W: Write + ?Sized>(
                     watch(&buf[..n]);
                 }
                 to.write_all(&buf[..n])?;
+                to.flush()?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// [`copy_watched`], with a transform between the read and the write.
+///
+/// The difference from the observer above is that what is written is not what was
+/// read, which is what the placeholder rewrite needs: a pane's own fill is
+/// replaced by cells that name an image, and the command never sees the result.
+/// The transform is stateful across reads because a character can straddle two of
+/// them.
+fn copy_transformed<R: Read + ?Sized, W: Write + ?Sized>(
+    from: &mut R,
+    to: &mut W,
+    mut watch: Option<Box<dyn FnMut(&[u8]) + Send>>,
+    transform: &mut dyn FnMut(&[u8]) -> Vec<u8>,
+) -> io::Result<()> {
+    let mut buf = [0u8; 16384];
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                // The observer first, and on the *original* bytes: it is the
+                // announcement scan, and what a client announces is the text it
+                // wrote, not the placeholders this side put in its place.
+                if let Some(watch) = watch.as_mut() {
+                    watch(&buf[..n]);
+                }
+                let rewritten = transform(&buf[..n]);
+                to.write_all(&rewritten)?;
                 to.flush()?;
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}

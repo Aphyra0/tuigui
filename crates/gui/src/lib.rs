@@ -33,6 +33,7 @@
 //! in-band cannot go stale.
 
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use wire::message::Message;
 use wire::transport::{Connection, Transport};
@@ -71,6 +72,14 @@ pub struct Gui {
     /// `XDG_RUNTIME_DIR`, which is what the server is told to dial.
     #[arg(long = "socket", env = "TUI_SOCKET")]
     pub socket: Option<std::path::PathBuf>,
+    /// Play the runnable again from the start when it ends, forever.
+    ///
+    /// Off by default because it is a debugging aid rather than a feature: a
+    /// short clip looping means the session can be left running while something
+    /// else is looked at, instead of ending when the clip does. A real runnable
+    /// is not a file and has no "start" to return to.
+    #[arg(long = "dbg-loop")]
+    pub dbg_loop: bool,
 }
 
 impl Gui {
@@ -86,8 +95,8 @@ impl Gui {
         _stdin: impl Read + Send + 'static,
         stdout: impl Write + Send + 'static,
     ) -> std::io::Result<()> {
-        // Read from `self.path` here. Not written: what the runnable produces, and
-        // how a frame of it reaches `tui`, is the next piece of work.
+        // Read from `self.path` when the pane is tiled: what the runnable produces is decoded
+        // there, and nothing about it is needed until the grid it is drawn into exists.
         let _ = &self.path;
 
         // Drawn to the writer the caller gave, not to `io::stdout()`: the caller is what
@@ -125,19 +134,42 @@ impl Gui {
         // keeps saying which address it is waiting on. The wait answers the server's
         // greeting, so what comes back is a link that is established.
         let connection = socket.accept().await?;
-        draw_until_ended(&mut terminal, connection, announcement).await
+        draw_until_ended(
+            &mut terminal,
+            connection,
+            announcement,
+            &self.path,
+            self.dbg_loop,
+        )
+        .await
     }
 }
 
+/// What the pane is tiled with once the session is up.
+///
+/// The *anchor*: this character is what the server replaces with image
+/// placeholders, so the fill is not decoration, it is the address of the picture.
+/// One character and not a sequence, because a fill is drawn a screen at a time
+/// and anything longer would make the rewrite cost grow with the marker.
+///
+/// A teardrop-spoked asterisk: not box drawing or a block, so a pane full of it
+/// cannot be mistaken for a border or a shadow, and not in any font's common set,
+/// so it reads as deliberate.
+const FILL: char = '❋';
+
 /// Draw until the server closes, reporting what it sends.
 ///
-/// Nothing draws frames yet, so a frame is reported rather than shown. The link is already
-/// established — the greeting was answered when the server dialed — so the pane is green
-/// before the first message arrives.
+/// The link is already established — the greeting was answered when the server dialed — so the
+/// pane is green before the first message arrives. Then the pane is tiled with [`FILL`], which
+/// is the *anchor*: it travels to the server as bytes, the server answers it with an image and
+/// a virtual placement, and the terminal resolves the cells against them. Nothing this side
+/// knows about the image except that it exists is needed.
 async fn draw_until_ended(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<impl Write>>,
     connection: Connection,
     announcement: String,
+    path: &std::path::Path,
+    dbg_loop: bool,
 ) -> std::io::Result<()> {
     // Green, and named with what this client announced: the one thing the user is waiting to
     // see, and the proof that this pane is talking to the session it thinks.
@@ -148,20 +180,131 @@ async fn draw_until_ended(
         )
     })?;
 
+    // Held before the fill, so the green is legible as a state rather than a flash on the
+    // way to the pattern. This is the only delay in the client; everything after it is
+    // driven by what arrives on the link.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    terminal.draw(|frame| frame.render_widget(widget::Session::filled(FILL), frame.area()))?;
+
+    // Decoding starts only now: the fill has been drawn and forwarded, so the server has the
+    // grid it needs to create the image under. A frame sent before that would name an image
+    // the terminal does not have, and the frame would be lost.
+    let mut frames = decode(path, dbg_loop)?;
+
     loop {
-        match connection.recv().await {
-            Ok(Some(Message::Frame(body))) => {
-                eprintln!("gui: dropped a {} byte frame (no display yet)", body.len());
-            }
-            Ok(Some(Message::Error(text))) => {
+        tokio::select! {
+            // A decoded frame, on its way to the server as the wire codec's bytes. A closed
+            // channel means the runnable ended, which is not the end of the session: the pane
+            // keeps its last frame, and the link stays up until the server closes it.
+            Some(jpeg) = frames.recv() => connection.send(&Message::Frame(jpeg)).await?,
+            received = connection.recv() => match received? {
                 // The server reports what *this* client asked for and failed, so this side is
                 // the one that should stop.
-                return Err(std::io::Error::other(format!("the server failed: {text}")));
-            }
-            Ok(Some(Message::Ping(_))) | Ok(Some(Message::Pong)) => {}
-            // The server closed. The session is over, which is not an error.
-            Ok(None) => return Ok(()),
-            Err(e) => return Err(e),
+                Some(Message::Error(text)) => {
+                    return Err(std::io::Error::other(format!("the server failed: {text}")));
+                }
+                Some(Message::Ping(_)) | Some(Message::Pong) | Some(Message::Frame(_)) => {}
+                // The server closed. The session is over, which is not an error.
+                None => return Ok(()),
+            },
         }
     }
 }
+
+/// Decode `path` into JPEG frames, as they become available.
+///
+/// ffmpeg is a sidecar process and its output is blocking IO, so both it and the encoder live
+/// on a thread of their own and hand frames over a channel. The thread is what keeps a
+/// blocking read out of the runtime, and the channel is what paces it: one queued frame, so a
+/// link that falls behind drops the frames nobody would have looked at rather than building a
+/// delay between the video and the pane.
+///
+/// `dbg_loop` makes ffmpeg rewind the input rather than end, which is what keeps a session
+/// alive after a short clip. The looping is ffmpeg's and not a loop here: it re-reads the file
+/// and re-emits its frames at the same rate, so this side sees one continuous stream and
+/// needs no state about where the clip began.
+fn decode(
+    path: &std::path::Path,
+    dbg_loop: bool,
+) -> std::io::Result<tokio::sync::mpsc::Receiver<Vec<u8>>> {
+    use ffmpeg_sidecar::command::FfmpegCommand;
+
+    let (tx, frames) = tokio::sync::mpsc::channel(1);
+    let path = path.to_path_buf();
+    std::thread::Builder::new()
+        .name("gui-video".into())
+        .spawn(move || {
+            let mut command = FfmpegCommand::new();
+            // `-re` belongs before the input, which is where ffmpeg wants it: it paces the file
+            // at its own frame rate instead of decoding all of it at once. Without it a short
+            // clip is over before its first frame has been drawn.
+            command.realtime();
+            if dbg_loop {
+                // Also before the input, and `-1` is ffmpeg's "forever": the flag is a
+                // property of how the input is read, so it is no use after `-i`.
+                command.args(["-stream_loop", "-1"]);
+            }
+            command.input(path.as_os_str());
+            let mut child = match command.rawvideo().spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    eprintln!("gui: could not start ffmpeg on {}: {e}", path.display());
+                    return;
+                }
+            };
+            let events = match child.iter() {
+                Ok(events) => events,
+                Err(e) => {
+                    eprintln!("gui: could not read ffmpeg's output: {e}");
+                    return;
+                }
+            };
+
+            let mut encoder = match turbojpeg::Compressor::new() {
+                Ok(encoder) => encoder,
+                Err(e) => {
+                    eprintln!("gui: no JPEG encoder available: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = encoder.set_quality(QUALITY) {
+                eprintln!("gui: the encoder refused quality {QUALITY}: {e}");
+                return;
+            }
+
+            for frame in events.filter_frames() {
+                let width = frame.width as usize;
+                let height = frame.height as usize;
+                let jpeg = encoder.compress_to_vec(turbojpeg::Image {
+                    pixels: frame.data.as_slice(),
+                    width,
+                    // ffmpeg's rawvideo output is packed, so a row is exactly its pixels.
+                    pitch: width * 3,
+                    height,
+                    format: turbojpeg::PixelFormat::RGB,
+                });
+                let jpeg = match jpeg {
+                    Ok(jpeg) => jpeg,
+                    Err(e) => {
+                        eprintln!("gui: dropped a {width}x{height} frame: {e}");
+                        continue;
+                    }
+                };
+                // Blocks while the link is behind, which is the backpressure: ffmpeg reads a
+                // file, and a file read ahead of what can be sent is memory.
+                if tx.blocking_send(jpeg).is_err() {
+                    // The client stopped taking frames, so the session is gone. Stop decoding
+                    // rather than filling memory with frames nobody will take.
+                    let _ = child.quit();
+                    return;
+                }
+            }
+            let _ = child.quit();
+        })
+        .map_err(std::io::Error::other)?;
+    Ok(frames)
+}
+
+/// JPEG quality. The pixels are on their way to a pane, where they are fitted to a grid of
+/// cells, so this buys legibility rather than fidelity.
+const QUALITY: i32 = 80;

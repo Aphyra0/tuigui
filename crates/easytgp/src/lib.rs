@@ -92,6 +92,15 @@ mod writer {
         SINK.set(sink).is_ok()
     }
 
+    /// The sink a caller that owns the terminal gets: this process's stdout.
+    ///
+    /// The same type as any other sink, so the default is not a special case in the
+    /// writer below: an owning caller installs this and a sharing one installs its
+    /// own locked writer, and the thread that drains the queue does one thing.
+    pub fn stdout() -> Arc<Mutex<dyn Write + Send>> {
+        Arc::new(Mutex::new(io::stdout()))
+    }
+
     fn write_all(out: &mut dyn Write, bytes: &[u8]) {
         match SINK.get() {
             Some(sink) => {
@@ -181,6 +190,22 @@ struct ReplyRouter {
 
 impl ReplyRouter {
     fn start(stdin: impl std::io::Read + Send + 'static) -> JoinHandle<()> {
+        Self::start_forwarding(stdin, std::io::sink())
+    }
+
+    /// Like [`ReplyRouter::start`], but the bytes that are *not* a reply are
+    /// written to `forward` instead of being dropped.
+    ///
+    /// A terminal's replies arrive on the same descriptor as the keyboard, so a
+    /// wrapper that owns that descriptor cannot simply hand it over: its own
+    /// acknowledgements would be read as keystrokes by the command. Parsing here
+    /// and passing on everything else is what splits one stream into the two
+    /// things it actually carries, and `io::sink()` is what makes the ordinary
+    /// path the same code with nowhere to put the extra bytes.
+    fn start_forwarding(
+        stdin: impl std::io::Read + Send + 'static,
+        mut forward: impl std::io::Write + Send + 'static,
+    ) -> JoinHandle<()> {
         std::thread::spawn(move || {
             let mut buf = BufReader::new(stdin)
                 .bytes()
@@ -188,7 +213,7 @@ impl ReplyRouter {
                 .peekable();
 
             let mut last = None;
-            while let Some(reply) = Message::parse_next(&mut buf) {
+            while let Some(reply) = Message::parse_next_with(&mut buf, &mut forward) {
                 let iv = reply.get_from_key('i');
                 if let Some(marker) = &iv {
                     let marker: u32 = marker.parse().unwrap();
@@ -334,9 +359,56 @@ pub struct Controller {
 }
 
 impl Controller {
+    /// Read the terminal's replies off `stdin`, writing escapes to stdout.
+    ///
+    /// The path for a caller that owns the terminal outright: the renderer is the
+    /// only writer, so there is nothing to share and nothing to strip out of the
+    /// input.
     pub fn init(stdin: impl std::io::Read + Send + 'static) -> Arc<Controller> {
+        Self::init_with_sink(stdin, std::io::sink(), writer::stdout())
+    }
+
+    /// [`Controller::init`], that also hands back the input the replies are mixed with.
+    ///
+    /// A terminal's answers and the user's keystrokes arrive on one descriptor, and
+    /// only this library can tell them apart. A wrapper that owns that descriptor
+    /// therefore hands it here and gets the input back on `forward`: everything that
+    /// is not one of our replies, in order, with nothing else changed.
+    ///
+    /// So the ordinary path is this path with `io::sink()` for `forward`, which is
+    /// what [`Controller::init`] is.
+    pub fn init_with_forwarding(
+        stdin: impl std::io::Read + Send + 'static,
+        forward: impl std::io::Write + Send + 'static,
+    ) -> Arc<Controller> {
+        Self::init_with_sink(stdin, forward, writer::stdout())
+    }
+
+    /// [`Controller::init_with_forwarding`], with somewhere else to write escapes.
+    ///
+    /// `sink` receives every escape as one whole batch, which is what lets a wrapper
+    /// put it under the same lock as its own output: an escape that landed in the
+    /// middle of a line another writer was printing would be two commands the
+    /// terminal obeys in halves.
+    ///
+    /// Call it **once per process**. The destination is global because
+    /// [`Message::send`] can be reached without a controller — it is `Message` that
+    /// knows how to encode itself, and a `Message` holds no reference to whoever
+    /// made it — so there is one writer and one place to configure it. A second call
+    /// returns `false` and changes nothing; the first caller wins, since moving the
+    /// destination mid-stream would split one image's escapes across two.
+    pub fn init_with_sink(
+        stdin: impl std::io::Read + Send + 'static,
+        forward: impl std::io::Write + Send + 'static,
+        sink: Arc<Mutex<dyn std::io::Write + Send>>,
+    ) -> Arc<Controller> {
+        // TODO: this belongs to `Controller::new` once a `Message` can reach the
+        // controller that made it, which is what removes the need for a global.
+        if !writer::set_sink(sink) {
+            log_reply_error("a graphics sink was already installed; the first one is in use");
+        }
         Arc::new(Controller {
-            router_handle: ReplyRouter::start(stdin),
+            router_handle: ReplyRouter::start_forwarding(stdin, forward),
             num_alloc: {
                 let mut slab = Slab::new();
                 slab.next();
@@ -1494,31 +1566,74 @@ impl Message {
     /// Takes a byte iterator returns first parsed action consuming bytes along the way.
     /// If none found will block until the end of the iterator (usually on the program exit) and returns None
     fn parse_next(buf: &mut std::iter::Peekable<impl Iterator<Item = u8>>) -> Option<Message> {
+        Self::parse_next_with(buf, &mut std::io::sink())
+    }
+
+    /// [`Message::parse_next`], which also passes on the bytes that are not a reply.
+    ///
+    /// The descriptor a terminal answers on is the same one the keyboard arrives
+    /// on, so what is *not* a reply is the user's input and has to be written
+    /// somewhere. Nothing else changes: the same intro is matched, the same control
+    /// data is parsed, the same message comes back.
+    ///
+    /// A byte that looks like the start of an intro but does not become one is
+    /// input and is forwarded, which is why the candidate is held rather than
+    /// written immediately: an `ESC` alone is the beginning of every sequence a
+    /// keyboard sends, and forwarding it the moment it is read would split a key.
+    ///
+    /// TODO: the search for an intro is a byte-at-a-time loop, which is what makes
+    /// it obviously correct and not fast. A real one scans with a `memchr` and
+    /// copies the runs between replies in bulk.
+    fn parse_next_with(
+        buf: &mut std::iter::Peekable<impl Iterator<Item = u8>>,
+        forward: &mut impl std::io::Write,
+    ) -> Option<Message> {
         const ESC: u8 = b'\x1b';
         while let Some(b) = buf.next() {
             // Only start parsing with the correct initial sequence
-            if b == ESC && buf.next()? == b'_' && buf.next()? == b'G' {
-                let mut a = Message::new();
-                // Protocol doesn't have zero control data operations,
-                // so it's safe to assume in a valid reply at least one ControlData will be parsed
-                while let Some(cd) = ControlData::parse(buf) {
-                    a = a.push_cd(cd);
+            if b == ESC {
+                // The two bytes after an `ESC` decide whether this is a reply or a
+                // key. They are read here either way, so the ones that were not an
+                // intro go on rather than being eaten: an arrow key starts with
+                // `ESC` too, and dropping what was read would type `\x1b` and lose
+                // the rest of the key.
+                let second = buf.next()?;
+                let third = buf.next()?;
+                if second == b'_' && third == b'G' {
+                    let mut a = Message::new();
+                    // Protocol doesn't have zero control data operations,
+                    // so it's safe to assume in a valid reply at least one ControlData will be parsed
+                    while let Some(cd) = ControlData::parse(buf) {
+                        a = a.push_cd(cd);
 
-                    match buf.next()? {
-                        b';' => break,
-                        b',' => continue,
-                        _ => return None,
-                    };
-                }
-
-                let mut payload = String::new();
-                while let Some(b) = buf.next() {
-                    if b == ESC && buf.next()? == b'\\' {
-                        return Some(a.payload(payload));
+                        match buf.next()? {
+                            b';' => break,
+                            b',' => continue,
+                            _ => return None,
+                        };
                     }
 
-                    payload.push(b as char);
+                    let mut payload = String::new();
+                    while let Some(b) = buf.next() {
+                        if b == ESC && buf.next()? == b'\\' {
+                            return Some(a.payload(payload));
+                        }
+
+                        payload.push(b as char);
+                    }
+                } else {
+                    // Not a reply, so these three bytes are input.
+                    let _ = forward.write_all(&[b, second, third]);
+                    let _ = forward.flush();
                 }
+            } else {
+                // Not an intro, so it is the user's input and goes straight on. The
+                // error is dropped rather than propagated because this returns an
+                // `Option`: a forward with nowhere to go is not a parse failure.
+                // Flushed per byte because the reader is an interactive program
+                // waiting on a keystroke, and a held byte is a key that was not typed.
+                let _ = forward.write_all(&[b]);
+                let _ = forward.flush();
             }
         }
 
@@ -1638,7 +1753,15 @@ impl Message {
     }
 
     fn send_raw(mut self, no_reply: bool) {
-        // TODO: Handle properly
+        // CRITICAL: this is not supposed to be here.
+        //
+        // Every caller passes `false`, so every command asks the terminal for a
+        // reply, and nothing in `tui` reads those replies: the router would have
+        // to read this process's stdin, which is the keyboard the proxy forwards,
+        // so reading it would eat the user's keystrokes. The acks are therefore
+        // expected to be consumed by whatever is between us and the terminal --
+        // a multiplexer feeding our own pane's input -- and dropped. That is a
+        // gamble, and a rework of the reply path is what replaces it.
         self = self.cd_if(no_reply, 'q', 2);
         let bytes = self.into_escape();
         // Through the writer, not straight to fd 1. A wrapper that serializes
@@ -2078,5 +2201,156 @@ mod tests {
         for s in ["\x1b_G", "\x1b_Gi", "\x1b_Gi=3", "\x1b_Gi=31;AA"] {
             assert!(parse(s).is_none(), "expected None for {s:?}");
         }
+    }
+
+    /// Parse `input`, and report both what came back and what was forwarded.
+    ///
+    /// The two together, because the whole point of the forwarding path is that a
+    /// reply is *removed* from the stream and everything else is *kept*: asserting
+    /// only one of the two would pass on an implementation that dropped input or
+    /// left a reply in it.
+    fn parse_forwarding(input: &str) -> (Vec<Message>, String) {
+        let mut buf = input.bytes().peekable();
+        let mut forwarded = Vec::new();
+        let mut messages = Vec::new();
+        while let Some(message) = Message::parse_next_with(&mut buf, &mut forwarded) {
+            messages.push(message);
+        }
+        (messages, String::from_utf8(forwarded).expect("forwarded input is text"))
+    }
+
+    /// Input with no reply in it is passed through, byte for byte.
+    #[test]
+    fn plain_input_is_forwarded_unchanged() {
+        let (messages, forwarded) = parse_forwarding("hello");
+        assert!(messages.is_empty(), "there was no reply to parse");
+        assert_eq!(forwarded, "hello");
+    }
+
+    /// A reply is consumed and the input around it is forwarded, in order.
+    #[test]
+    fn a_reply_is_removed_and_the_input_around_it_survives() {
+        let (messages, forwarded) = parse_forwarding("ls\x1b_Gi=31;\x1b\\-la");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(cds(&messages[0]), [('i', "31")]);
+        // The command is not run, but as far as the parse is concerned the bytes
+        // before the reply and after it are one continuous stream of input.
+        assert_eq!(forwarded, "ls-la");
+    }
+
+    /// Several replies, with input between them, each removed once.
+    #[test]
+    fn each_reply_is_removed_from_a_mixed_stream() {
+        let (messages, forwarded) =
+            parse_forwarding("a\x1b_Gi=1;OK\x1b\\b\x1b_Gi=2;OK\x1b\\c");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(cds(&messages[0]), [('i', "1")]);
+        assert_eq!(cds(&messages[1]), [('i', "2")]);
+        assert_eq!(forwarded, "abc");
+    }
+
+    /// An `ESC` that begins a key rather than a reply is input, not a reply.
+    ///
+    /// This is the case that makes the naive version wrong: an arrow key also
+    /// starts with `ESC`, and treating it as a truncated reply would eat it.
+    #[test]
+    fn an_escape_that_is_not_a_reply_is_forwarded() {
+        let (messages, forwarded) = parse_forwarding("\x1b[A");
+        assert!(messages.is_empty(), "an arrow key is not a reply");
+        assert_eq!(forwarded, "\x1b[A");
+    }
+
+    /// A truncated reply is not forwarded as input either.
+    ///
+    /// Half a reply has nowhere to go: it is not a message the router can use, and
+    /// handing it to the command would type the terminal's own answer into it.
+    #[test]
+    fn a_truncated_reply_is_neither_parsed_nor_forwarded() {
+        let (messages, forwarded) = parse_forwarding("\x1b_Gi=31;AA");
+        assert!(messages.is_empty());
+        assert_eq!(forwarded, "");
+    }
+
+    /// The ordinary entry point behaves exactly like the forwarding one with a sink.
+    #[test]
+    fn parsing_without_forwarding_matches_the_forwarding_path() {
+        let input = "key\x1b_Gi=7;OK\x1b\\more";
+        let (with, _) = parse_forwarding(input);
+        let plain = {
+            let mut buf = input.bytes().peekable();
+            let mut messages = Vec::new();
+            while let Some(message) = Message::parse_next(&mut buf) {
+                messages.push(message);
+            }
+            messages
+        };
+        assert_eq!(with.len(), plain.len());
+        assert_eq!(cds(&with[0]), cds(&plain[0]));
+    }
+
+    /// A controller routes the replies out of a stream and forwards the rest.
+    ///
+    /// Synthetic input rather than a terminal: the point is the splitting, and a
+    /// real terminal would only add the latencies that make such a test flaky. The
+    /// keystrokes must arrive on the forward pipe *while* the router runs, which is
+    /// the property that lets both halves live in one process.
+    #[test]
+    fn a_controller_routes_replies_and_forwards_the_input_between_them() {
+        /// Collects everything written to it, so the test can look at it after.
+        struct Collect(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Collect {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // One keystroke, one reply, another keystroke. The reply is the ack for the
+        // liveness probe this library sends when a transfer is awaited, so it is
+        // also what the router is looking for.
+        let forwarded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let input = b"ab\x1b_Gi=100001;OK\x1b\\cd".to_vec();
+        let _controller = Controller::init_with_forwarding(
+            std::io::Cursor::new(input),
+            Collect(forwarded.clone()),
+        );
+
+        // The router runs on its own thread, so the input arrives asynchronously.
+        // A short wait is enough: the whole stream is in memory and needs no IO.
+        for _ in 0..100 {
+            if forwarded.lock().unwrap().len() >= 4 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Both keystrokes survive, in order, with the reply removed from between
+        // them. If the reply were forwarded the command would be typed the
+        // terminal's own answer, and if the intro were treated as input the two
+        // `ESC _ G` bytes would show up here too.
+        let got = forwarded.lock().unwrap().clone();
+        assert_eq!(String::from_utf8(got).expect("input is text"), "abcd");
+    }
+
+    /// The escape destination cannot be moved once it is set.
+    ///
+    /// A second destination would split one image's escapes across two writers, so
+    /// the installer refuses. That the *installed* one receives an escape is not
+    /// asserted here: the destination is process-global and the first test to run
+    /// wins it, which makes routing order-dependent in a test binary. It is checked
+    /// where it matters instead, by a real session showing the escapes on the
+    /// terminal.
+    #[test]
+    fn the_escape_destination_cannot_be_moved() {
+        let _ = writer::set_sink(std::sync::Arc::new(std::sync::Mutex::new(
+            std::io::sink(),
+        )));
+        let second = writer::set_sink(std::sync::Arc::new(std::sync::Mutex::new(
+            std::io::sink(),
+        )));
+        assert!(!second, "a second destination must be refused");
     }
 }

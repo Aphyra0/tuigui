@@ -166,7 +166,7 @@ cannot be relied on.
 
 ## Next steps (vertical slice)
 
-1. Commit session artifacts (TERMS.md, marker_bench, Cargo.toml).
+1. Commit session artifacts (TERMS.md, Cargo.toml).
 2. Branch; implement: termios setup + router spawn + `I=` transmit await
    path + `place` (own-ack) + `ready()`/`wait()` + `try_ready()`.
 3. Test in kitty: one PNG transmit+place+display; then video loop with

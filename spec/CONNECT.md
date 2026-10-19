@@ -74,17 +74,20 @@ in the pane. Nothing has to be provisioned and nothing survives a crash.
 ## Across machines
 
 Unbuilt. The announcement travels fine, since a pane's output crosses ssh like
-any other text; what is missing is a channel on the far side to dial. The
-candidate is ssh: it is already there, it is authenticated, and its port
-forwarding gives a socket on whichever end needs one.
+any other text; what is missing is a channel on the far side to dial. Two
+proposals for it, and neither is built:
 
-Two things make it different from the local case, and both are open:
+- **[SSH_SEAM.md](SSH_SEAM.md)** — arrange a port forward on the ssh that
+  started the session. It reaches the terminal side through the connection that
+  already exists, and it needs a shim in front of an ssh we do not own.
+- **[REVERSE_SSH.md](REVERSE_SSH.md)** — the pane side reads `SSH_CONNECTION`
+  and ssh's back to the user's machine. Nothing to arrange, and it depends on
+  the user's machine being reachable from the pane.
 
-- **The forward must exist before the announcement is read**, and the ssh is
-  owned by whoever started the session rather than by us. `SSH_SEAM.md` is the
-  proposal for that.
+Two things make the remote case different from the local one, and both are open:
+
 - **A second transport would bring ranking back.** Today there is exactly one
-  channel, so nothing has to choose.
+  channel, so nothing has to choose. Either proposal above is the second member.
 - **The address would be stable.** The scan remembers addresses so a redraw is
   not a second client, and never forgets them, which is right for a per-pid
   socket path and wrong for a stable remote one.

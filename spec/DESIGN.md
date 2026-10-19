@@ -160,4 +160,5 @@ and has no DCT in it.
 | [COMP.md](COMP.md) | the compositor, with Xwayland. Planned. |
 | [REMOTE.md](REMOTE.md) | the app on another machine from the terminal. Planned. |
 | [SSH_SEAM.md](SSH_SEAM.md) | attaching a forward to an ssh we do not own, for that. Planned. |
+| [REVERSE_SSH.md](REVERSE_SSH.md) | the pane ssh-ing back to the user, instead. An idea. |
 | [EMULATOR.md](EMULATOR.md) | a terminal that accepts a compressed stream. An idea to hand to a terminal, not a plan here. |

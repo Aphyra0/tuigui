@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "usage: tuigui <runnable>\n\
+const USAGE: &str = "usage: tuigui [--dbg-loop] <runnable>\n\
      e.g. tuigui /path/to/app";
 
 /// What `tuigui` should do.
@@ -22,30 +22,46 @@ const USAGE: &str = "usage: tuigui <runnable>\n\
 pub struct Config {
     /// The runnable to draw, which is what produces the frames.
     pub runnable: PathBuf,
+    /// Passed through to the client, which passes it to the decoder.
+    ///
+    /// Here because the client is started *by* the server, so a user of `tuigui`
+    /// has no second command line to put it on: the only place to say it is the
+    /// one they typed.
+    pub dbg_loop: bool,
 }
 
 impl Config {
-    /// Parse `<runnable>`.
+    /// Parse `[--dbg-loop] <runnable>`.
     ///
     /// The runnable is the user's request and the server's command is derived from
     /// it, so there is no second command and no address to pass: a client names its
-    /// own channel, so there is nothing here for a user to configure, and a flag
-    /// would be a knob with one setting.
+    /// own channel, so there is nothing here for a user to configure except the
+    /// flags that are the client's.
     pub fn from_args(
         args: impl Iterator<Item = String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut args = args.peekable();
-        if let Some(arg) = args.peek() {
-            // Accepted no longer: the tunnel it selected was removed. Failing
-            // loudly beats starting a local session for someone who asked for a
-            // remote one and wondering why nothing is remote.
-            if arg == "--net" {
-                return Err("--net was removed: announce a channel instead".into());
+        let mut dbg_loop = false;
+        let mut runnable = None;
+        for arg in args {
+            match arg.as_str() {
+                // A debug aid, and debug aids do not get to swallow a positional:
+                // the runnable is still required and still exactly one.
+                "--dbg-loop" => dbg_loop = true,
+                // Accepted no longer: the tunnel it selected was removed. Failing
+                // loudly beats starting a local session for someone who asked for a
+                // remote one and wondering why nothing is remote.
+                "--net" => return Err("--net was removed: announce a channel instead".into()),
+                other => {
+                    if runnable.is_some() {
+                        return Err(format!("unexpected argument {other:?}\n{USAGE}").into());
+                    }
+                    runnable = Some(PathBuf::from(other));
+                }
             }
         }
-        let runnable = args.next().ok_or(USAGE)?;
         Ok(Self {
-            runnable: PathBuf::from(runnable),
+            runnable: runnable.ok_or(USAGE)?,
+            dbg_loop,
         })
     }
 }
@@ -61,7 +77,7 @@ impl Config {
 /// the server the only reader of fd 0, so nothing steals a keystroke.
 pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let session = tui::Tui {
-        command: server_command(&config.runnable),
+        command: server_command(&config.runnable, config.dbg_loop),
     };
     // Nothing is drawn from this thread: the client runs inside the pty, which is
     // what puts its drawing through the rewrite. This only waits for the session to
@@ -75,11 +91,19 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
 /// The command the server runs: this same binary, re-entered as the client for
 /// `runnable`.
-fn server_command(runnable: &Path) -> Vec<String> {
+///
+/// The client's own flags go after the re-entry flag and before the runnable, which is
+/// where `gui` expects them. Position does not actually matter to clap, but putting them
+/// here keeps the runnable last, so the shape of the command reads the same however many
+/// flags are added.
+fn server_command(runnable: &Path, dbg_loop: bool) -> Vec<String> {
     let mut cmd = vec![std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "tuigui".into())];
     cmd.push(INTERNAL_CLIENT_FLAG.into());
+    if dbg_loop {
+        cmd.push("--dbg-loop".into());
+    }
     cmd.push(runnable.to_string_lossy().into_owned());
     cmd
 }

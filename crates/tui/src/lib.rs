@@ -21,10 +21,12 @@
 
 mod announce;
 mod bytes;
+mod placeholder;
 mod proxy;
 mod pty;
 mod raw;
 mod server;
+mod session;
 mod sink;
 
 use std::io::{self, Read, Write};
@@ -76,17 +78,35 @@ impl Tui {
         let _raw = Raw::install()?;
         let sink = Sink::new(stdout);
 
-        // The pty first, because the server is built around what the pty produces: the pty
+        // The keyboard, split in two on its way in. The terminal's answers to this side's
+        // graphics escapes arrive on the same descriptor as the user's keystrokes, so the
+        // router reads it and gives back only what was not a reply; that pipe is then the
+        // keyboard the command sees. Without this the command would be typed the terminal's
+        // own acknowledgements.
+        //
+        // The sink is the escape destination as well as the screen: one lock covers both the
+        // command's bytes and this side's escapes, which is what stops an escape landing in
+        // the middle of a line the command is printing.
+        let (keyboard, replies) = io::pipe()?;
+        let controller = easytgp::Controller::init_with_sink(
+            stdin,
+            replies,
+            std::sync::Arc::new(std::sync::Mutex::new(sink.clone())),
+        );
+
+        // The pty next, because the server is built around what the pty produces: the pty
         // is the producer and the server reads it. There is no socket to bind and no session
         // file to write — a client names its own channel, and this side only answers.
-        let pty = Pty::new(&self.command, stdin, sink.clone())?;
+        let pty = Pty::new(&self.command, keyboard, sink.clone())?;
 
         // One subscription, read by the server's own loop. Reading it there rather than on
         // the pty's forwarding thread is what lets the same loop wait on the clients too: a
         // scan on that thread would have to hand its finds over from it, and the finds would
         // be a third thing to select on.
         let output = pty.bytes().subscribe();
-        let server = Server::new(sink, output);
+        // The pty's grid, which is the pane a client draws into: a client cannot read it from
+        // its own environment, so the side that made the pty is the side that tells it.
+        let server = Server::new(output, pty.cols(), pty.rows(), controller);
 
         tokio::select! {
             // The command's half: its own select races the bytes against the child, so this

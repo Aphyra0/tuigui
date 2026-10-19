@@ -26,7 +26,3 @@ ffmpeg-sidecar = { workspace = true }
 [[example]]
 name = "image"
 path = "examples/image.rs"
-
-[[example]]
-name = "marker_bench"
-path = "examples/marker_bench.rs"

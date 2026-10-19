@@ -2604,6 +2604,7 @@ dependencies = [
  "image",
  "rustix 1.1.5",
  "tokio",
+ "turbojpeg",
  "wire",
 ]
 

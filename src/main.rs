@@ -9,7 +9,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // this command's.
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() == Some(tuigui::INTERNAL_CLIENT_FLAG) {
-        let gui = gui::Gui::parse_from(args);
+        // A program name has to be put back before clap sees the rest. `parse_from`
+        // treats its first element as `argv[0]` and skips it, so passing the runnable
+        // directly made clap read the runnable's path as the program name and then
+        // report that its required `<PATH>` was missing.
+        let gui = gui::Gui::parse_from(std::iter::once("gui".to_string()).chain(args));
         gui.run(std::io::stdin(), std::io::stdout()).await?;
         return Ok(());
     }

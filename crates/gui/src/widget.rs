@@ -21,6 +21,11 @@ pub struct Session {
     established: bool,
     /// What to draw, one entry per line.
     lines: Vec<String>,
+    /// Tiled over the whole area instead of `lines`, when set.
+    ///
+    /// A character rather than a string: the point of a fill is that it repeats,
+    /// and one field cannot disagree with itself about how many there are.
+    fill: Option<char>,
 }
 
 impl Session {
@@ -35,6 +40,7 @@ impl Session {
         Self {
             established: false,
             lines: advert.lines().map(str::to_string).collect(),
+            fill: None,
         }
     }
 
@@ -43,6 +49,21 @@ impl Session {
         Self {
             established: true,
             lines: vec![label],
+            fill: None,
+        }
+    }
+
+    /// Established, and tiled edge to edge with `fill`.
+    ///
+    /// A separate constructor from [`Session::established`] because the text and
+    /// the fill answer different questions: the label says which link this is,
+    /// the fill is proof the pane is being painted at all. Filling over the label
+    /// would throw away the first to show the second.
+    pub fn filled(fill: char) -> Self {
+        Self {
+            established: true,
+            lines: vec![],
+            fill: Some(fill),
         }
     }
 }
@@ -57,6 +78,22 @@ impl Widget for Session {
             PINK
         };
         buf.set_style(area, Style::new().bg(background));
+
+        // A fill is drawn instead of the lines, never over them: `filled` carries
+        // no lines to lose, and this keeps the two paths from both writing a cell.
+        if let Some(fill) = self.fill {
+            for y in area.y..area.y.saturating_add(area.height) {
+                for x in area.x..area.x.saturating_add(area.width) {
+                    // Every cell, including the ones past the last column of a row:
+                    // the point is a pane with no gaps in it, and skipping cells is
+                    // how the background shows through.
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.set_char(fill);
+                    }
+                }
+            }
+            return;
+        }
 
         // Centred as a block: off-centre text in a full-screen fill reads as an
         // accident rather than an answer. Clipped rather than wrapped, so a narrow

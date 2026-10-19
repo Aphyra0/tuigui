@@ -12,6 +12,9 @@ image = { workspace = true }
 rustix = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+# Decoding a frame off the wire. The client encodes with the same library, so the
+# two halves agree on the codec by sharing it rather than by documenting one.
+turbojpeg = { version = "1.5", default-features = false, features = ["pkg-config", "require-simd"] }
 # `select_all` and `StreamExt`, for reading every attached client in one loop
 # without spawning a task per client. Not already reachable through tokio.
 futures-util = { version = "0.3", features = ["alloc"] }
