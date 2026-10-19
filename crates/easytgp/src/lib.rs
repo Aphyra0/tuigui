@@ -1,23 +1,33 @@
 //! Terminal graphics protocol (TGP): the wire format used to stream
 //! pixel data into a graphics-capable terminal.
+//!
+//! # On dead-code warnings
+//!
+//! `dead_code` is allowed crate-wide rather than item by item. What it hides is of two
+//! kinds, and neither is a mistake: a field that exists to keep a value alive for its side
+//! effect, which the compiler cannot see; and API surface for work that is described but not
+//! yet wired (`a=f` frame composition, the timing a `SyncData` is meant to carry).
+//!
+//! Crate-wide rather than per item because the list changes as that work lands, and a note
+//! per item would be a second thing to keep in step. If a warning of a different kind ever
+//! appears, it is not covered by this and should be fixed.
+
+#![allow(dead_code)]
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     fmt::Display,
     future::Future,
-    io::{BufReader, Cursor, Read, Write},
-    ops::Deref,
+    io::{BufReader, Cursor, Read},
     pin::pin,
-    sync::{Arc, Mutex, RwLock, RwLockReadGuard},
+    sync::{Arc, Mutex},
     task::Waker,
-    thread::{sleep, JoinHandle},
+    thread::JoinHandle,
     time::Duration,
 };
 
-use derive_deref::{Deref, DerefMut};
-use derive_getters::Getters;
 use idalloc::Slab;
-use image::{PixelWithColorType, RgbImage};
+use image::RgbImage;
 use itertools::Itertools;
 
 // TODO: https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
@@ -182,11 +192,6 @@ static mut R: ReplyRouter = ReplyRouter {
 };
 
 type Marker = u32;
-
-struct PendingReady {
-    pending: HashMap<ImgNumber, Waker>,
-    ready: HashMap<ImgNumber, Option<Message>>,
-}
 
 #[derive(Default)]
 struct ReplyRouter {
@@ -528,7 +533,7 @@ impl Controller {
 
 impl PlacementHandle {
     /// Deletes the existing placement and returns a new one instead.
-    pub fn replace(self, request: PlacementRequest) -> Self {
+    pub fn replace(self, _request: PlacementRequest) -> Self {
         todo!()
     }
 
@@ -1728,7 +1733,11 @@ pub struct Message {
 
 impl Message {
     // returns value for either I, or i. If both specified defaults to I.
-    pub fn ident(&self) -> ActionIdent {
+    //
+    // Private, because it returns `ActionIdent`, which is an implementation detail: it
+    // exists so the reply router can tell a numbered image from an identified one, and a
+    // caller has no use for the distinction.
+    fn ident(&self) -> ActionIdent {
         // TODO: refactor
         self.cds
             .iter()
@@ -1881,7 +1890,7 @@ impl Message {
 
     // TODO: implement chunking
     /// execute the command
-    pub fn send(mut self) -> ReplyFuture {
+    pub fn send(self) -> ReplyFuture {
         self.send_medium(true)
     }
 
@@ -2014,10 +2023,25 @@ impl TGPError {
 
 // TODO:
 // The PNG format is specified using the f=100 key. The width and height of the image will be read from the PNG data itself. Note that if you use both PNG and compression, then you must provide the S key with the size of the PNG data.
+/// One control-data key and its value, as it appears in an escape (`i=31`).
+///
+/// Public because [`Format::to_cd`] returns one, and a public trait method cannot return a
+/// type the caller cannot name — a caller writing its own `Format` has to be able to
+/// construct one. The fields stay private: what a caller needs is to build one, not to
+/// reach inside it.
 #[derive(Debug, Clone, PartialEq)]
-struct ControlData(char, String);
+pub struct ControlData(char, String);
 
 impl ControlData {
+    /// A key and its value.
+    ///
+    /// The fields are private, so this is the only way to build one from outside — which is
+    /// what a caller implementing [`Format`] needs, since `to_cd` has to return the format's
+    /// `f=` key.
+    pub fn new(key: char, value: impl Display) -> Self {
+        Self(key, value.to_string())
+    }
+
     fn format(&self) -> String {
         format!("{}={}", self.0, self.1.trim())
     }
