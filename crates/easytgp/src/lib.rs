@@ -35,16 +35,22 @@ mod id {
     use idalloc::Slab;
     use static_init::dynamic;
 
-    /// The id slab, and nothing else.
+    /// The id slab, and a screen clear at first use.
     ///
-    /// This used to clear `ECHO` and `ICANON` on stdin, print a screen clear, and
-    /// `unwrap` all of it, inside a static initializer. Three problems with one
-    /// cause: a global initializer runs on whatever thread first touches the
-    /// slab, and a panic there cannot unwind, so a process whose stdin is not a
-    /// terminal was aborted rather than told why. None of it is an allocator's
-    /// business; the caller owns the terminal.
+    /// The termios work that used to live here has moved to [`Controller`], which is
+    /// the one call where a caller hands over its terminal; doing it here meant it
+    /// ran on whatever thread first touched the slab.
+    ///
+    /// The clear stays, because it is what makes a graphics program's own output
+    /// legible rather than appended to whatever was on the screen. There is nothing
+    /// to fail at, which is the difference from the termios code: a clear cannot
+    /// turn into an abort on a stdin that is not a terminal.
     #[dynamic]
     static mut I: Slab<Id> = {
+        use std::io::Write as _;
+        print!("\x1b[2J\x1b[3J\x1b[H");
+        let _ = std::io::stdout().flush();
+
         let mut slab = Slab::<Id>::new();
         // skip 0 as an id.
         slab.next();
@@ -353,6 +359,37 @@ impl Future for ReplyFuture {
     }
 }
 
+/// Take this terminal out of its line discipline, so replies can be read at all.
+///
+/// The reply router reads the terminal's answers off the caller's stdin, and the
+/// line discipline decides when those bytes arrive. With `ICANON` on, input is held
+/// until a newline — and a graphics reply has no newline, so the router never sees
+/// one and every transmit waits forever. With `ECHO` on, whatever is typed comes
+/// back into the stream being parsed.
+///
+/// Called by [`Controller::init_with_sink`], so no caller has to know that a
+/// graphics library needs raw mode. A caller that wants its modes restored still
+/// has to do that itself: this is a plug, not a guard.
+///
+/// Not a failure when there is no terminal. A pipe, a pty with no discipline, or a
+/// test running with stdin from `/dev/null` are all legitimate, and they have no
+/// modes to set — which is why nothing here is `unwrap`ped or returned. The version
+/// of this that lived in a global initializer aborted the process on exactly those
+/// cases.
+pub fn take_terminal_raw() {
+    let stdin = std::io::stdin();
+    let Ok(mut modes) = rustix::termios::tcgetattr(&stdin) else {
+        // Not a terminal, so there is no line discipline to turn off.
+        return;
+    };
+    modes.make_raw();
+    if let Err(e) =
+        rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &modes)
+    {
+        log_reply_error(&format!("could not take the terminal out of line mode: {e}"));
+    }
+}
+
 pub struct Controller {
     router_handle: JoinHandle<()>,
     num_alloc: Slab<ImgNumber>,
@@ -407,6 +444,9 @@ impl Controller {
         if !writer::set_sink(sink) {
             log_reply_error("a graphics sink was already installed; the first one is in use");
         }
+        // The router is about to read replies off this terminal, which it cannot do
+        // while the line discipline is holding them.
+        take_terminal_raw();
         Arc::new(Controller {
             router_handle: ReplyRouter::start_forwarding(stdin, forward),
             num_alloc: {
