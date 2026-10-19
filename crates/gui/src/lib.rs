@@ -72,14 +72,25 @@ pub struct Gui {
     /// `XDG_RUNTIME_DIR`, which is what the server is told to dial.
     #[arg(long = "socket", env = "TUI_SOCKET")]
     pub socket: Option<std::path::PathBuf>,
+    /// The diagnostic switches, which belong to the client.
+    #[command(flatten)]
+    pub debug: DebugOptions,
+}
+
+/// The switches that exist to diagnose a session, not to use one.
+///
+/// The client's half of the set: what the *sender* can do to make a failure visible.
+/// A session has two ends and either can be the reason nothing appears, so each end
+/// has its own switches and each stays with the code it changes.
+#[derive(Debug, Clone, Copy, Default, clap::Args)]
+pub struct DebugOptions {
     /// Play the runnable again from the start when it ends, forever.
     ///
-    /// Off by default because it is a debugging aid rather than a feature: a
-    /// short clip looping means the session can be left running while something
-    /// else is looked at, instead of ending when the clip does. A real runnable
-    /// is not a file and has no "start" to return to.
-    #[arg(long = "dbg-loop")]
-    pub dbg_loop: bool,
+    /// A clip is short and a session is not, so a run that ends after a few seconds
+    /// is hard to look at while something else is being examined, which is the usual
+    /// case when one of these switches is needed at all.
+    #[arg(long = "dbg-loop-video")]
+    pub loop_video: bool,
 }
 
 impl Gui {
@@ -139,7 +150,7 @@ impl Gui {
             connection,
             announcement,
             &self.path,
-            self.dbg_loop,
+            self.debug.loop_video,
         )
         .await
     }
@@ -169,7 +180,7 @@ async fn draw_until_ended(
     connection: Connection,
     announcement: String,
     path: &std::path::Path,
-    dbg_loop: bool,
+    loop_video: bool,
 ) -> std::io::Result<()> {
     // Green, and named with what this client announced: the one thing the user is waiting to
     // see, and the proof that this pane is talking to the session it thinks.
@@ -189,7 +200,7 @@ async fn draw_until_ended(
     // Decoding starts only now: the fill has been drawn and forwarded, so the server has the
     // grid it needs to create the image under. A frame sent before that would name an image
     // the terminal does not have, and the frame would be lost.
-    let mut frames = decode(path, dbg_loop)?;
+    let mut frames = decode(path, loop_video)?;
 
     loop {
         tokio::select! {
@@ -219,13 +230,13 @@ async fn draw_until_ended(
 /// link that falls behind drops the frames nobody would have looked at rather than building a
 /// delay between the video and the pane.
 ///
-/// `dbg_loop` makes ffmpeg rewind the input rather than end, which is what keeps a session
+/// `loop_video` makes ffmpeg rewind the input rather than end, which is what keeps a session
 /// alive after a short clip. The looping is ffmpeg's and not a loop here: it re-reads the file
 /// and re-emits its frames at the same rate, so this side sees one continuous stream and
 /// needs no state about where the clip began.
 fn decode(
     path: &std::path::Path,
-    dbg_loop: bool,
+    loop_video: bool,
 ) -> std::io::Result<tokio::sync::mpsc::Receiver<Vec<u8>>> {
     use ffmpeg_sidecar::command::FfmpegCommand;
 
@@ -239,7 +250,7 @@ fn decode(
             // at its own frame rate instead of decoding all of it at once. Without it a short
             // clip is over before its first frame has been drawn.
             command.realtime();
-            if dbg_loop {
+            if loop_video {
                 // Also before the input, and `-1` is ffmpeg's "forever": the flag is a
                 // property of how the input is read, so it is no use after `-i`.
                 command.args(["-stream_loop", "-1"]);

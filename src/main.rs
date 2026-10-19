@@ -18,6 +18,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let config = tuigui::Config::from_args(std::env::args().skip(1))?;
-    tuigui::run(config).await
+    let config = tuigui::TuiGui::parse();
+    config.run().await
 }

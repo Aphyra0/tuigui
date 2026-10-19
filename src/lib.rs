@@ -11,82 +11,74 @@
 //! other client does — by announcing a channel in its own output. There is nothing
 //! to pass between them out of band, which is why this file has no path, no socket
 //! name, and no state to share.
+//!
+//! Their command-line options are composed rather than duplicated. Each half declares
+//! its own [`tui::DebugOptions`] and [`gui::DebugOptions`], and those are flattened
+//! into [`TuiGui`], so a switch defined on either side is accepted here without being
+//! re-declared — and a switch added to one side cannot fail to appear.
 
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "usage: tuigui [--dbg-loop] <runnable>\n\
-     e.g. tuigui /path/to/app";
-
-/// What `tuigui` should do.
-#[derive(Debug, Clone)]
-pub struct Config {
+/// Everything `tuigui` decides, assembled from the two halves it starts.
+///
+/// The switches are the two halves' own, flattened in: what the server can change and
+/// what the client can change are different sets, and neither is copied here. The only
+/// thing written out by hand is which of the client's switches have to be turned back
+/// into arguments, because the client is a separate process and its options arrive as a
+/// command line rather than as a struct.
+#[derive(Debug, Clone, clap::Parser)]
+#[command(
+    name = "tuigui",
+    about = "Run the tui server and its gui client as one command"
+)]
+pub struct TuiGui {
     /// The runnable to draw, which is what produces the frames.
     pub runnable: PathBuf,
-    /// Passed through to the client, which passes it to the decoder.
-    ///
-    /// Here because the client is started *by* the server, so a user of `tuigui`
-    /// has no second command line to put it on: the only place to say it is the
-    /// one they typed.
-    pub dbg_loop: bool,
+    /// The server's switches, used by the server this command starts.
+    #[command(flatten)]
+    pub tui: tui::DebugOptions,
+    /// The client's switches, passed on to the client this command starts.
+    #[command(flatten)]
+    pub gui: gui::DebugOptions,
 }
 
-impl Config {
-    /// Parse `[--dbg-loop] <runnable>`.
+impl TuiGui {
+    /// The client's switches, as the arguments it will be started with.
     ///
-    /// The runnable is the user's request and the server's command is derived from
-    /// it, so there is no second command and no address to pass: a client names its
-    /// own channel, so there is nothing here for a user to configure except the
-    /// flags that are the client's.
-    pub fn from_args(
-        args: impl Iterator<Item = String>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut dbg_loop = false;
-        let mut runnable = None;
-        for arg in args {
-            match arg.as_str() {
-                // A debug aid, and debug aids do not get to swallow a positional:
-                // the runnable is still required and still exactly one.
-                "--dbg-loop" => dbg_loop = true,
-                // Accepted no longer: the tunnel it selected was removed. Failing
-                // loudly beats starting a local session for someone who asked for a
-                // remote one and wondering why nothing is remote.
-                "--net" => return Err("--net was removed: announce a channel instead".into()),
-                other => {
-                    if runnable.is_some() {
-                        return Err(format!("unexpected argument {other:?}\n{USAGE}").into());
-                    }
-                    runnable = Some(PathBuf::from(other));
-                }
-            }
+    /// Spelled out field by field, because what the client receives is a command line
+    /// rather than a struct. This is the one place that has to know a flag's spelling,
+    /// and it sits next to the code that passes it on.
+    fn client_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.gui.loop_video {
+            args.push("--dbg-loop-video".into());
         }
-        Ok(Self {
-            runnable: runnable.ok_or(USAGE)?,
-            dbg_loop,
-        })
+        args
     }
-}
 
-/// Start the session: the server owns this terminal, and the command inside it is
-/// this same binary re-entered as the client.
-///
-/// The client has to be *inside* the pty, not beside the server on the same
-/// terminal. The server owns the real terminal's input and output, and its rewrite
-/// of what the pane draws only sees what comes out of the pty: a client drawing
-/// directly would have its bytes delivered unrewritten, so the terminal would show
-/// the raw text and never an image. Piping the client through the pty also makes
-/// the server the only reader of fd 0, so nothing steals a keystroke.
-pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let session = tui::Tui {
-        command: server_command(&config.runnable, config.dbg_loop),
-    };
-    // Nothing is drawn from this thread: the client runs inside the pty, which is
-    // what puts its drawing through the rewrite. This only waits for the session to
-    // end, which happens when the client inside it exits.
-    //
-    // `std::io`'s handles, not tokio's: the session takes plain streams and puts the
-    // blocking reads on their own thread, so there is nothing async about them to
-    // wrap.
-    Ok(session.run(std::io::stdin(), std::io::stdout()).await?)
+    /// Start the session: the server owns this terminal, and the command inside it is
+    /// this same binary re-entered as the client.
+    ///
+    /// The client has to be *inside* the pty, not beside the server on the same
+    /// terminal. The server owns the real terminal's input and output, and its rewrite
+    /// of what the pane draws only sees what comes out of the pty: a client drawing
+    /// directly would have its bytes delivered unrewritten, so the terminal would show
+    /// the raw text and never an image. Piping the client through the pty also makes
+    /// the server the only reader of fd 0, so nothing steals a keystroke.
+    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let session = tui::Tui {
+            command: server_command(&self.runnable, &self.client_args()),
+            debug: self.tui,
+        };
+        // Nothing is drawn from this thread: the client runs inside the pty, which is
+        // what puts its drawing through the rewrite. This only waits for the session to
+        // end, which happens when the client inside it exits.
+        //
+        // `std::io`'s handles, not tokio's: the session takes plain streams and puts the
+        // blocking reads on their own thread, so there is nothing async about them to
+        // wrap.
+        Ok(session.run(std::io::stdin(), std::io::stdout()).await?)
+    }
 }
 
 /// The command the server runs: this same binary, re-entered as the client for
@@ -96,14 +88,12 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 /// where `gui` expects them. Position does not actually matter to clap, but putting them
 /// here keeps the runnable last, so the shape of the command reads the same however many
 /// flags are added.
-fn server_command(runnable: &Path, dbg_loop: bool) -> Vec<String> {
+fn server_command(runnable: &Path, client_args: &[String]) -> Vec<String> {
     let mut cmd = vec![std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "tuigui".into())];
     cmd.push(INTERNAL_CLIENT_FLAG.into());
-    if dbg_loop {
-        cmd.push("--dbg-loop".into());
-    }
+    cmd.extend_from_slice(client_args);
     cmd.push(runnable.to_string_lossy().into_owned());
     cmd
 }

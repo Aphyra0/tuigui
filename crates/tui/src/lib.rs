@@ -36,8 +36,8 @@ use server::Server;
 use sink::Sink;
 
 pub use bytes::Bytes;
-pub use pty::Pty as Command;
 pub use proxy::Streams;
+pub use pty::Pty as Command;
 pub use server::Server as ImageServer;
 pub use sink::Sink as Screen;
 
@@ -56,6 +56,47 @@ pub struct Tui {
     /// The command to run, with its arguments.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
+    /// The diagnostic switches, shared with the client.
+    #[command(flatten)]
+    pub debug: DebugOptions,
+}
+
+/// The switches that exist to diagnose a session, not to use one.
+///
+/// Every one of these makes the session worse in some way, and every one exists
+/// because a failure in this pipeline is invisible: an image that is never sent, a
+/// placement nothing resolves against, a medium the terminal cannot read, and a
+/// blank pane all look the same from outside. Each switch removes one layer, so
+/// what remains on screen is attributable to the layers still in place.
+///
+/// They are all named `--dbg-`, and they are all the caller's to pass: a server
+/// does not decide to diagnose itself.
+#[derive(Debug, Clone, Copy, Default, clap::Args)]
+pub struct DebugOptions {
+    /// Draw a fixed blue image instead of the frames that arrive.
+    ///
+    /// Removes the wire codec and the decode, so what is on screen is attributable
+    /// to the encode, the transmit and the placement. Blue means those are sound and
+    /// the fault is upstream; a blank pane means it is here.
+    #[arg(long = "dbg-blue-pixel")]
+    pub blue_pixel: bool,
+    /// Place the image for real instead of creating a virtual placement.
+    ///
+    /// A virtual placement (`U=1`) has no position of its own, so it draws nothing
+    /// until placeholder cells resolve against it — correct, and silent when they do
+    /// not. A real placement draws at the cursor and needs nothing from the client's
+    /// text, which is what separates "no image" from "no cells".
+    #[arg(long = "dbg-no-vplacement")]
+    pub no_vplacement: bool,
+    /// Send the pixels inside the escape instead of through shared memory.
+    ///
+    /// The shared memory medium (`t=s`) names an object the terminal maps, which is
+    /// the fast path and the reason this pipeline is affordable. The inline path
+    /// puts a base64 PNG in the escape, so it is slower and larger — and it cannot
+    /// fail on a terminal that will not read the object, which is what makes it the
+    /// control for "the image arrived but nothing was drawn".
+    #[arg(long = "dbg-no-shm")]
+    pub no_shm: bool,
 }
 
 impl Tui {
@@ -104,9 +145,20 @@ impl Tui {
         // scan on that thread would have to hand its finds over from it, and the finds would
         // be a third thing to select on.
         let output = pty.bytes().subscribe();
-        // The pty's grid, which is the pane a client draws into: a client cannot read it from
-        // its own environment, so the side that made the pty is the side that tells it.
-        let server = Server::new(output, pty.cols(), pty.rows(), controller);
+        let (cols, rows) = (pty.cols(), pty.rows());
+
+        // The medium is chosen here and nowhere else: a flag read at every frame is the branch
+        // the type parameter exists to remove, but the flag still has to be read somewhere, and
+        // this is the one place that knows what the user asked for. The two arms are different
+        // types, so each is boxed to one.
+        let server: std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>>>> = if self
+            .debug
+            .no_shm
+        {
+            Box::pin(Server::<easytgp::Png>::new(output, cols, rows, self.debug, controller).run())
+        } else {
+            Box::pin(Server::<easytgp::Shm>::new(output, cols, rows, self.debug, controller).run())
+        };
 
         tokio::select! {
             // The command's half: its own select races the bytes against the child, so this
@@ -114,7 +166,7 @@ impl Tui {
             session = pty.run() => session,
             // Nothing is reading the pty's output any more, so no client can be found and
             // there is no session left to serve.
-            served = server.run() => served,
+            served = server => served,
         }
     }
 }

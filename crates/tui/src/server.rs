@@ -24,7 +24,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use easytgp::Controller;
+use easytgp::{Controller, Format};
 use tokio::sync::mpsc::Receiver;
 
 use wire::message::Message;
@@ -32,6 +32,7 @@ use wire::transport::Transport;
 
 use crate::announce::Announcement;
 use crate::session::Session;
+use crate::DebugOptions;
 
 /// What the pty produces, and what the scan finds in it.
 ///
@@ -78,7 +79,7 @@ impl Announcements {
 /// established: the handshake happens inside [`Transport::connect`], so a connection only
 /// exists once a peer has answered the greeting, and there is no half-attached client to be
 /// told apart from a whole one.
-pub struct Server {
+pub struct Server<F: Format> {
     /// What the pty has produced, and where a client announces itself.
     announcements: Announcements,
     /// The grid a client's pty was created with, in cells.
@@ -88,6 +89,8 @@ pub struct Server {
     /// through its environment.
     cols: u32,
     rows: u32,
+    /// The diagnostic switches, passed to every session it attaches.
+    debug: DebugOptions,
     /// Creates image requests, and owns the reply router behind them.
     ///
     /// On the server and not in a session because there is one terminal: the reply
@@ -100,21 +103,23 @@ pub struct Server {
     ///
     /// Owned by the loop and nowhere else: reading a link needs it, so a link in a map
     /// beside the loop reading it would be a link in two places.
-    sessions: Vec<Session>,
+    sessions: Vec<Session<F>>,
 }
 
-impl Server {
+impl<F: Format> Server<F> {
     /// Serve a pty's output, with the reply router this side's own escapes need.
     pub fn new(
         output: Receiver<Vec<u8>>,
         cols: u32,
         rows: u32,
+        debug: DebugOptions,
         controller: Arc<Controller>,
     ) -> Self {
         Self {
             announcements: Announcements::new(output),
             cols,
             rows,
+            debug,
             controller,
             sessions: Vec::new(),
         }
@@ -131,6 +136,7 @@ impl Server {
             mut announcements,
             cols,
             rows,
+            debug,
             controller,
             mut sessions,
         } = self;
@@ -178,6 +184,7 @@ impl Server {
                         connection,
                         cols,
                         rows,
+                        debug,
                         controller.clone(),
                     )),
                     Err(e) => eprintln!("tui: could not reach an announced client: {e}"),

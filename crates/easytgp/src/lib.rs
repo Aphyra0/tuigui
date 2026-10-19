@@ -680,8 +680,29 @@ fn resolve_dims(
 //     }
 // }
 
-trait Format: Copy + Clone + Default + 'static {
+/// The pixel format a frame is transmitted in.
+///
+/// Public so a caller can be generic over the medium: the choice of [`Png`] or
+/// [`Shm`] is the caller's, and a caller that wants one function for either cannot
+/// name the bound otherwise.
+///
+/// `Unpin` is part of the contract rather than a bound the caller adds, because a
+/// transmission is a `Future` and awaiting one needs it: a format that could not be
+/// sent would be a format that implements this trait and nothing else.
+pub trait Format: Copy + Clone + Default + Unpin + 'static {
     fn to_cd(self) -> ControlData;
+
+    /// Build a request for this medium from decoded pixels.
+    ///
+    /// The constructor for the medium, named so that a caller generic over [`Format`]
+    /// can build a request without branching on the type. Without it, a caller that
+    /// wants one piece of code for either medium has to choose between
+    /// [`Controller::new_png`] and [`Controller::new_shm_rgb`] at every frame, which
+    /// is the branch the type parameter exists to remove.
+    ///
+    /// Required rather than defaulted: a new medium has to say how pixels reach the
+    /// terminal, and a default would silently pick one of the two.
+    fn request(controller: &Controller, pixels: RgbImage) -> Res<ImageRequest<Self>>;
 
     /// The wire byte for the protocol's `t` key: the transmission medium.
     ///
@@ -723,6 +744,10 @@ impl Format for Png {
     fn needs_dimensions(self) -> bool {
         false
     }
+    /// Encoded here, then carried inline: the pixels are in the escape itself.
+    fn request(controller: &Controller, pixels: RgbImage) -> Res<ImageRequest<Self>> {
+        controller.new_png(pixels)
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -731,6 +756,14 @@ impl Format for Rgb {
     fn to_cd(self) -> ControlData {
         ControlData('f', 24.to_string())
     }
+    /// Raw pixels have to be declared with the image's own size.
+    fn request(controller: &Controller, pixels: RgbImage) -> Res<ImageRequest<Self>> {
+        let size = ImageSize {
+            width: pixels.width(),
+            height: pixels.height(),
+        };
+        Ok(controller.new_rgb(pixels, size))
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -738,6 +771,22 @@ pub struct Rgba;
 impl Format for Rgba {
     fn to_cd(self) -> ControlData {
         ControlData('f', 32.to_string())
+    }
+    fn request(controller: &Controller, pixels: RgbImage) -> Res<ImageRequest<Self>> {
+        // The alpha channel is not in the caller's buffer, so it is added opaque:
+        // `new_rgba` takes RGBA and every pixel here is fully opaque.
+        let width = pixels.width();
+        let height = pixels.height();
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        for pixel in pixels.pixels() {
+            rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xff]);
+        }
+        let image = image::RgbaImage::from_raw(width, height, rgba)
+            .expect("the buffer is exactly width * height * 4 by construction");
+        Ok(controller.new_rgba(
+            image,
+            ImageSize { width, height },
+        ))
     }
 }
 
@@ -761,6 +810,11 @@ impl Format for Shm {
     }
     fn is_inline(self) -> bool {
         false
+    }
+    /// Staged in a shared memory object: the escape carries the object's name, and
+    /// the terminal maps it rather than decoding anything.
+    fn request(controller: &Controller, pixels: RgbImage) -> Res<ImageRequest<Self>> {
+        controller.new_shm_rgb(pixels)
     }
 }
 

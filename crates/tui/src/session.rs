@@ -14,9 +14,11 @@
 
 use std::sync::Arc;
 
-use easytgp::{Controller, DynImage, PlacementRequest, Png};
+use easytgp::{Controller, DynImage, Format, PlacementRequest};
 use wire::message::Message;
 use wire::transport::Connection;
+
+use crate::DebugOptions;
 
 /// The image id the client's placeholder cells carry, as their foreground colour.
 ///
@@ -40,8 +42,19 @@ pub const PLACEMENT_ID: u32 = 98;
 /// of being wrong is failing a session on a terminal that was merely slow.
 const TRANSMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The frame that is painted when [`DebugOptions::blue_pixel`] is set.
+///
+/// Small and solid, because its whole purpose is to be unmistakable: anything else
+/// on screen is not this, and this cannot be confused with a decoded frame.
+const BLUE: (u32, u32) = (64, 64);
+
 /// What a session knows beyond its link.
-pub struct State {
+///
+/// Generic over the medium, which is fixed when the session is built: a caller that
+/// knows its terminal cannot map a shared memory object picks [`easytgp::Png`], and
+/// one that knows it can picks [`easytgp::Shm`]. Neither pays for the other's
+/// branch, and the choice is a type rather than a flag.
+pub struct State<F: Format> {
     /// The grid the client is drawing into, in cells.
     ///
     /// From the pty, because that is the size the client sees: a pane does not
@@ -49,16 +62,15 @@ pub struct State {
     /// it is the one that made the pty.
     pub cols: u32,
     pub rows: u32,
-    /// The image the client's cells are resolved against.
+    /// The diagnostic switches this session was started with.
+    pub debug: DebugOptions,
+    /// The image the frames are sent under, and the pending operations on it.
     ///
-    /// `None` until the first frame, because an image cannot be created before
-    /// there are pixels for it: the protocol rejects a zero-sized one. Held rather
-    /// than created per frame because its id is what the cells name, and a handle
-    /// is the only thing that knows that id without tracking it separately.
-    ///
-    /// A `DynImage<Png>`, so the pixels travel inside the escape: nothing here
-    /// depends on a shared memory object the terminal has to be able to read.
-    pub image: Option<DynImage<Png>>,
+    /// Kept across frames rather than rebuilt, because it owns the unacknowledged
+    /// transmits and placements: a frame adds to it and `sync` is what waits for
+    /// those to land. `None` until the first frame, since an image cannot be created
+    /// before there are pixels for it.
+    pub image: Option<DynImage<F>>,
     /// Creates image requests, and owns the reply router behind them.
     pub controller: Arc<Controller>,
 }
@@ -69,20 +81,27 @@ pub struct State {
 /// decision is here rather than in the server's loop so the loop stays one
 /// `select!` over several clients instead of a loop that also has to know what a
 /// frame means.
-pub struct Session {
+pub struct Session<F: Format> {
     /// The link. Every session has one, so it is not optional.
     pub connection: Connection,
     /// What has been learned about the client.
-    pub state: State,
+    pub state: State<F>,
 }
 
-impl Session {
-    pub fn new(connection: Connection, cols: u32, rows: u32, controller: Arc<Controller>) -> Self {
+impl<F: Format> Session<F> {
+    pub fn new(
+        connection: Connection,
+        cols: u32,
+        rows: u32,
+        debug: DebugOptions,
+        controller: Arc<Controller>,
+    ) -> Self {
         Self {
             connection,
             state: State {
                 cols,
                 rows,
+                debug,
                 image: None,
                 controller,
             },
@@ -112,32 +131,32 @@ impl Session {
         }
     }
 
-    /// Paint one JPEG frame into this pane.
+    /// Paint one frame into this pane.
     ///
-    /// The bytes are decoded here and re-encoded as PNG, which is what the terminal
-    /// accepts inline: the pixels travel in the escape itself, so nothing depends on
-    /// a shared memory object being readable.
-    ///
-    /// The first frame creates the image and places it, and waits for both: an image
-    /// that is not placed draws nothing. Every later frame replaces the pixels of
-    /// the same image, which keeps whatever references it valid, because the image's
-    /// id is what those references name.
+    /// The frame that arrived is a JPEG, and the terminal does not accept JPEG, so it
+    /// is decoded here and rebuilt as a request in this session's medium. Which
+    /// medium that is is the type parameter, not a runtime choice: [`Format::request`]
+    /// is what turns pixels into a request for it.
     async fn paint(&mut self, jpeg: &[u8]) -> std::io::Result<()> {
-        let decoded = turbojpeg::decompress(jpeg, turbojpeg::PixelFormat::RGB).map_err(|e| {
-            std::io::Error::other(format!("decoding a {} byte frame: {e}", jpeg.len()))
-        })?;
-        let (width, height) = (decoded.width as u32, decoded.height as u32);
-        // The buffer is moved into the image rather than copied out of it: at frame
-        // sizes a copy is the whole frame again.
-        let pixels = image::RgbImage::from_raw(width, height, decoded.pixels).ok_or_else(|| {
-            std::io::Error::other(format!("{width}x{height} does not match the decoded buffer"))
-        })?;
+        let pixels = if self.state.debug.blue_pixel {
+            // The frame is ignored on purpose, so nothing in the wire path, the codec
+            // or the decode is exercised: what appears on screen is attributable to
+            // the encode, the transmit and the placement alone.
+            image::RgbImage::from_pixel(BLUE.0, BLUE.1, image::Rgb([0, 0, 255]))
+        } else {
+            let decoded = turbojpeg::decompress(jpeg, turbojpeg::PixelFormat::RGB).map_err(|e| {
+                std::io::Error::other(format!("decoding a {} byte frame: {e}", jpeg.len()))
+            })?;
+            let (width, height) = (decoded.width as u32, decoded.height as u32);
+            // The buffer is moved into the image rather than copied out of it: at
+            // frame sizes a copy is the whole frame again.
+            image::RgbImage::from_raw(width, height, decoded.pixels).ok_or_else(|| {
+                std::io::Error::other(format!("{width}x{height} does not match the decoded buffer"))
+            })?
+        };
 
-        let request = self
-            .state
-            .controller
-            .new_png(pixels)
-            .map_err(|e| std::io::Error::other(format!("encoding a frame: {e}")))?;
+        let request = F::request(&self.state.controller, pixels)
+            .map_err(|e| std::io::Error::other(format!("building a frame request: {e}")))?;
 
         // Timed, because this is the one await in the program that a terminal can
         // leave hanging: the acknowledgement it waits for is a reply a terminal may
@@ -167,6 +186,10 @@ impl Session {
             cols: Some(self.state.cols),
             rows: Some(self.state.rows),
             placement_id: Some(PLACEMENT_ID),
+            // The design's placement is virtual: a prototype with no position of its
+            // own, which the client's placeholder cells resolve against. A real one
+            // draws at the cursor with no help from that text, which is the experiment.
+            virtual_placement: !self.state.debug.no_vplacement,
             ..Default::default()
         });
         // Waited on: until the placement lands nothing is on screen, so a frame that
@@ -265,20 +288,19 @@ mod tests {
         accepted.expect("accept")
     }
 
-    /// A first frame creates the image and the virtual placement; a later one does not.
+    /// Every frame is transmitted under one id, and placed again.
     ///
     /// Both halves are one test because the escape destination is global to the
     /// process and can only be set once: two tests would race for it, and whichever
     /// lost would observe an empty terminal rather than a wrong painting. The
     /// behaviour under test is a sequence anyway — first frame, then next.
     ///
-    /// The first frame is the one that matters. The cells the client drew are on
-    /// screen before any frame arrives, so an image that does not exist yet draws
-    /// nothing; this is what makes the placeholders resolve. Every frame after it is
-    /// one command under the same id, which keeps the cells valid, because the id
-    /// lives in their colour.
+    /// The re-placement is the point rather than a detail. A transmit under an id the
+    /// terminal already has **frees that image's placements**, so a session that places
+    /// only its first frame shows one picture and then a blank pane. What is asserted
+    /// here is that the second frame carries its own placement, under the same id.
     #[tokio::test]
-    async fn a_first_frame_creates_the_image_and_a_later_one_does_not_re_place_it() {
+    async fn every_frame_reuses_one_id_and_places_itself_again() {
         let written = Arc::new(Mutex::new(Vec::new()));
         let (keys, keys_writer) = std::io::pipe().expect("a pipe for the input");
         let terminal = Terminal {
@@ -292,7 +314,13 @@ mod tests {
         );
 
         let dir = std::env::temp_dir().join(format!("tui-session-{}", std::process::id()));
-        let mut session = Session::new(connection(&dir).await, 120, 40, controller);
+        let mut session = Session::<easytgp::Shm>::new(
+            connection(&dir).await,
+            120,
+            40,
+            DebugOptions::default(),
+            controller,
+        );
         session
             .handle_msg(Message::Frame(jpeg(8, 8)))
             .await
@@ -320,10 +348,18 @@ mod tests {
 
         let all = written.lock().unwrap().clone();
         let second = String::from_utf8(all[after_first..].to_vec()).expect("escapes are text");
+        // The same id, so the client's cells keep naming the image that is being
+        // updated -- and a placement, because the terminal freed the previous one when
+        // this image was transmitted over. Without the second placement the pane is
+        // blank from here on, which is the failure this asserts against.
         assert!(second.contains("i=99"), "the same id: {second:?}");
         assert!(
-            !second.contains("a=p"),
-            "a placement is not remade per frame: {second:?}"
+            second.contains("a=p"),
+            "a later frame places itself again: {second:?}"
+        );
+        assert!(
+            second.contains("p=98"),
+            "under the same placement id: {second:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
