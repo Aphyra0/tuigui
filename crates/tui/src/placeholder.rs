@@ -103,12 +103,22 @@ impl Placeholders {
                 }
             }
 
-            match std::str::from_utf8(&input[i..]) {
+            // Text is taken only up to the next escape, never to the end of the
+            // buffer. An `ESC` is valid UTF-8, so a decode of everything that follows
+            // succeeds and every later escape is handled as ordinary characters --
+            // which means only the first cursor move in a read is ever seen, and every
+            // row after it is drawn with the row it started on.
+            let end = match input[i..].iter().position(|&b| b == 0x1b) {
+                Some(at) => i + at,
+                None => input.len(),
+            };
+
+            match std::str::from_utf8(&input[i..end]) {
                 Ok(text) => {
                     for ch in text.chars() {
                         self.cell(ch, &mut out);
                     }
-                    i = input.len();
+                    i = end;
                 }
                 Err(e) => {
                     let valid = e.valid_up_to();
@@ -120,9 +130,15 @@ impl Placeholders {
                         }
                         i += valid;
                     }
-                    // The rest is a character cut off mid-sequence, so it waits.
-                    self.carry.extend_from_slice(&input[i..]);
-                    return out;
+                    if end == input.len() {
+                        // A character cut off by the end of the read: it waits for the
+                        // bytes that complete it.
+                        self.carry.extend_from_slice(&input[i..]);
+                        return out;
+                    }
+                    // Malformed bytes with an escape after them: they cannot be text,
+                    // and skipping them is what makes progress.
+                    i = end;
                 }
             }
         }
@@ -432,6 +448,25 @@ mod tests {
         let out = once("\x1b[2;1H❋");
         let after = out.split('\u{10eeee}').nth(1).expect("a placeholder");
         assert!(after.starts_with('\u{030d}'), "{after:?}");
+    }
+
+    /// Every cursor move in a read is seen, not only the first.
+    ///
+    /// This is what a drawn screen actually looks like: a move per row, and a fill for
+    /// that row. An `ESC` is valid UTF-8, so decoding everything after the first move
+    /// succeeds and treats the remaining moves as ordinary characters — which leaves the
+    /// row stuck at whatever the first move set, and draws every row as the first one.
+    /// The picture on screen is then a correct horizontal line, repeated down the pane.
+    #[test]
+    fn each_rows_move_sets_that_rows_diacritic() {
+        let out = once("\x1b[1;1H❋\x1b[2;1H❋\x1b[3;1H❋");
+        let rows: Vec<char> = out
+            .split('\u{10eeee}')
+            .skip(1)
+            .map(|cell| cell.chars().next().expect("a row diacritic"))
+            .collect();
+        // Rows 1, 2 and 3: `U+0305`, `U+030D`, `U+030E`.
+        assert_eq!(rows, vec!['\u{0305}', '\u{030d}', '\u{030e}'], "{out:?}");
     }
 
     /// A character split across two reads still becomes one placeholder.
