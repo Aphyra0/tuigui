@@ -26,6 +26,11 @@ pub struct Pty {
     proxy: Proxy,
     /// The command, so its exit can be waited on.
     child: Child,
+    /// One more handle to the master, for setting the grid on a resize.
+    ///
+    /// The proxy holds the only other two, inside its threads, and this is the fd the
+    /// `TIOCSWINSZ` ioctl needs. A `dup`, so it is the same pty.
+    resizable: std::fs::File,
     /// The grid the pty was created with, in cells.
     ///
     /// Read from this terminal rather than inherited by the command, and kept here so a
@@ -74,6 +79,11 @@ impl Pty {
 
         let child = exec(command, &slave)?;
 
+        // A third handle, kept out of the proxy, so the size can be set again later.
+        // `tcsetwinsize` is an ioctl on the pty's fd, and the two clones below are moved into
+        // the proxy's threads; without one held here a resize would have nothing to write to.
+        let resizable = master.try_clone()?;
+
         // The master twice: one handle is written for the command's input, the
         // other read for its output. A pty master is a single stream, so the two
         // directions cannot share one handle without one of them consuming the
@@ -98,6 +108,7 @@ impl Pty {
         Ok(Self {
             proxy,
             child,
+            resizable,
             cols: ws.ws_col as u32,
             rows: ws.ws_row as u32,
             bytes,
@@ -123,9 +134,10 @@ impl Pty {
 
     /// Forward bytes until the command exits. Blocks.
     ///
-    /// Two things can end this half, so both are waited on: the command exiting,
-    /// which is the end of the session, and the byte pump ending, which is the pty
-    /// closing. Whichever happens first is it.
+    /// Three things can end this half, so all are waited on: the command exiting, which is
+    /// the end of the session; the byte pump ending, which is the pty closing; and a resize
+    /// of the real terminal, which does not end anything but has to be acted on here because
+    /// this is where the pty's fd is.
     ///
     /// The pump itself runs on a blocking thread. It is raw fd IO with no await
     /// points, so the runtime has nothing to schedule; the thread is what keeps a
@@ -137,23 +149,79 @@ impl Pty {
         let Pty {
             proxy,
             mut child,
+            resizable,
             ..
         } = self;
-        let forwarded = tokio::task::spawn_blocking(move || proxy.run());
-        tokio::select! {
-            status = child.wait() => {
-                let status = status?;
-                if !status.success() {
-                    eprintln!("tui: command exited with {status}");
+        // Pinned as it is made, because the pump is awaited in a loop rather than once: a
+        // `select!` arm takes its future by value, and this one has to survive the passes a
+        // resize causes. `spawn_blocking`'s handle is cancel-safe, so a pass the resize wins
+        // leaves the pump running where it was.
+        let mut forwarded = std::pin::pin!(tokio::task::spawn_blocking(move || proxy.run()));
+
+        // The real terminal tells us it changed size by signalling, not by sending bytes, so
+        // this is a signal stream and not something the proxy's read loop could see: a
+        // signal is delivered to the process, and the proxy is a blocking thread on the far
+        // side of the runtime with no way to wait for one.
+        //
+        // `SIGWINCH` is ignored by default, so asking for it does not disturb anything that
+        // was not going to happen anyway, and the registry installs its handler with
+        // `SA_RESTART` — so the proxy's blocking reads resume rather than failing with
+        // `EINTR` every time the window moves.
+        let mut resized = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
+
+        loop {
+            tokio::select! {
+                status = child.wait() => {
+                    let status = status?;
+                    if !status.success() {
+                        eprintln!("tui: command exited with {status}");
+                    }
+                    return Ok(());
                 }
-                Ok(())
+                // A panicked blocking task is a failure to report, not a session that
+                // simply ended.
+                ended = &mut forwarded => {
+                    return match ended {
+                        Ok(result) => result,
+                        Err(e) => Err(io::Error::other(format!("the byte pump failed: {e}"))),
+                    };
+                }
+                // The terminal was resized. The child's pty still has the old grid, so the
+                // command keeps drawing for a screen that is no longer the right shape until
+                // it is told — which for a full-screen program means it lays itself out
+                // against the wrong size.
+                _ = resized.recv() => {
+                    // Read from this process's stdin, the same source the initial size came
+                    // from: that is the terminal the user actually resized.
+                    if let Ok(ws) = rustix::termios::tcgetwinsize(io::stdin()) {
+                        if let Err(e) = rustix::termios::tcsetwinsize(&resizable, ws) {
+                            eprintln!("tui: could not tell the command its new size: {e}");
+                        }
+                        // The size is in the kernel now, but a full-screen program only
+                        // notices by being signalled — the same `SIGWINCH` the terminal sent
+                        // us is what it does not receive, because it is on a pty of its own.
+                        // A pid is always positive and fits an `i32`, which is what
+                        // `from_raw` takes; `and_then` keeps the failure visible instead of
+                        // inventing a pid that would signal an unrelated process.
+                        let pid = child
+                            .id()
+                            .and_then(|id| i32::try_from(id).ok())
+                            .and_then(rustix::process::Pid::from_raw);
+                        match pid {
+                            Some(pid) => {
+                                if let Err(e) = rustix::process::kill_process(
+                                    pid,
+                                    rustix::process::Signal::WINCH,
+                                ) {
+                                    eprintln!("tui: could not signal the command: {e}");
+                                }
+                            }
+                            // Already reaped, or a pid that cannot exist: nothing to resize.
+                            None => {}
+                        }
+                    }
+                }
             }
-            // A panicked blocking task is a failure to report, not a session that
-            // simply ended.
-            ended = forwarded => match ended {
-                Ok(result) => result,
-                Err(e) => Err(io::Error::other(format!("the byte pump failed: {e}"))),
-            },
         }
     }
 }

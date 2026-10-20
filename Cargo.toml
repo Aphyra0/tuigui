@@ -37,7 +37,9 @@ derive-getters = "0.5"
 smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend", "renderer_pixman", "desktop", "xwayland"] }
 wayland-protocols = { version = "0.32", features = ["client"] }
 tracing = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "process", "sync", "time", "macros"] }
+# `signal` for SIGWINCH: the real terminal reports a resize by signalling, not by sending
+# bytes, and the pty the command runs on has to be told the new size.
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "process", "sync", "time", "macros", "signal"] }
 # Retry, for the one message that must arrive: the report that something else failed. Chosen
 # over `tokio-retry` because its handler sees each error, so an error that is plainly
 # permanent can be passed on instead of retried.
