@@ -32,6 +32,10 @@ impl Raw {
     /// Reads the termios from `io::stdin()`: this is the terminal the process is
     /// attached to, which is the one whose line discipline would otherwise mangle
     /// the bytes on their way through.
+    ///
+    /// Nothing here touches the *terminal's* modes (`?7` autowrap and the like), which
+    /// live outside the tty and cannot be read back. Setting `?7l` was tried and did not
+    /// change the drift; see `spec/DRIFT.md` for what that leaves.
     pub fn install() -> io::Result<Self> {
         let stdin = io::stdin();
         let original = rustix::termios::tcgetattr(&stdin)?;
