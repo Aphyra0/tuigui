@@ -31,12 +31,15 @@ ndarray = "0.16"
 ratatui = "0.30"
 pollster = "0.4"
 fxhash = "0.2"
-crossterm = { version = "0.28", default-features = false }
+crossterm = { version = "0.28", default-features = false, features = ["events"] }
 derive_deref = "1.1"
 derive-getters = "0.5"
 smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend", "renderer_pixman", "desktop", "xwayland"] }
 wayland-protocols = { version = "0.32", features = ["client"] }
 tracing = "0.1"
+# The logging facade. A binary installs its own capturer, so which crate records a
+# diagnostic is not the same decision as where it ends up.
+log = "0.4"
 # `signal` for SIGWINCH: the real terminal reports a resize by signalling, not by sending
 # bytes, and the pty the command runs on has to be told the new size.
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "process", "sync", "time", "macros", "signal"] }

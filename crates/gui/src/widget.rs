@@ -1,132 +1,172 @@
-//! What the client draws.
+//! The pane the client draws, and the session it draws from.
+//!
+//! ```text
+//!   widget.rs          this: the widget, the Session, and the fixed sockets
+//!   widget/state.rs    where the session is, and the steps that move it along
+//!   widget/popup.rs    what is open over it
+//! ```
+
+mod popup;
+mod state;
+
+pub use popup::PopupState;
+pub use state::State;
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::widgets::Widget;
+use ratatui::text::Line;
+use ratatui::widgets::{Paragraph, StatefulWidget, Widget as _};
 
-/// Fills its area with a colour and, in the middle, what this side knows.
+/// What the session holds while a step is running.
 ///
-/// The colour is the state of the handshake, which is the one thing the client
-/// knows before anything else works. The text says the same thing in words: the
-/// advert it announced while waiting, and the server's label once accepted. A
-/// blank pane and a broken one look the same, so neither state is allowed to be
-/// empty.
+/// A step consumes the state it is given, so there has to be something in the session's
+/// place for as long as it takes. This is that something, and it is a failure rather than
+/// a state: if it is ever drawn, a step did not return the state it moved to, which is a
+/// bug and reads as one.
+const INTERNAL_ERROR: &str = "internal error: a step did not return its state";
+
+/// The ways a session can be reached.
+///
+/// One per transport: what the client can dial, in the order the list offers them. Only
+/// the first is built, and the rest are named here anyway so the choice a user is making is
+/// visible as a choice rather than as a single button.
+pub const CONNECTIONS: [&str; 4] = [
+    "Unix Socket",
+    "SSH Socket",
+    "Peer to Peer",
+    "Reverse SSH",
+];
+
+/// The socket a Unix Socket session dials.
+///
+/// One fixed name, so a user and a server can both write it down without a scan, and it is
+/// the server's to bind.
+///
+/// Under `XDG_RUNTIME_DIR` and not `/tmp`: a socket in `/tmp` is reachable by every user on
+/// the machine, and this is the platform's directory for exactly this.
+pub fn socket_path() -> std::path::PathBuf {
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    std::path::Path::new(&dir).join("tuigui.sock")
+}
+
+/// The picture's anchor, filled across the display area.
+///
+/// The server replaces every one of these with an image placeholder, so the fill is not
+/// decoration: it is the address of the picture, and this is the only thing the terminal
+/// has to be told for the image to have somewhere to be.
+pub const FILL: char = '❋';
+
+/// One session: where it is, and what is open over it.
 pub struct Session {
-    /// Whether the server has answered.
+    /// Where the session is, or what went wrong getting there.
     ///
-    /// A separate field from the text rather than inferred from it: which state
-    /// the session is in and what is drawn are different facts, and a widget that
-    /// derived one from the other could not show anything while waiting.
-    established: bool,
-    /// What to draw, one entry per line.
-    lines: Vec<String>,
-    /// Tiled over the whole area instead of `lines`, when set.
+    /// A `Result` and not a state, because a step consumes the state it is given: there
+    /// has to be something in its place while the step runs, and a failure is the only
+    /// honest thing to put there. A step that never returns its next state leaves the
+    /// failure behind, and the pane shows it.
+    pub state: Result<State, String>,
+    /// What is open over it.
+    pub popup_state: PopupState,
+    /// The buttons along the bottom.
+    pub footer: Footer,
+    /// The program to run, once a socket has been dialed.
+    pub program: std::path::PathBuf,
+    /// The compositor's output size, which is also the program's window size.
     ///
-    /// A character rather than a string: the point of a fill is that it repeats,
-    /// and one field cannot disagree with itself about how many there are.
-    fill: Option<char>,
+    /// Fixed when the session starts: the compositor's output being the window is what
+    /// the MVP fixes, so this is read once and reused for every later step.
+    pub size: (u32, u32),
 }
 
 impl Session {
-    /// Nothing heard yet: the client is waiting to be found, and shows the advert
-    /// it is waiting on.
-    ///
-    /// Showing the advert is not decoration. A client that cannot be dialed is
-    /// stuck in this state and can say exactly why: the address it announced is on
-    /// the screen, and a server that never dialed it is a server that never read
-    /// it.
-    pub fn waiting(advert: &str) -> Self {
+    pub fn new(program: std::path::PathBuf, size: (u32, u32)) -> Self {
         Self {
-            established: false,
-            lines: advert.lines().map(str::to_string).collect(),
-            fill: None,
+            state: Ok(State::ConnSelect),
+            popup_state: PopupState::None,
+            footer: Footer,
+            program,
+            size,
         }
     }
 
-    /// The server accepted this client and named the link.
-    pub fn established(label: String) -> Self {
-        Self {
-            established: true,
-            lines: vec![label],
-            fill: None,
-        }
-    }
-
-    /// Established, and tiled edge to edge with `fill`.
-    ///
-    /// A separate constructor from [`Session::established`] because the text and
-    /// the fill answer different questions: the label says which link this is,
-    /// the fill is proof the pane is being painted at all. Filling over the label
-    /// would throw away the first to show the second.
-    pub fn filled(fill: char) -> Self {
-        Self {
-            established: true,
-            lines: vec![],
-            fill: Some(fill),
+    /// Whether the session has ended.
+    pub fn done(&self) -> bool {
+        match &self.state {
+            // Failed, or finished: either way there is nothing left to do.
+            Err(_) => true,
+            Ok(state) => state.done(),
         }
     }
 }
 
-impl Widget for Session {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let background = if self.established {
-            // Accepted: green, the answer the user is looking for.
-            GREEN
-        } else {
-            // Waiting: a colour that cannot be mistaken for success.
-            PINK
-        };
-        buf.set_style(area, Style::new().bg(background));
+/// The client itself: a widget over [`Session`].
+pub struct GuiWidget;
 
-        // A fill is drawn instead of the lines, never over them: `filled` carries
-        // no lines to lose, and this keeps the two paths from both writing a cell.
-        if let Some(fill) = self.fill {
-            for y in area.y..area.y.saturating_add(area.height) {
-                for x in area.x..area.x.saturating_add(area.width) {
-                    // Every cell, including the ones past the last column of a row:
-                    // the point is a pane with no gaps in it, and skipping cells is
-                    // how the background shows through.
-                    if let Some(cell) = buf.cell_mut((x, y)) {
-                        cell.set_char(fill);
-                    }
-                }
-            }
-            return;
+impl StatefulWidget for GuiWidget {
+    type State = Session;
+
+    fn render(self, area: Rect, buf: &mut Buffer, session: &mut Session) {
+        // The bottom line holds the buttons, and the rest belongs to the session. Split
+        // once, so the state and the buttons agree about where the content ends.
+        let [content, footer] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+
+        // Where the session is may change because of drawing this frame: the async step is
+        // driven here, and it draws itself where it stands.
+        //
+        // The state is taken out and the result put back, which is why the session holds a
+        // `Result`: what goes in its place while the step runs is the failure a state that
+        // never comes back deserves, and a step that does not return leaves exactly that
+        // on screen for the next frame to draw.
+        let taken = std::mem::replace(&mut session.state, Err(INTERNAL_ERROR.to_string()));
+        session.state = taken.and_then(|state| {
+            pollster::block_on(state.render(content, buf, &session.program, session.size))
+        });
+
+        // Whether the step failed just now or failed on an earlier frame, the pane says
+        // why. This is the one place a failure is drawn: a step hands its failure back
+        // rather than drawing it, because the pane is this widget's and not the step's.
+        //
+        // Cleared first, because centred text only writes the cells it sits on: whatever
+        // the frame before this one drew — the advert, "connecting to ..." — would still be
+        // there around it, and two states' words on one screen read as neither.
+        if let Err(message) = &session.state {
+            log::error!("{message}");
+            ratatui::widgets::Clear.render(content, buf);
+            buf.set_style(content, Style::new().bg(Color::Rgb(0x40, 0, 0)));
+            let lines: Vec<Line> = std::iter::once(Line::from("the session failed"))
+                .chain(message.lines().map(Line::from))
+                .collect();
+            Paragraph::new(lines).centered().render(content, buf);
         }
 
-        // Centred as a block: off-centre text in a full-screen fill reads as an
-        // accident rather than an answer. Clipped rather than wrapped, so a narrow
-        // pane shows a prefix instead of pushing text out of the area.
-        let width = area.width as usize;
-        let height = area.height as usize;
-        let first = area.y + (height.saturating_sub(self.lines.len()) / 2) as u16;
-        for (row, line) in self.lines.iter().enumerate() {
-            let row = first + row as u16;
-            if row >= area.y + area.height {
-                // More lines than the pane has rows. Drawing past the area would
-                // land on whatever is next to it.
-                break;
-            }
-            let line = clip(line, width);
-            let x = area.x + ((width - line.chars().count()) / 2) as u16;
-            buf.set_string(x, row, line, Style::new());
-        }
+        // The footer, then the panel over the session, never instead of it.
+        session.footer.render(footer, buf, session.popup_state);
+        session.popup_state.render(content, buf);
     }
 }
 
-/// The longest prefix of `text` that fits in `width` columns.
+/// The line of buttons along the bottom.
 ///
-/// By characters, not bytes: an advert can carry any text, and slicing at a byte
-/// offset would panic in the middle of a multi-byte one.
-fn clip(text: &str, width: usize) -> &str {
-    match text.char_indices().nth(width) {
-        Some((cut, _)) => &text[..cut],
-        None => text,
+/// Its own struct with a `render` rather than a loop inside the widget, because this line
+/// is the one part of the pane that is the same in every state: what pressing one into
+/// opens is a panel, which is not the session's business.
+pub struct Footer;
+
+impl Footer {
+    /// Draw the buttons on `area`, marking whichever panel is open.
+    pub fn render(&mut self, area: Rect, buf: &mut Buffer, open: PopupState) {
+        buf.set_style(area, Style::new().bg(Color::Rgb(0x28, 0x28, 0x28)));
+        let mut x = 1u16;
+        for (index, label) in popup::BUTTONS.iter().enumerate() {
+            let style = if open.is_open_for(index) {
+                Style::new().fg(Color::Black).bg(Color::Rgb(0xff, 0x69, 0xb4))
+            } else {
+                Style::new().fg(Color::Gray)
+            };
+            buf.set_string(area.x + x, area.y, format!(" {label} "), style);
+            x += label.len() as u16 + 3;
+        }
     }
 }
-
-/// Hot pink, as the one thing on screen that cannot be a coincidence.
-const PINK: Color = Color::Rgb(0xff, 0x69, 0xb4);
-/// The colour of an accepted session.
-const GREEN: Color = Color::Rgb(0x27, 0xae, 0x60);

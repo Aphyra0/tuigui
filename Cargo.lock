@@ -549,8 +549,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
 dependencies = [
  "bitflags 2.13.2",
+ "mio",
  "parking_lot",
  "rustix 0.38.44",
+ "signal-hook",
+ "signal-hook-mio",
 ]
 
 [[package]]
@@ -1160,6 +1163,9 @@ dependencies = [
  "crossterm 0.28.1",
  "easytgp",
  "ffmpeg-sidecar",
+ "futures",
+ "log",
+ "pollster",
  "ratatui",
  "rustix 1.1.5",
  "tokio",
@@ -1960,6 +1966,12 @@ dependencies = [
  "rustix 1.1.5",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "pollster"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
 
 [[package]]
 name = "portable-atomic"
