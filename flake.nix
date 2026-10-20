@@ -104,10 +104,13 @@
             buildInputs = with pkgs; [
               wayland
               wayland-protocols
-              # system libs the comp crate (in-process smithay compositor)
+              # system libs the compositor crate (in-process smithay head)
               # links against: pixman renderer + xkbcommon keymaps
               pixman
               libxkbcommon
+              # X11 apps run through this, since it is what the compositor
+              # spawns to serve them; without it a session is Wayland-only.
+              xwayland
               # SIMD JPEG encoding for the streaming client. Nix's build already
               # has the SIMD kernels, so it is linked via pkg-config rather than
               # compiled from source: no cmake or nasm needed.
@@ -160,17 +163,22 @@
               pkgs.wayland
               pkgs.wayland-protocols
               pkgs.wayland-scanner
-              # libs the comp crate (in-process smithay compositor) links against
+              # libs the compositor crate (in-process smithay head) links against
               pkgs.pixman
               pkgs.libxkbcommon
+              # X11 apps: the compositor spawns this to serve them, so an X11-only
+              # app (xeyes, glxgears) can be run in a session.
+              pkgs.xwayland
               # SIMD JPEG encoding: linked against Nix's libjpeg-turbo, so it
               # only needs to be on the linker/pkg-config path.
               pkgs.libjpeg_turbo
               # demo apps to stream + TGP test terminals
               pkgs.foot
               pkgs.kitty
-              # wayland-native demo clients (weston-flower, weston-editor,
-              # weston-smoke, weston-terminal, ...) for streaming tests
+              # wayland-native demo clients for streaming tests. Note that the
+              # EGL ones (weston-flower, weston-terminal) render through
+              # dma-buf, which the compositor's shm-only capture cannot read, so
+              # they capture black; the shm clients and `foot` do not.
               pkgs.weston
               # video decode for the `--video` streaming path (bypasses wayland)
               pkgs.ffmpeg

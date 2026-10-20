@@ -39,7 +39,45 @@ use wire::message::Message;
 use wire::transport::{Connection, Transport};
 use wire::unix::UnixSocket;
 
+// First, and with `macro_use`, because `eprln!` is defined here: a module that uses the
+// macro has to be declared after the one that introduces it.
+#[macro_use]
+mod log;
+mod compositor;
 mod widget;
+
+/// The size of this terminal in pixels, for the compositor's output.
+///
+/// An app run under a compositor is configured with a window size in pixels, and the
+/// only honest source for it is the terminal's own cell geometry: the pane's grid is
+/// what the picture is finally fitted to, so an output sized to it is one the app lays
+/// itself out against correctly.
+///
+/// The pixel fields of a terminal's window size are documented as unreliable and often
+/// zero (they are a property of the graphics layer, not the tty), so a terminal that
+/// does not report them is not an error: [`DEFAULT_CELL`] is then used, which is the
+/// fallback every program that needs a cell size in pixels uses. That is an assumption,
+/// and it is stated rather than hidden, because a terminal that does report them gets
+/// its real geometry.
+fn output_size() -> std::io::Result<(u32, u32)> {
+    let ws = ratatui::crossterm::terminal::window_size()?;
+    let (cols, rows) = (ws.columns as u32, ws.rows as u32);
+    let (cell_w, cell_h) = match (ws.width, ws.height) {
+        (w, h) if w > 0 && h > 0 => (
+            (w as u32 / cols.max(1)).max(1),
+            (h as u32 / rows.max(1)).max(1),
+        ),
+        _ => DEFAULT_CELL,
+    };
+    Ok((cols.max(1) * cell_w, rows.max(1) * cell_h))
+}
+
+/// The cell size assumed when the terminal does not report one, in pixels.
+///
+/// Standard for a monospace face at the sizes terminals ship with, and it only has to
+/// be close: the compositor's output is what the app lays out against, and the terminal
+/// fits the resulting picture to the same cell grid either way.
+const DEFAULT_CELL: (u32, u32) = (10, 20);
 
 /// Where this client listens when nothing else is asked for.
 ///
@@ -53,6 +91,40 @@ mod widget;
 fn socket_path() -> std::path::PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
     std::path::Path::new(&dir).join(format!("tuigui-{}.sock", std::process::id()))
+}
+
+/// What kind of runnable a path names.
+///
+/// The distinction is by extension and by nothing else, because that is all the
+/// command line carries: `gui clip.mp4` and `gui /usr/bin/foot` are the same shape of
+/// argument, and what to *do* with them is the only thing that differs. Reading it
+/// here, once, is what keeps the two paths from each having to decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Runnable {
+    /// A clip, decoded with ffmpeg.
+    Video,
+    /// A program, run inside a compositor of our own and captured frame by frame.
+    App,
+}
+
+impl Runnable {
+    /// Classify `path`.
+    ///
+    /// Only the `.mp4` extension counts as a clip, case-insensitively. Everything else
+    /// is a program, which is the safe default: an unrecognized path is far more likely
+    /// to be a binary than an exotic video container, and running a binary is what this
+    /// command is for.
+    pub fn classify(path: &std::path::Path) -> Self {
+        let is_mp4 = path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"));
+        if is_mp4 {
+            Runnable::Video
+        } else {
+            Runnable::App
+        }
+    }
 }
 
 /// A runnable to stream into this pane.
@@ -103,13 +175,9 @@ impl Gui {
     /// is `async` with no runtime of its own.
     pub async fn run(
         self,
-        _stdin: impl Read + Send + 'static,
+        stdin: impl Read + Send + 'static,
         stdout: impl Write + Send + 'static,
     ) -> std::io::Result<()> {
-        // Read from `self.path` when the pane is tiled: what the runnable produces is decoded
-        // there, and nothing about it is needed until the grid it is drawn into exists.
-        let _ = &self.path;
-
         // Drawn to the writer the caller gave, not to `io::stdout()`: the caller is what
         // knows where this pane's screen is, and writing to the process's own stdout would
         // ignore it.
@@ -145,14 +213,22 @@ impl Gui {
         // keeps saying which address it is waiting on. The wait answers the server's
         // greeting, so what comes back is a link that is established.
         let connection = socket.accept().await?;
-        draw_until_ended(
+        // Whatever the session did is logged rather than drawn, since the pane above it is
+        // a picture and text written into it is never seen. The log is the record; this
+        // only makes sure the failure is in it.
+        let outcome = draw_until_ended(
             &mut terminal,
             connection,
             announcement,
             &self.path,
-            self.debug.loop_video,
+            stdin,
+            self.debug,
         )
-        .await
+        .await;
+        if let Err(e) = &outcome {
+            eprln!("gui: {e}");
+        }
+        outcome
     }
 }
 
@@ -180,7 +256,8 @@ async fn draw_until_ended(
     connection: Connection,
     announcement: String,
     path: &std::path::Path,
-    loop_video: bool,
+    stdin: impl Read + Send + 'static,
+    debug: DebugOptions,
 ) -> std::io::Result<()> {
     // Green, and named with what this client announced: the one thing the user is waiting to
     // see, and the proof that this pane is talking to the session it thinks.
@@ -197,17 +274,32 @@ async fn draw_until_ended(
     tokio::time::sleep(Duration::from_secs(1)).await;
     terminal.draw(|frame| frame.render_widget(widget::Session::filled(FILL), frame.area()))?;
 
-    // Decoding starts only now: the fill has been drawn and forwarded, so the server has the
+    // Frames start only now: the fill has been drawn and forwarded, so the server has the
     // grid it needs to create the image under. A frame sent before that would name an image
     // the terminal does not have, and the frame would be lost.
-    let mut frames = decode(path, loop_video)?;
+    let mut frames = match Runnable::classify(path) {
+        // A clip is decoded from the file.
+        Runnable::Video => decode(path, debug.loop_video)?,
+        // A program runs in a compositor of our own, and this client's keyboard goes to
+        // it. `_stdin` is that keyboard: the pane's input is this process's, which is
+        // where the caller's reader comes from.
+        Runnable::App => compositor::capture(path, output_size()?, stdin)?,
+    };
 
     loop {
         tokio::select! {
-            // A decoded frame, on its way to the server as the wire codec's bytes. A closed
-            // channel means the runnable ended, which is not the end of the session: the pane
-            // keeps its last frame, and the link stays up until the server closes it.
-            Some(jpeg) = frames.recv() => connection.send(&Message::Frame(jpeg)).await?,
+            // A decoded frame, on its way to the server as the wire codec's bytes.
+            frame = frames.recv() => match frame {
+                Some(jpeg) => connection.send(&Message::Frame(jpeg)).await?,
+                // The runnable ended: a clip that finished, or a program that exited
+                // (including one that could not start at all). The session ends with it,
+                // because there is nothing left to draw and no reason to keep the pane
+                // open. This has to be an explicit arm: a pattern of `Some(jpeg)` would
+                // simply stop matching when the channel closed, leaving only the other
+                // arm, and a server that sends nothing backs would leave the client
+                // blocked forever with a frozen pane.
+                None => return Ok(()),
+            },
             received = connection.recv() => match received? {
                 // The server reports what *this* client asked for and failed, so this side is
                 // the one that should stop.
@@ -259,14 +351,14 @@ fn decode(
             let mut child = match command.rawvideo().spawn() {
                 Ok(child) => child,
                 Err(e) => {
-                    eprintln!("gui: could not start ffmpeg on {}: {e}", path.display());
+                    eprln!("gui: could not start ffmpeg on {}: {e}", path.display());
                     return;
                 }
             };
             let events = match child.iter() {
                 Ok(events) => events,
                 Err(e) => {
-                    eprintln!("gui: could not read ffmpeg's output: {e}");
+                    eprln!("gui: could not read ffmpeg's output: {e}");
                     return;
                 }
             };
@@ -274,12 +366,12 @@ fn decode(
             let mut encoder = match turbojpeg::Compressor::new() {
                 Ok(encoder) => encoder,
                 Err(e) => {
-                    eprintln!("gui: no JPEG encoder available: {e}");
+                    eprln!("gui: no JPEG encoder available: {e}");
                     return;
                 }
             };
             if let Err(e) = encoder.set_quality(QUALITY) {
-                eprintln!("gui: the encoder refused quality {QUALITY}: {e}");
+                eprln!("gui: the encoder refused quality {QUALITY}: {e}");
                 return;
             }
 
@@ -297,7 +389,7 @@ fn decode(
                 let jpeg = match jpeg {
                     Ok(jpeg) => jpeg,
                     Err(e) => {
-                        eprintln!("gui: dropped a {width}x{height} frame: {e}");
+                        eprln!("gui: dropped a {width}x{height} frame: {e}");
                         continue;
                     }
                 };
@@ -319,3 +411,49 @@ fn decode(
 /// JPEG quality. The pixels are on their way to a pane, where they are fitted to a grid of
 /// cells, so this buys legibility rather than fidelity.
 const QUALITY: i32 = 80;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The extension is the whole decision, so this pins what counts as an extension.
+    #[test]
+    fn only_mp4_is_a_clip() {
+        for clip in ["a.mp4", "a.MP4", "/tmp/b.Mp4", "./dir/c.mp4"] {
+            assert_eq!(
+                Runnable::classify(std::path::Path::new(clip)),
+                Runnable::Video,
+                "{clip} should be decoded as a clip"
+            );
+        }
+        for app in [
+            "/usr/bin/foot",
+            "firefox",
+            "a.mkv",
+            "a.mp4.txt",
+            "mp4",
+            "a.mp",
+            "/tmp/no-extension",
+        ] {
+            assert_eq!(
+                Runnable::classify(std::path::Path::new(app)),
+                Runnable::App,
+                "{app} should be run as a program"
+            );
+        }
+    }
+
+    /// The extension is read the way `Path` reads it, trailing separators and all.
+    ///
+    /// Pinned because it is the one case where the *name* looks like a clip and the
+    /// classification is not what a string split would give: `a.mp4/` names a directory
+    /// (`Path::extension` drops the trailing slash), and it is classified as a clip,
+    /// which is what a caller who wrote a directory named after a clip asked for.
+    #[test]
+    fn a_trailing_separator_does_not_hide_the_extension() {
+        assert_eq!(
+            Runnable::classify(std::path::Path::new("a.mp4/")),
+            Runnable::Video
+        );
+    }
+}

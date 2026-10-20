@@ -9,6 +9,10 @@ description = "Client side: draw a runnable's output into the pane the tui serve
 wire = { workspace = true }
 easytgp = { workspace = true }
 ratatui = { workspace = true }
+# Reading this terminal's size in pixels, for the compositor's output.
+crossterm = { workspace = true }
+# The compositor an app runs inside, and the capture of the window it draws there.
+compositor = { workspace = true }
 # SIMD JPEG encoding. `image`'s encoder is scalar and was the single largest
 # cost in the frame budget; this one is libjpeg-turbo. `image` is no longer a
 # dependency here: frames go from ffmpeg's RGB buffer straight into the encoder.

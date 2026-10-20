@@ -1,0 +1,26 @@
+[package]
+name = "compositor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-process headless Wayland compositor for capture and input injection"
+
+[[bin]]
+name = "compositor-smoke"
+path = "src/bin/compositor-smoke.rs"
+
+[dependencies]
+smithay = { workspace = true }
+wayland-protocols = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+# Used by the smoke client in src/bin, which exercises the compositor
+# end-to-end (it is a real Wayland client).
+wayland-client = "0.31"
+rustix = { workspace = true }
+memmap2 = "0.9"
+
+# The example writes what it captured as a PNG, so a window can be looked at
+# rather than only measured.
+[dev-dependencies]
+png = { workspace = true }

@@ -96,7 +96,8 @@ surface, damage, pixels in our own address space.
 
 Owning it rather than shelling out deletes a process boundary and a protocol
 round-trip in each direction, and it means "capture" is a buffer read rather than
-a screencopy through a shm pool. [COMP.md](COMP.md) is the design.
+a screencopy through a shm pool. It is built (`crates/compositor`); what it
+captures today is `wl_shm` buffers only. [COMP.md](COMP.md) has the details.
 
 ### The terminal side
 
@@ -137,28 +138,32 @@ and has no DCT in it.
   and the one serialized writer to the screen
 - `gui`: argument handling, binding and announcing, answering the greeting, and
   the terminal surface it draws on
+- the frame path: `gui` decodes a clip with ffmpeg (or captures a program run in
+  `crates/compositor`), JPEG-encodes it, and `tui` transmits and places it as one
+  TGP image that the client's placeholder cells resolve against
+- `compositor`: an in-process headless Wayland session, one window, capture and
+  input injection. shm clients only; a dma-buf client captures black
 - `tuigui`: both halves as one command
 - `easytgp`: the TGP encoding, exercised by its own examples
 
 **Not built**
 
-- **wiring `easytgp` to the session.** `gui` reads no runnable and produces no
-  frames; `tui` draws nothing and drops a frame it is sent. The pixel layer exists
-  and the session exists, and the two are not joined. This is the next piece.
-- **the compositor.** `smithay` and `xwayland` are pinned in `Cargo.toml` and the
-  crate does not exist yet. [COMP.md](COMP.md) is the plan.
+- **dma-buf capture.** The compositor reads `wl_shm` buffers, so a client that
+  renders through EGL (kitty, `weston-flower`) runs but captures as black. See
+  [COMP.md](COMP.md).
+- **pointer input.** Keys reach an app run in the compositor; motion, clicks and
+  scroll do not reach it from the terminal yet.
 - **any transport but a local socket.** The remote case needs a second one; see
   [CONNECT.md](CONNECT.md). The shape of it is in [REMOTE.md](REMOTE.md) and
   [SSH_SEAM.md](SSH_SEAM.md).
-- **input.** Keys reach the command because the pty forwards them, but nothing
-  routes them to an application.
 
 ## Related
 
 | | |
 |---|---|
-| [COMP.md](COMP.md) | the compositor, with Xwayland. Planned. |
+| [COMP.md](COMP.md) | the compositor, with Xwayland. Built. |
 | [REMOTE.md](REMOTE.md) | the app on another machine from the terminal. Planned. |
 | [SSH_SEAM.md](SSH_SEAM.md) | attaching a forward to an ssh we do not own, for that. Planned. |
 | [REVERSE_SSH.md](REVERSE_SSH.md) | the pane ssh-ing back to the user, instead. An idea. |
 | [EMULATOR.md](EMULATOR.md) | a terminal that accepts a compressed stream. An idea to hand to a terminal, not a plan here. |
+| [MCP.md](MCP.md) | letting an agent see and drive what is in a window, instead of only a human seeing pixels. An idea. |

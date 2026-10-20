@@ -1,6 +1,7 @@
 # COMP — tuigui's own Wayland compositor
 
-Status: in development (MVP, branch `dev`).
+Status: built, in `crates/compositor`. It runs one client's window and captures it;
+XWayland is wired up but not exercised, and the underlying capture is shm-only.
 
 ## Why
 
@@ -19,21 +20,36 @@ event dispatch into the seat.
 
 ## Goal
 
-A `crates/comp` crate exposing the smallest API that replaces the cage path:
+A `crates/compositor` crate exposing the smallest API that replaces the cage path:
 
 ```rust
-let comp = Compositor::init()?;                       // headless backend, private socket
+let comp = Compositor::init((1280, 720), 1.0)?;  // headless, private socket
 let client = comp.spawn("path/to/client", (1280, 720))?; // run app, one window
-let frame = client.capture()?;                        // BGRA/RGBA pixels + damage
-client.key(Key::A, KeyState::Press)?;
-client.mouse_move(640, 360)?;
+let frame = client.capture()?;                        // RGBA pixels + damage
+client.type_key(Key::Char('a'))?;
+client.move_mouse(640.0, 360.0)?;
 client.click(Button::Left)?;
-client.scroll(Delta::Vertical(2))?;
+client.scroll(ScrollDelta::vertical(2))?;
 ```
 
 `spawn` launches the binary with `WAYLAND_DISPLAY` pointing at the
-compositor's private socket (same trick `CageSession` uses today) and waits for
-the first xdg_surface commit so the caller never sees a half-alive client.
+compositor's private socket and waits for the first commit, so the caller never
+sees a half-alive client.
+
+## Who uses it
+
+`gui` is the only caller: given a path that is not a clip, it starts a compositor
+and runs the program inside it, then sends the captured window as frames
+(`crates/gui/src/compositor.rs`). The video path is unchanged and selected by the
+`.mp4` extension.
+
+## What the capture can and cannot read
+
+`capture()` copies **wl_shm buffers**. A client that renders through EGL/dmabuf
+(kitty, foot's GL path, `weston-flower`) commits a dma-buf instead, which is not
+readable this way: the window runs, but every captured frame is the empty output.
+There is no GL capture path yet — `OUTPUT_FORMAT` and the GL comment in the crate
+root are where it would go.
 
 ## Window policy (the hard rule)
 
@@ -55,31 +71,32 @@ windows on top of each other.
 
 ### Backend
 
-`smithay::backend::renderer::glow` over EGL/GBM on a render node — the
-headless setup Smithay's `smallvil` uses for the "no real display" case, but
-driven without winit (a plain calloop event loop). The output is created once,
-headless, at the size given to `Compositor::init`, with
-`PresentationMode::Wait` as the frame-clock emulator so frame callbacks fire on
-a sane cadence.
+Software compositing only — there is no GPU renderer. Smithay's compositor,
+xdg-shell, shm, seat and XWayland frontends are driven by a plain `calloop` event
+loop on a dedicated thread. The output is created once, headless, at the size
+given to `Compositor::init`, with a frame-callback emulator firing `done()` each
+turn so clients keep drawing.
 
 The `resolution` passed to `spawn` is the **client's configure size**; the MVP
 fixes it to the output size, so one call site controls both.
 
 ### Capture
 
-Headless GL renders the output into a linear-format GBM buffer that we mmap.
-`capture()`:
+There is no render pass and no GL read-back. On every commit, the client's
+committed buffer is copied straight into an owned `Vec<u8>` in `commit()`
+(`crates/compositor/src/state.rs`), and `capture()` clones it:
 
-1. render the current output state into the back buffer (Smithay's
-   `draw_full_tree`-style render element pass),
-2. `glReadPixels` into the caller-owned `Vec<u8>` — BGRA→RGBA swizzle happens
-   in a tight loop,
-3. report damage since the last capture as pixel-space `Rect`s.
+1. `map_rgba` copies the `wl_shm` buffer into the window's pixel store, row by
+   row (shm pools may be sparse, so the stride is never assumed to make rows
+   contiguous),
+2. damage since the last capture is taken as pixel-space `Rect`s,
+3. a software cursor disc is drawn over the result.
 
-The MVP starts **shm-first**: a shm-only client (weston demos) commits plain
-`wl_shm` buffers, which we can read directly and skip the GL copy entirely;
-the GL path is the fallback for dmabuf/EGL clients (glxgears) and for downscale
-compositing.
+This is the **shm-first MVP**. A dmabuf/EGL client's buffer is not read at all,
+so its window captures as black; the GL path is the work that would fix that.
+The output is `Argb8888`, whose bytes are B, G, R, A — the `Frame` is named
+RGBA because that was the intent, and `gui` encodes it as `BGRX` to match what
+is actually there.
 
 ### Input
 
@@ -102,9 +119,15 @@ Smithay state lives on a dedicated thread with its own event loop
 channels to it; `capture()` is a synchronous, blocking round-trip so the API
 stays simple.
 
-## FrameSource integration
+## Frame source integration
 
-`CompFrameSource` (later, outside this crate's MVP) implements
-`tuigui_streamer::FrameSource` on top of `client.capture()`, so `main.rs`
-switches between cage and comp with a flag; the TGP encoder stays
-codec-agnostic.
+`crates/gui/src/compositor.rs` is that integration: it starts the compositor,
+spawns the program, captures on a thread, encodes each changed frame as JPEG and
+hands it to the link, and routes this client's keyboard into `Client::type_key`.
+It is chosen by the runnable's extension, not by a flag: `.mp4` is a clip, anything
+else is a program.
+
+Input is the piece that is thin. Keys are decoded from the terminal's sequences in
+`gui` and injected, so `foot` accepts typing; pointer motion and clicks reach the
+compositor's API but nothing in the client calls them yet, which needs mouse
+reporting to be enabled on the terminal.
