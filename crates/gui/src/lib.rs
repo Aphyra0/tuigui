@@ -69,6 +69,15 @@ fn output_size() -> std::io::Result<(u32, u32)> {
         ),
         _ => DEFAULT_CELL,
     };
+    eprln!(
+        "gui: terminal reports {}x{} cells, {}x{} pixels -> cell {cell_w}x{cell_h}, output {}x{}",
+        cols,
+        rows,
+        ws.width,
+        ws.height,
+        cols.max(1) * cell_w,
+        rows.max(1) * cell_h
+    );
     Ok((cols.max(1) * cell_w, rows.max(1) * cell_h))
 }
 
