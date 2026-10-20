@@ -64,7 +64,16 @@ pub enum State {
         waiting: BoxFuture<'static, std::io::Result<Connection>>,
     },
     /// The link is up, and the program is being started.
-    StartingApp(Connection),
+    ///
+    /// The start is polled rather than awaited, for the same reason the dial is: a step
+    /// that blocked here would hold the frame it is part of open, so nothing it drew would
+    /// reach the terminal until it finished. The future owns the compositor and the program.
+    StartingApp {
+        /// The link, waiting for the program to draw.
+        connection: Connection,
+        /// The start, polled once per frame.
+        starting: BoxFuture<'static, std::io::Result<App>>,
+    },
     /// The program's window is being captured and sent, through the link that is up.
     Streaming(Connection, App),
     /// The session is over. Not a failure: it is how a session is meant to finish.
@@ -171,7 +180,16 @@ impl State {
                 match futures::poll!(waiting.as_mut()) {
                     std::task::Poll::Ready(Ok(connection)) => {
                         log::info!("dialed");
-                        Ok(State::StartingApp(connection))
+                        // The program's start is begun now and polled from the next frame,
+                        // so the frame that says "starting" is flushed before anything
+                        // waits on the program.
+                        log::info!("starting {} at {size:?}", program.display());
+                        let starting = App::start(program, size)
+                            .map_err(|e| format!("could not start {}: {e}", program.display()))?;
+                        Ok(State::StartingApp {
+                            connection,
+                            starting,
+                        })
                     }
                     std::task::Poll::Ready(Err(e)) => Err(format!("could not be dialed: {e}")),
                     std::task::Poll::Pending => Ok(State::Connecting { advert, waiting }),
@@ -179,12 +197,19 @@ impl State {
             }
 
             // Start the program in a compositor of our own.
-            State::StartingApp(connection) => {
+            State::StartingApp {
+                connection,
+                mut starting,
+            } => {
                 render_centered(content, buf, "starting the program...".to_string());
-                log::info!("starting {} at {size:?}", program.display());
-                let app = App::start(program, size)
-                    .map_err(|e| format!("could not start {}: {e}", program.display()))?;
-                Ok(State::Streaming(connection, app))
+                match futures::poll!(starting.as_mut()) {
+                    std::task::Poll::Ready(Ok(app)) => Ok(State::Streaming(connection, app)),
+                    std::task::Poll::Ready(Err(e)) => Err(e.to_string()),
+                    std::task::Poll::Pending => Ok(State::StartingApp {
+                        connection,
+                        starting,
+                    }),
+                }
             }
 
             // One frame out, or one message in: a link that has gone quiet is still

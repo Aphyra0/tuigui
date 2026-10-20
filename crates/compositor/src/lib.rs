@@ -473,9 +473,16 @@ impl Compositor {
         // Wayland compositor does not provide one or more of the required
         // interfaces") instead of a bare "spawn failed". Non-blocking for us:
         // we only read from the shared tail under a mutex.
+        //
+        // The handle is kept, because a child that dies immediately is the case
+        // this exists for and the case it races: the loop below can see the
+        // process gone before this thread has read a byte, and reading the tail
+        // then reports "no diagnostic output" for a child whose output is still
+        // in the pipe. The early-exit path joins it first, which is instant once
+        // the writer is dead — the pipe is at EOF.
         let stderr = StderrTail::new();
         let stderr_buf = stderr.clone();
-        if let Some(mut er) = child.stderr.take() {
+        let stderr_reader = child.stderr.take().map(|mut er| {
             std::thread::Builder::new()
                 .name("compositor-err".into())
                 .spawn(move || {
@@ -505,8 +512,13 @@ impl Compositor {
                         }
                     }
                 })
-                .ok();
-        }
+                .ok()
+        })
+        // A thread that would not start is not a reason to fail the spawn: the child is
+        // running, and its output is only diagnostics. Two `Option`s because the stderr pipe
+        // may be absent as well as the thread failing; `None` means "nothing to join, and
+        // nothing said".
+        .flatten();
 
         // Window admission happens on the wl thread when the client's first
         // toplevel commits; poll capture readiness for the ack.
@@ -519,29 +531,26 @@ impl Compositor {
                 Err(CompError::NotReady) | Err(CompError::Timeout) => {
                     // The child seems alive; give it a beat to finish starting.
                     if !Self::child_ok(&mut child) {
-                        // Include the client's own stderr tail so GTK/Qt
-                        // diagnostics (e.g. "not providing required interfaces")
-                        // are visible instead of a bare "exited early".
-                        let why = stderr.last_line();
+                        // The child is gone, so its stderr pipe is at EOF and the reader
+                        // has everything it will ever have. Join it before reading: a
+                        // reader that has not run yet would report an empty tail, which is
+                        // the one thing this path exists to avoid.
+                        let why = drain(stderr_reader, &stderr);
                         return Err(CompError::Spawn(if why.is_empty() {
-                            "client process exited early (captured no diagnostic output)".into()
+                            "client process exited early (it produced no output at all)".into()
                         } else {
-                            format!("client process exited early: last stderr: {why}")
+                            format!("client process exited early: {why}")
                         }));
                     }
                     if Instant::now() > deadline {
                         let _ = child.kill();
-                        let why = stderr.last_line();
+                        // Killed, so the pipe is closed and the reader is at its end.
+                        let why = drain(stderr_reader, &stderr);
+                        let named = path.as_ref().display();
                         return Err(CompError::Spawn(if why.is_empty() {
-                            format!(
-                                "client {} never committed a frame within 10s (no diagnostic output)",
-                                path.as_ref().display()
-                            )
+                            format!("client {named} never committed a frame within 10s (no output)")
                         } else {
-                            format!(
-                                "client {} never committed a frame within 10s; last stderr: {why}",
-                                path.as_ref().display()
-                            )
+                            format!("client {named} never committed a frame within 10s: {why}")
                         }));
                     }
                     std::thread::sleep(Duration::from_millis(15));
@@ -588,6 +597,22 @@ fn recv_reply<T>(reply_rx: std::sync::mpsc::Receiver<T>) -> Result<T, CompError>
     reply_rx
         .recv_timeout(RPC_TIMEOUT)
         .map_err(|_| CompError::Timeout)
+}
+
+/// Finish reading a dead child's stderr, and hand back everything it said.
+///
+/// Called once the child is gone, so its end of the pipe is closed: the reader reaches EOF
+/// and the join returns rather than waiting. That join is the whole point — the reader is a
+/// thread, and a child that dies immediately is exactly the case where it has not run yet,
+/// so a tail read without it says "no output" about a process that had plenty.
+///
+/// The whole tail, not its last line: a program explaining why it refused to start usually
+/// says it over several lines, and the line a naive read keeps is often the least of them.
+fn drain(reader: Option<std::thread::JoinHandle<()>>, tail: &StderrTail) -> String {
+    if let Some(handle) = reader {
+        let _ = handle.join();
+    }
+    tail.as_string()
 }
 
 /// Set (or clear) `DISPLAY` on a child command from the XWayland display slot.

@@ -17,6 +17,7 @@ use std::io::Read;
 use std::path::Path;
 
 use compositor::{Client, Compositor, Key};
+use wire::transport::BoxFuture;
 
 /// JPEG quality for a captured window.
 ///
@@ -41,12 +42,20 @@ pub struct App {
 }
 
 impl App {
-    /// Start `path` in a compositor of `size` pixels, and wait for its first window.
+    /// Begin starting `path` in a compositor of `size` pixels.
     ///
-    /// Blocking on purpose: `spawn` returns only once the program has committed a window,
-    /// so a caller has something to read or the reason there is nothing. Dropping the
-    /// result shuts both the compositor and the program down.
-    pub fn start(path: &Path, size: (u32, u32)) -> std::io::Result<Self> {
+    /// Returns the compositor and a future that spawns the program and waits for its first
+    /// window. The wait is *not* done here, because it is a wait: a caller that is drawing
+    /// has to finish its frame before an address it drew can reach the terminal, so a step
+    /// that blocked here would stop the very frame it is part of. The caller polls the
+    /// future instead, once per frame, and gets the [`App`] when the program has drawn.
+    ///
+    /// The future owns the compositor, so nothing else has to keep it alive while the wait
+    /// runs, and dropping the future shuts both the compositor and the program down.
+    pub fn start(
+        path: &Path,
+        size: (u32, u32),
+    ) -> std::io::Result<BoxFuture<'static, std::io::Result<Self>>> {
         let compositor = Compositor::init_with_options(
             size,
             1.0,
@@ -60,19 +69,28 @@ impl App {
         )
         .map_err(std::io::Error::other)?;
 
-        let client = compositor.spawn(path, size).map_err(std::io::Error::other)?;
+        let path = path.to_path_buf();
+        Ok(Box::pin(async move {
+            // Blocks until the program has committed a window, so the first frame after
+            // this is a real one rather than the empty output.
+            let client = compositor
+                .spawn(&path, size)
+                .map_err(std::io::Error::other)?;
 
-        let mut encoder = turbojpeg::Compressor::new().map_err(std::io::Error::other)?;
-        encoder
-            .set_quality(QUALITY)
-            .map_err(std::io::Error::other)?;
+            // Built after the program is up, because a compressor is only worth making for
+            // a session that has something to encode.
+            let mut encoder = turbojpeg::Compressor::new().map_err(std::io::Error::other)?;
+            encoder
+                .set_quality(QUALITY)
+                .map_err(std::io::Error::other)?;
 
-        Ok(Self {
-            client,
-            _compositor: compositor,
-            encoder,
-            last: None,
-        })
+            Ok(App {
+                client,
+                _compositor: compositor,
+                encoder,
+                last: None,
+            })
+        }))
     }
 
     /// Whether the program is still running.

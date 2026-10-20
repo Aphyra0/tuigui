@@ -100,12 +100,42 @@ impl Gui {
 
 /// The size of this terminal in pixels, for the compositor's output.
 ///
-/// Taken from the terminal itself: the pane's geometry is what the picture is fitted to,
-/// so an output sized to it is one the program lays itself out against correctly.
+/// Taken from the terminal itself: the pane's geometry is what the picture is fitted to, so
+/// an output sized to it is one the program lays itself out against correctly.
+///
+/// The pixel fields of a terminal's window size are documented as unreliable and often zero
+/// — they are a property of the graphics layer, not the tty. A terminal that does not report
+/// them is therefore not an error, and the cell size is assumed instead. Returning the
+/// reported pixels directly would be `0x0` in that case, and a zero-sized output is not a
+/// small window: it is no surface at all, so a program started into it never commits a
+/// buffer and never says why.
 fn output_size() -> std::io::Result<(u32, u32)> {
     let ws = ratatui::crossterm::terminal::window_size()?;
-    Ok((ws.width as u32, ws.height as u32))
+    let (cols, rows) = (ws.columns as u32, ws.rows as u32);
+    let (cell_w, cell_h) = match (ws.width, ws.height) {
+        (w, h) if w > 0 && h > 0 => (
+            (w as u32 / cols.max(1)).max(1),
+            (h as u32 / rows.max(1)).max(1),
+        ),
+        _ => DEFAULT_CELL,
+    };
+    let size = (cols.max(1) * cell_w, rows.max(1) * cell_h);
+    log::info!(
+        "the terminal reports {cols}x{rows} cells, {}x{} pixels -> cell {cell_w}x{cell_h}, output {}x{}",
+        ws.width,
+        ws.height,
+        size.0,
+        size.1
+    );
+    Ok(size)
 }
+
+/// The cell size assumed when the terminal does not report one, in pixels.
+///
+/// Standard for a monospace face at the sizes terminals ship with, and it only has to be
+/// close: the compositor's output is what the program lays out against, and the terminal
+/// fits the resulting picture to the same cell grid either way.
+const DEFAULT_CELL: (u32, u32) = (10, 20);
 
 /// Install the capturer every `log` record goes to, and return where it writes.
 ///
