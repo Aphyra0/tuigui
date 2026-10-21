@@ -45,9 +45,13 @@ pub enum Request {
         y: f64,
         reply: std::sync::mpsc::Sender<Result<(), CompError>>,
     },
-    /// Click a pointer button (press + release in one request).
-    Click {
+    /// Press or release a pointer button.
+    ///
+    /// One state at a time rather than a click, so a drag can be expressed: a
+    /// press, motion with the button still held, then a release.
+    Button {
         button: Button,
+        down: bool,
         reply: std::sync::mpsc::Sender<Result<(), CompError>>,
     },
     /// Scroll by discrete wheel steps.

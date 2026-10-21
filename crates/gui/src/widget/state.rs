@@ -276,10 +276,8 @@ impl State {
                 let events = capture.finish();
                 let capture = session.input_listener.capture();
                 for event in &events {
-                    if let termputs::InputEvent::Key { key, state } = event {
-                        app.key(key, *state)
-                            .map_err(|e| format!("could not deliver a key: {e}"))?;
-                    }
+                    app.input(event, session.cell)
+                        .map_err(|e| format!("could not deliver input: {e}"))?;
                 }
                 // A frame if the window has one. Its send is what the frame is for, so it
                 // happens here rather than being handed out. Bounded, because a link that

@@ -498,49 +498,56 @@ impl CompState {
         Ok(())
     }
 
-    pub fn handle_click(&mut self, button: Button) -> Result<(), CompError> {
-        // Ensure the pointer is somewhere sane first (defaults to center).
+    /// Press a pointer button and leave it down.
+    ///
+    /// Separate from the click so a **drag** is expressible: dragging is a press,
+    /// then motion with the button still held, then a release, and a single
+    /// press-and-release request can never describe one -- the button is up again
+    /// before the motion arrives, so the client sees a click and then a plain
+    /// pointer move.
+    pub fn handle_button(
+        &mut self,
+        button: Button,
+        down: bool,
+    ) -> Result<(), CompError> {
         if self.pointer_loc.x == 0.0 && self.pointer_loc.y == 0.0 {
             let (w, h) = self.server_size;
             self.handle_mouse_move(w as f64 / 2.0, h as f64 / 2.0)?;
         }
         let pointer = self.seat.get_pointer().ok_or(CompError::NotReady)?;
         let time = server_time();
-        let code = button.evdev_code();
-        let press_serial = self.next_serial();
-        self.buttons = self.buttons.saturating_add(1);
-        // Establish the keyboard focus on press, like anvil's
-        // `on_pointer_button`: a real client routes clicks/hover through the
-        // active window, and without a prior key event it never became active.
-        if let (Some(surface), Some(kbd)) = (self.focus_surface(), self.seat.get_keyboard()) {
-            if !kbd.is_focused() {
-                kbd.set_focus(self, Some(surface), press_serial);
+        let serial = self.next_serial();
+        if down {
+            self.buttons = self.buttons.saturating_add(1);
+            // Establish the keyboard focus on press, like anvil's
+            // `on_pointer_button`: a real client routes clicks/hover through the
+            // active window, and without a prior key event it never became active.
+            if let (Some(surface), Some(kbd)) = (self.focus_surface(), self.seat.get_keyboard())
+            {
+                if !kbd.is_focused() {
+                    kbd.set_focus(self, Some(surface), serial);
+                }
             }
+        } else {
+            self.buttons = self.buttons.saturating_sub(1);
         }
         pointer.button(
             self,
             &smithay::input::pointer::ButtonEvent {
-                serial: press_serial,
+                serial,
                 time,
-                button: code,
-                state: smithay::backend::input::ButtonState::Pressed,
-            },
-        );
-        pointer.frame(self);
-        let release_serial = self.next_serial();
-        self.buttons = self.buttons.saturating_sub(1);
-        pointer.button(
-            self,
-            &smithay::input::pointer::ButtonEvent {
-                serial: release_serial,
-                time,
-                button: code,
-                state: smithay::backend::input::ButtonState::Released,
+                button: button.evdev_code(),
+                state: if down {
+                    smithay::backend::input::ButtonState::Pressed
+                } else {
+                    smithay::backend::input::ButtonState::Released
+                },
             },
         );
         pointer.frame(self);
         Ok(())
     }
+
 
     pub fn handle_scroll(&mut self, delta: ScrollDelta) -> Result<(), CompError> {
         if self.pointer_loc.x == 0.0 && self.pointer_loc.y == 0.0 {
@@ -776,8 +783,8 @@ pub fn run_thread(
             Request::MouseMove { x, y, reply } => {
                 let _ = reply.send(state.handle_mouse_move(x, y));
             }
-            Request::Click { button, reply } => {
-                let _ = reply.send(state.handle_click(button));
+            Request::Button { button, down, reply } => {
+                let _ = reply.send(state.handle_button(button, down));
             }
             Request::Scroll { delta, reply } => {
                 let _ = reply.send(state.handle_scroll(delta));

@@ -761,10 +761,22 @@ impl Client {
 
     /// Click a button at the current pointer position.
     pub fn click(&self, button: Button) -> Result<(), CompError> {
+        self.button(button, true)?;
+        self.button(button, false)
+    }
+
+    /// Press or release a pointer button and leave it that way.
+    ///
+    /// The separate halves behind [`Client::click`], and what a **drag** needs: a
+    /// press, the motion that follows with the button still held, then a release.
+    /// A click cannot describe a drag because its button is already up by the
+    /// time any motion arrives.
+    pub fn button(&self, button: Button, down: bool) -> Result<(), CompError> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         self.tx
-            .send(server::Request::Click {
+            .send(server::Request::Button {
                 button,
+                down,
                 reply: reply_tx,
             })
             .map_err(|_| CompError::Thread("compositor thread stopped".into()))?;

@@ -97,6 +97,64 @@ impl App {
         self.client.is_running()
     }
 
+    /// Deliver one input event to the program.
+    ///
+    /// The `cell` is the terminal's cell size in output pixels, and it is what
+    /// converts a mouse position: an event arrives in the terminal's cells and the
+    /// compositor's pointer is in output pixels, so the two do not agree on what a
+    /// coordinate means, and the caller is the side that knows the cell.
+    pub fn input(
+        &self,
+        event: &termputs::InputEvent,
+        cell: (u32, u32),
+    ) -> std::io::Result<()> {
+        match event {
+            termputs::InputEvent::Key { key, state } => self.key(key, *state),
+            termputs::InputEvent::Mouse(mouse) => self.mouse(mouse, cell),
+            // A paste is text, not the keys that produce it, and a seat has no
+            // text channel; a resize is the pane's shape rather than the
+            // program's; focus follows the pane and not the window. None of them
+            // is input this side can hand to a compositor.
+            termputs::InputEvent::Paste(_)
+            | termputs::InputEvent::Resize { .. }
+            | termputs::InputEvent::FocusGained
+            | termputs::InputEvent::FocusLost => Ok(()),
+        }
+    }
+
+    /// Deliver one mouse event to the program.
+    fn mouse(&self, mouse: &termputs::MouseEvent, cell: (u32, u32)) -> std::io::Result<()> {
+        // The pointer moves first, always: every other kind of event happens *at*
+        // a position, and a click that did not move first would land wherever the
+        // pointer already was.
+        //
+        // The cell's centre is where it lands: a cell has area and a pointer has
+        // none, so the middle is the only choice that is not a bias toward one
+        // edge of the cell the user aimed at.
+        let (cell_w, cell_h) = cell;
+        let x = (mouse.column as f64 + 0.5) * cell_w as f64;
+        let y = (mouse.row as f64 + 0.5) * cell_h as f64;
+        // The pointer moves first, always: every other kind of event happens *at*
+        // a position, and a press that did not move first would land wherever the
+        // pointer already was.
+        self.mouse_move(x, y)?;
+
+        // A press and a release are sent as they are reported, not collapsed into
+        // one click, because they are two different gestures. A click is a press
+        // and a release with nothing in between; a **drag** is a press, motion
+        // while the button is still held, and only then a release. Collapsing the
+        // pair would make the button up before any drag motion arrived, so
+        // selecting text with the mouse could never work.
+        match mouse.kind {
+            termputs::MouseKind::Down(button) => self.mouse_button(button, true),
+            termputs::MouseKind::Up(button) => self.mouse_button(button, false),
+            // Motion beyond the move above: a drag carries no button of its own
+            // because the press already said which one is held.
+            termputs::MouseKind::Scroll(direction) => self.mouse_scroll(direction),
+            termputs::MouseKind::Drag(_) | termputs::MouseKind::Moved => Ok(()),
+        }
+    }
+
     /// Deliver one key event to the program.
     ///
     /// The key goes in as a **position**, not a character: the seat derives the
@@ -156,17 +214,16 @@ impl App {
         button: termputs::Button,
         down: bool,
     ) -> std::io::Result<()> {
-        // The compositor's `click` is a press and release in one call, so a
-        // release has nothing to do: the button is already up.
-        if !down {
-            return Ok(());
-        }
         let button = match button {
             termputs::Button::Left => compositor::Button::Left,
             termputs::Button::Right => compositor::Button::Right,
             termputs::Button::Middle => compositor::Button::Middle,
         };
-        self.client.click(button).map_err(std::io::Error::other)
+        // The state goes through as reported, so a held button stays held: that
+        // is what makes a drag a drag rather than a click and a stray move.
+        self.client
+            .button(button, down)
+            .map_err(std::io::Error::other)
     }
 
     /// Scroll by one wheel step in `direction`.

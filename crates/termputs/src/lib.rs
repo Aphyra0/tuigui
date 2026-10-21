@@ -46,9 +46,15 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
 /// The escape sequences that ask a terminal for the events we want.
 ///
-/// One request in parts: report mouse events (`1000`), report motion while a
-/// button is held (`1002`), encode coordinates as decimal text (`1006`, without
-/// which a column past 223 is unrepresentable), and bracketed paste (`2004`).
+/// One request in parts: report mouse events (`1000`), report **all** motion
+/// (`1003`), encode coordinates as decimal text (`1006`, without which a column
+/// past 223 is unrepresentable), and bracketed paste (`2004`).
+///
+/// Motion is asked for unconditionally, not only while a button is held (`1002`).
+/// A pointer has to be *seen* to hover over a control before it can be clicked,
+/// and a terminal in the held-only mode reports nothing at all while the mouse is
+/// merely moved -- so the pointer never reaches the program and the window looks
+/// dead until something is pressed.
 ///
 /// The kitty keyboard protocol is **not** requested, and that is deliberate. Its
 /// disambiguate level (`>1u`) makes a terminal re-encode `Ctrl+C` as a `CSI u`
@@ -57,7 +63,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 /// a session with `Ctrl+C`.
 const ENABLE: &[&str] = &[
     "\x1b[?1000h", // mouse button events
-    "\x1b[?1002h", // ... and motion while a button is down
+    "\x1b[?1003h", // ... and every motion, held or not
     "\x1b[?1006h", // SGR encoding: decimal coordinates, no 223 limit
     "\x1b[?2004h", // bracketed paste
 ];
@@ -66,7 +72,7 @@ const ENABLE: &[&str] = &[
 const DISABLE: &[&str] = &[
     "\x1b[?2004l",
     "\x1b[?1006l",
-    "\x1b[?1002l",
+    "\x1b[?1003l",
     "\x1b[?1000l",
 ];
 
