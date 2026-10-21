@@ -90,9 +90,12 @@ pub struct Server {
     pub socket_name: PathBuf,
     /// The single output presenting the one window.
     pub output: Output,
-    /// Global render dimensions (physical pixels); the output scale is fixed
-    /// at 1.0 so the window always covers the full output.
+    /// Global render dimensions (physical pixels); what the output presents.
     pub size: (u32, u32),
+    /// The scale the output advertises. A client multiplies the size it is
+    /// configured with by this to get its buffer, so the configured size is the
+    /// output's resolution divided by it.
+    pub scale: f64,
     /// Client content scale (`--ui-scale / --scale`) applied via
     /// `ClientHandle::set_client_scale` on admission.
     pub client_scale: f64,
@@ -113,9 +116,12 @@ pub struct Server {
 }
 
 impl Server {
-    /// Create the display, private socket, and the single output. The wl_output
-    /// scale stays 1.0 (neutral) so the window always fills the output; content
-    /// scaling is done per-client via `client_scale`.
+    /// Create the display, private socket, and the single output.
+    ///
+    /// `scale` is what the output advertises to its clients: a client that
+    /// honours it draws at that many times the logical size, so its interface is
+    /// legible on a dense panel instead of half-sized. The **mode is unchanged**,
+    /// so the window still fills the same pixels.
     ///
     /// `runtime_dir` is a private, per-session directory owned by this
     /// compositor. The listening socket is bound *inside* it. Giving the child
@@ -128,6 +134,7 @@ impl Server {
         runtime_dir: &std::path::Path,
         show_cursor: bool,
         use_x11: bool,
+        scale: f64,
     ) -> Result<Self, CompError> {
         let display = Display::new().map_err(|e| CompError::Server(e.to_string()))?;
         // Pick a free name and bind the socket under the private runtime dir.
@@ -172,7 +179,22 @@ impl Server {
                 make: "compositor".into(),
             },
         );
-        output.change_current_state(Some(mode), None, None, Some((0, 0).into()));
+        // The third argument is the output's `Scale`, which is what a client
+        // reads to decide how many buffer pixels one logical pixel is worth. It
+        // is advertised here and the mode is left alone, so a client that honours
+        // it draws the same interface larger rather than the window changing
+        // size.
+        //
+        // A whole value is advertised as an integer and not a fraction: some
+        // clients only understand integer scaling, and a fractional value would
+        // be rounded up for them, making 2.0 arrive as 2 and 1.5 arrive as 2 as
+        // well -- two different requests answered the same way.
+        let advertised = if scale.fract() == 0.0 {
+            smithay::output::Scale::Integer(scale as i32)
+        } else {
+            smithay::output::Scale::Fractional(scale)
+        };
+        output.change_current_state(Some(mode), None, Some(advertised), Some((0, 0).into()));
         output.set_preferred(mode);
 
         Ok(Server {
@@ -181,6 +203,7 @@ impl Server {
             socket_name,
             output,
             size,
+            scale,
             client_scale,
             x11_display: std::sync::Arc::new(std::sync::RwLock::new(None)),
             x11_failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -277,6 +277,14 @@ pub struct CompositorOptions {
     /// compositor. When false, only native Wayland clients are supported
     /// (`DISPLAY` is left unset). Defaults to true.
     pub use_x11: bool,
+    /// The scale the output advertises to its clients.
+    ///
+    /// A client that honours this draws its content at this many times the
+    /// logical size, so the same interface is legible on a high-density panel
+    /// rather than half-sized. The **resolution does not change**: the output's
+    /// mode stays what it was, and a client that scales fills the same pixels
+    /// with larger content. Defaults to 1.0, which is neutral.
+    pub scale: f64,
 }
 
 impl Default for CompositorOptions {
@@ -284,6 +292,7 @@ impl Default for CompositorOptions {
         CompositorOptions {
             show_cursor: true,
             use_x11: true,
+            scale: 1.0,
         }
     }
 }
@@ -353,6 +362,7 @@ impl Compositor {
             &runtime_dir,
             options.show_cursor,
             options.use_x11,
+            options.scale,
         )?;
         // Query the socket name before handing the server (and its socket) to
         // the compositor thread.

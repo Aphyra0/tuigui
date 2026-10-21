@@ -68,7 +68,7 @@ impl TuiGui {
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let session = tui::Tui {
             command: server_command(&self.runnable, &self.client_args()),
-            debug: self.tui,
+            debug: self.tui.clone(),
         };
         // Nothing is drawn from this thread: the client runs inside the pty, which is
         // what puts its drawing through the rewrite. This only waits for the session to

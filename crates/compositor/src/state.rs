@@ -130,6 +130,10 @@ pub struct CompState {
     /// admission (`--ui-scale / --scale`). Buffer sizes unaffected, so the
     /// window stays full-output.
     client_scale: f64,
+    /// The scale the output advertises. What a client multiplies the size it is
+    /// configured with by to get its buffer, so the configured size has to be
+    /// divided by it for the buffer to be the output's resolution.
+    output_scale: f64,
     /// Set false when the control channel closes to wind the loop down.
     serve: bool,
     /// Whether capture draws the software cursor overlay (from `--no-cursor`).
@@ -137,6 +141,25 @@ pub struct CompState {
 }
 
 impl CompState {
+    /// The size a client is configured with: the output's **logical** size.
+    ///
+    /// A client that honours the output's scale multiplies what it is
+    /// configured with to get its buffer, so configuring it with the physical
+    /// resolution would have it allocate that many pixels *times* the scale --
+    /// a buffer larger than the output, of which only a corner is ever shown.
+    /// Dividing by the scale is what makes the two agree.
+    fn logical_size(&self) -> (u32, u32) {
+        let scale = if self.output_scale.is_finite() && self.output_scale > 0.0 {
+            self.output_scale
+        } else {
+            1.0
+        };
+        (
+            (self.server_size.0 as f64 / scale).round().max(1.0) as u32,
+            (self.server_size.1 as f64 / scale).round().max(1.0) as u32,
+        )
+    }
+
     fn next_serial(&mut self) -> Serial {
         self.serial = self.serial.wrapping_add(1);
         Serial::from(self.serial as u32)
@@ -256,7 +279,7 @@ impl XdgShellHandler for CompState {
             .configure_size
             .lock()
             .unwrap()
-            .get_or_insert(self.server_size);
+            .get_or_insert_with(|| self.logical_size());
 
         // Scale the client's content (`--ui-scale / --scale`) independently of
         // the window size: smithay maps this into the client's logical space
@@ -462,26 +485,35 @@ impl CompState {
         let y = y.clamp(0.0, h.max(2) as f64 - 1.0);
         let loc = Point::new(x, y);
         self.pointer_loc = loc;
-        // smithay reports surface-local pointer coords as `location * client_scale`
-        // (PointerTarget::motion -> to_client), using the *focused client's*
-        // scale. For a native client that scale is `ui_scale` (set on admission),
-        // and its buffer is created at the full output size (buffer pixel ==
-        // output logical pixel), so it expects output-logical coords. Compensate
-        // by dividing the injected location by that client's scale (which smithay
-        // multiplies back) — otherwise a scale != 1 compresses the hit target
-        // under the cursor and you have to move the mouse further down/right than
-        // the visual target to click it. The XWayland client's scale is never
-        // overridden (stays 1.0), so this divide is a no-op for it.
+        // smithay reports surface-local pointer coords as `location * scale`
+        // (PointerTarget::motion -> to_client), where the scale it composes with
+        // includes the output's. The location injected here is in **output**
+        // pixels -- that is what the caller's cell arithmetic produces -- so the
+        // two divisions below turn it into the surface-local position the client
+        // expects.
+        //
+        // The client's own content scale is the first: it is set on admission
+        // (`client_scale`) and smithay multiplies by it. The output's advertised
+        // scale is the second, and it is not the same number: a client that
+        // honours it lays its surface out at `output / scale` logical pixels, so
+        // it reads the position in that smaller space. Dividing by only the
+        // client scale leaves every coordinate off by the output scale, which is
+        // why the pointer drifts away from the cursor as it moves.
         let client_scale = surface
             .client()
             .map(|c| self.client_compositor_state(&c).client_scale())
             .unwrap_or(1.0);
-        let scale = if client_scale.is_finite() && client_scale > 0.0 {
+        let client_scale = if client_scale.is_finite() && client_scale > 0.0 {
             client_scale
         } else {
             1.0
         };
-        let loc = Point::new(x / scale, y / scale);
+        let output_scale = if self.output_scale.is_finite() && self.output_scale > 0.0 {
+            self.output_scale
+        } else {
+            1.0
+        };
+        let loc = Point::new(x / (client_scale * output_scale), y / (client_scale * output_scale));
         let pointer = self.seat.get_pointer().ok_or(CompError::NotReady)?;
         let serial = self.next_serial();
         let time = server_time();
@@ -745,7 +777,7 @@ pub fn run_thread(
             while let Ok(Some(stream)) = server.socket.accept() {
                 tracing::debug!("compositor: new client connection accepted");
                 let data = ClientState::new();
-                *data.configure_size.lock().unwrap() = Some(state.server_size);
+                *data.configure_size.lock().unwrap() = Some(state.logical_size());
                 if let Err(e) = state.display_handle.insert_client(stream, data) {
                     tracing::warn!("insert_client failed: {e}");
                 }
@@ -804,7 +836,7 @@ pub fn run_thread(
         // 1. Adopt any client sockets spawned outside the thread (spawn() path).
         while let Ok(stream) = pending_windows.try_recv() {
             let data = ClientState::new();
-            *data.configure_size.lock().unwrap() = Some(state.server_size);
+            *data.configure_size.lock().unwrap() = Some(state.logical_size());
             if let Err(e) = state
                 .display_handle
                 .insert_client(stream, data)
@@ -881,6 +913,7 @@ fn init_state(server: &mut Server) -> Result<CompState, CompError> {
         buttons: 0,
         serial: 0,
         client_scale: server.client_scale,
+        output_scale: server.scale,
         serve: true,
         show_cursor: false,
     };

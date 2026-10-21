@@ -59,11 +59,21 @@ impl App {
             size,
             1.0,
             compositor::CompositorOptions {
+                // Drawn into the captured pixels, so the pointer is visible in
+                // the pane without the terminal having to place one. The
+                // compositor has no cursor of its own to show, so without this
+                // there is nothing on screen saying where the pointer is.
                 show_cursor: true,
                 // X11 apps are a later concern. Waiting for XWayland's window manager to
                 // come up blocks the first frame on machines where it never does, which
                 // looks exactly like a program that drew nothing.
                 use_x11: false,
+                // Hardcoded for now: a dense panel shows a 1x interface as a
+                // half-sized one, and 1.75 is a comfortable middle on one. The
+                // output's resolution is unchanged, so this makes the program
+                // draw its interface larger in the same pixels rather than
+                // making the window bigger.
+                scale: 1.75,
             },
         )
         .map_err(std::io::Error::other)?;

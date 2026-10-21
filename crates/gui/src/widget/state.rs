@@ -360,6 +360,31 @@ fn render_centered(content: Rect, buf: &mut Buffer, text: String) {
         ..content
     };
     buf.set_style(content, Style::new().bg(Color::Rgb(0x18, 0x18, 0x18)));
-    buf.set_style(middle, Style::new().bg(Color::Rgb(0x28, 0x28, 0x28)));
-    Paragraph::new(Line::from(text)).centered().render(middle, buf);
+
+    // The background covers the message and nothing else -- not the whole row.
+    //
+    // It exists because of how a renderer writes only the cells it *changed*.
+    // The spaces inside the message would be spaces already, so they would not
+    // be written, and the address would reach the far side in pieces with cursor
+    // moves between them. Giving those cells a background of their own makes the
+    // message change in the frame it appears, so it is written in one run.
+    //
+    // Narrow, and not the full row, because a row-wide background is a *whole
+    // line* the terminal has to redraw -- and a multiplexer relaying this pane
+    // sees every one of those cells as changed. The message needs its own cells
+    // to be emitted together; it does not need the rest of the row rewritten.
+    let line = Line::from(text);
+    let width = line.width() as u16;
+    // One cell right of where `Paragraph::centered` puts the text: centering
+    // truncates the padding, and the two do not land on the same cell, which
+    // leaves the last glyph outside the background.
+    let start = middle.x + middle.width.saturating_sub(width) / 2 + 1;
+    let text_area = Rect {
+        x: start,
+        y: row,
+        width: width.min(middle.width),
+        height: 1.min(content.height),
+    };
+    buf.set_style(text_area, Style::new().bg(Color::Rgb(0x28, 0x28, 0x28)));
+    Paragraph::new(line).centered().render(middle, buf);
 }

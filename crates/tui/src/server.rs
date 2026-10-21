@@ -29,11 +29,19 @@ use tokio::sync::mpsc::Receiver;
 
 use wire::message::Message;
 use wire::transport::Transport;
+use wire::unix::UnixSocket;
 
 use crate::announce::Announcement;
 use crate::session::Session;
 use crate::sink::Sink;
 use crate::DebugOptions;
+
+/// How long to wait between attempts when dialing a named address.
+///
+/// Long enough not to be a busy loop on a client that is not up yet, and short
+/// enough that a session starting does not feel like it is waiting. The retry
+/// exists because the client's own start and the server's can be in either order.
+const DIAL_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What the pty produces, and what the scan finds in it.
 ///
@@ -165,7 +173,21 @@ impl<F: Format> Server<F> {
             let action = if sessions.is_empty() {
                 // Nothing to read, so there is nothing to race: waiting on the announcement
                 // alone is the same thing without an empty `select_all`, which asserts.
-                Action::Announced(announcements.next().await)
+                //
+                // Unless a dial target was named, in which case the announcement has a
+                // competitor: the same address, again, on a timer. An announcement that
+                // never arrives must not be the only way to find a client, or a session
+                // whose announcement is lost -- which is what a multiplexer re-rendering
+                // the pane can do -- has no way to start at all.
+                match &debug.dial_unix {
+                    Some(path) => {
+                        tokio::select! {
+                            transport = announcements.next() => Action::Announced(transport),
+                            _ = tokio::time::sleep(DIAL_RETRY) => Action::Dial(path.clone()),
+                        }
+                    }
+                    None => Action::Announced(announcements.next().await),
+                }
             } else {
                 let reads: Vec<_> = sessions
                     .iter()
@@ -193,7 +215,7 @@ impl<F: Format> Server<F> {
                         connection,
                         cols,
                         rows,
-                        debug,
+                        debug.clone(),
                         controller.clone(),
                         sink.clone(),
                     )),
@@ -201,6 +223,23 @@ impl<F: Format> Server<F> {
                 },
                 // The pty is gone, so the session is over and there is nothing left to serve.
                 Action::Announced(None) => return Ok(()),
+                // The retry timer elapsed. Dialing the same address again is how a session
+                // starts when no announcement arrives, so a failure here is expected on every
+                // pass until the client is up and is not worth saying more than once.
+                Action::Dial(path) => {
+                    let socket = UnixSocket::new(path);
+                    match socket.connect().await {
+                        Ok(connection) => sessions.push(Session::new(
+                            connection,
+                            cols,
+                            rows,
+                            debug.clone(),
+                            controller.clone(),
+                            sink.clone(),
+                        )),
+                        Err(e) => eprintln!("tui: could not dial {}: {e}", socket.path().display()),
+                    }
+                }
                 Action::Said { outcome, index } => match outcome {
                     // What a client said is the session's business, not the loop's, and a
                     // failure is the session's to report: the loop has no better answer, and
@@ -226,6 +265,8 @@ impl<F: Format> Server<F> {
 enum Action {
     /// The wait for an announcement finished, one way or another.
     Announced(Option<Box<dyn Transport>>),
+    /// The retry timer elapsed: dial the named address again.
+    Dial(std::path::PathBuf),
     /// A client's read finished.
     Said {
         outcome: io::Result<Option<Message>>,

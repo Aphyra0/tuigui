@@ -73,7 +73,7 @@ pub struct Tui {
 ///
 /// They are all named `--dbg-`, and they are all the caller's to pass: a server
 /// does not decide to diagnose itself.
-#[derive(Debug, Clone, Copy, Default, clap::Args)]
+#[derive(Debug, Clone, Default, clap::Args)]
 pub struct DebugOptions {
     /// Draw a fixed blue image instead of the frames that arrive.
     ///
@@ -99,6 +99,32 @@ pub struct DebugOptions {
     /// control for "the image arrived but nothing was drawn".
     #[arg(long = "dbg-no-shm")]
     pub no_shm: bool,
+    /// Dial a client at this path instead of waiting to be announced to.
+    ///
+    /// The session's normal shape is the client announcing an address that only it
+    /// can name, because it is the half that cannot know whether anyone is
+    /// listening. That breaks when the announcement does not survive the trip -- a
+    /// multiplexer that re-renders the pane, a pty whose output is not this
+    /// process's to read -- and the client is then listening on a socket nobody
+    /// hears about.
+    ///
+    /// This is the other direction: the server dials instead, on a path both ends
+    /// know without telling each other. Bare, it uses the address a local session's
+    /// client always binds; with a path it dials that. Only useful for a session on
+    /// one machine, and only as a diagnostic, because it assumes an address rather
+    /// than learning one.
+    ///
+    /// The path is written with `=`, as in `--dbg-dial-unix=/tmp/other.sock`. The
+    /// value is optional and the command follows the flag, so a space-separated
+    /// value would be read as the command instead.
+    #[arg(
+        long = "dbg-dial-unix",
+        value_name = "PATH",
+        default_missing_value = "/run/user/1000/tuigui.sock",
+        num_args = 0..=1,
+        require_equals = true
+    )]
+    pub dial_unix: Option<std::path::PathBuf>,
 }
 
 impl Tui {
