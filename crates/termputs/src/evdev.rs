@@ -455,6 +455,16 @@ fn consumed_len(event: &Event) -> Option<usize> {
 const PASTE_START: &str = "\x1b[200~";
 const PASTE_END: &str = "\x1b[201~";
 
+/// The characters that only appear when shift is held.
+///
+/// A legacy terminal sends these for the shifted form of a key with no modifier
+/// bits to say so, so the character is the only evidence that shift was down.
+/// Uppercase letters are not listed: their case is the evidence.
+const SHIFTED_SYMBOLS: [char; 21] = [
+    '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '{', '}', '|', ':', '"',
+    '<', '>', '?', '~',
+];
+
 /// Turn one parsed event into ours.
 fn convert(event: Event) -> Vec<InputEvent> {
     match event {
@@ -464,10 +474,25 @@ fn convert(event: Event) -> Vec<InputEvent> {
                 KeyEventKind::Repeat => KeyState::Repeated,
                 KeyEventKind::Release => KeyState::Released,
             };
+            let mut modifiers = Modifiers::from_terminput(key.modifiers);
+            // A legacy terminal reports no modifier bits at all: a shifted key
+            // arrives as the shifted character and nothing else. `A` is therefore
+            // read here as `A`, and the shift has to be recovered from the
+            // character itself or the program would be typed a lowercase `a`.
+            //
+            // Only inferred when the report carried no shift, so a terminal that
+            // does say so is believed over this guess.
+            if !modifiers.contains(Modifiers::SHIFT) {
+                if let KeyCode::Char(c) = key.code {
+                    if c.is_uppercase() || SHIFTED_SYMBOLS.contains(&c) {
+                        modifiers = Modifiers::from_bits(modifiers.bits() | Modifiers::SHIFT);
+                    }
+                }
+            }
             vec![InputEvent::Key {
                 key: Key {
                     code: key.code,
-                    modifiers: Modifiers::from_terminput(key.modifiers),
+                    modifiers,
                 },
                 state,
             }]

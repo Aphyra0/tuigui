@@ -104,42 +104,38 @@ impl App {
     /// position is what lets a modifier and a shifted key mean anything. That is
     /// also why the modifiers are pressed as their own keys first: a seat learns
     /// `ctrl` by being sent the control key, and there is no other way to ask.
+    ///
+    /// A key is sent as a whole press-and-release, and that is not a detail of
+    /// style: an ordinary terminal reports presses only, with no byte for a
+    /// release, so a press that waits for its own release is a key the program
+    /// holds down forever. One event is therefore one complete keystroke -- the
+    /// modifiers, the key down, the key up, the modifiers up.
+    ///
+    /// Repeat and release events are dropped for the same reason: on a terminal
+    /// that does not send them they cannot arrive, and on one that does the
+    /// keystroke above has already delivered the equivalent.
     pub fn key(&self, key: &termputs::Key, state: termputs::KeyState) -> std::io::Result<()> {
-        let compositor_state = match state {
-            termputs::KeyState::Pressed | termputs::KeyState::Repeated => {
-                compositor::KeyState::Pressed
-            }
-            termputs::KeyState::Released => compositor::KeyState::Released,
-        };
-
-        // Modifiers only go down on a press. Releasing them on the way out would
-        // fight the sequence: the caller's release of `c` is not a release of
-        // the control key that is still held.
-        if state == termputs::KeyState::Pressed {
-            for modifier in key.modifiers.keycodes() {
-                self.client
-                    .keycode(modifier.to_evdev(), compositor::KeyState::Pressed)
-                    .map_err(std::io::Error::other)?;
-            }
-        }
-
-        let Some(keycode) = key.keycode() else {
-            // A key with no position: the modifier keys above have already gone
-            // down, so they are put back up rather than left held.
-            return self.release_modifiers(key);
-        };
-        self.client
-            .keycode(keycode.to_evdev(), compositor_state)
-            .map_err(std::io::Error::other)?;
-
         if state == termputs::KeyState::Released {
-            return self.release_modifiers(key);
+            return Ok(());
         }
-        Ok(())
-    }
 
-    /// Raise the modifiers a key was holding.
-    fn release_modifiers(&self, key: &termputs::Key) -> std::io::Result<()> {
+        // A repeat is a press of the same key, which is what a keystroke already
+        // does.
+        let Some(keycode) = key.keycode() else {
+            return Ok(());
+        };
+
+        for modifier in key.modifiers.keycodes() {
+            self.client
+                .keycode(modifier.to_evdev(), compositor::KeyState::Pressed)
+                .map_err(std::io::Error::other)?;
+        }
+        // The key itself, down and up. The release is what stops the program from
+        // believing the key is still held, and it is why this cannot be a plain
+        // press.
+        self.client
+            .type_keycode(keycode.to_evdev())
+            .map_err(std::io::Error::other)?;
         for modifier in key.modifiers.keycodes().into_iter().rev() {
             self.client
                 .keycode(modifier.to_evdev(), compositor::KeyState::Released)
