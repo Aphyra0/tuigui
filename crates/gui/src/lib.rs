@@ -68,7 +68,7 @@ impl Gui {
     /// own.
     pub async fn run(
         self,
-        stdin: impl Read + Send + 'static,
+        stdin: impl Read + std::os::fd::AsRawFd + Send + 'static,
         stdout: impl Write + Send + 'static,
     ) -> std::io::Result<()> {
         // Before anything can fail, so the first failure is in the log rather than missing
@@ -97,8 +97,6 @@ impl Gui {
         // Held for the whole session: dropping it restores the terminal, which is
         // what the name and the lack of an underscore say.
         let _tty = Raw::install()?;
-        // Then non-blocking, so a capture's reader can give the descriptor back.
-        make_nonblocking(STDIN_FILENO)?;
         let listener = termputs::Listener::new(
             Box::new(stdin) as widget::Input,
             Box::new(std::io::stdout()) as widget::Output,
@@ -162,25 +160,6 @@ struct Size {
     /// pixels.
     cell: (u32, u32),
 }
-
-/// Put a descriptor into non-blocking mode.
-///
-/// A capture's reader has to return when it is told to stop, and a blocking read
-/// does not: the flag is checked between reads, so a read that never returns is a
-/// capture that never finishes. The descriptor stays non-blocking for the rest of
-/// the session, which is what the reader polls.
-fn make_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    // `F_GETFL` then `F_SETFL` with the flag added: setting the flags outright
-    // would clear the ones this did not ask about.
-    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-    let flags = rustix::fs::fcntl_getfl(fd).map_err(std::io::Error::from)?;
-    rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK)
-        .map_err(std::io::Error::from)?;
-    Ok(())
-}
-
-/// The descriptor a program's own standard input is on.
-const STDIN_FILENO: std::os::fd::RawFd = 0;
 
 /// Holds this terminal in raw mode, and restores the old settings when dropped.
 ///

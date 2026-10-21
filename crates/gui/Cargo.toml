@@ -29,10 +29,8 @@ ffmpeg-sidecar = { workspace = true }
 rustix = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
-# Blocking on the session's async steps from inside a draw, which is synchronous.
-pollster = { workspace = true }
-# `poll!`, for the one step that must not block: a frame has to finish before the address
-# it drew can reach the terminal.
+# `poll!`, for the two steps that must not block: the dial and the program's start have
+# to let their frame finish before anything they drew can reach the terminal.
 futures = "0.3"
 # The logging facade. Every diagnostic goes through it rather than to the pane, and the
 # capturer in this crate is the one logger installed.

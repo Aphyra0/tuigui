@@ -18,7 +18,7 @@ license = "MIT"
 thiserror = "2"
 derive_builder = "0.20"
 clap = { version = "4", features = ["derive", "env"] }
-rustix = { version = "1.1", features = ["fs", "termios", "process", "pty", "net"] }
+rustix = { version = "1.1", features = ["fs", "termios", "process", "pty", "net", "event"] }
 png = "0.18"
 image = "0.25"
 fast_image_resize = { version = "6", features = ["rayon"] }

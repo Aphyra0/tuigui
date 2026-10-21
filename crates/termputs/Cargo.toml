@@ -19,3 +19,8 @@ kbvm = { version = "0.2", default-features = false }
 # The input thread logs why it stopped. Every diagnostic goes through the
 # facade, so where it lands is the binary's decision.
 log = { workspace = true }
+# `poll`, for waiting on the terminal instead of reading it in a loop. A read on
+# a descriptor with nothing to give returns immediately, so a reader that only
+# reads spends a core to learn nothing; `poll` blocks in the kernel for the same
+# cost as doing nothing at all.
+rustix = { workspace = true }

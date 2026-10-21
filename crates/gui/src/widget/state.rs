@@ -27,12 +27,21 @@ use crate::compositor::App;
 
 use super::{socket_path, Session, CONNECTIONS, FILL};
 
-/// How long a quiet link is waited on before the window is looked at again.
+/// How long a quiet session is paused before the window is looked at again.
 ///
-/// The frame source is a poll and the link is an await, so something has to give the loop
-/// a chance to poll. This is that: a link with nothing to say does not hold the session,
-/// and a window that repaints while the link is quiet is still picked up.
+/// A frame with nothing to send and nothing to read would otherwise return at once and be
+/// drawn again immediately, so an idle program would cost a core. This is the pause that
+/// keeps it cheap: the window is still looked at often enough to feel instant, and the
+/// loop is not free-running.
 const QUIET: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// How long a frame is given to leave this side.
+///
+/// A frame is a write to another process, and that process may be busy applying the
+/// previous one. Bounded so a link that has stopped draining is reported rather than
+/// waited on: without it the session stalls here with the frame in hand and says nothing,
+/// which is a pane that looks frozen for no stated reason.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Where the session is.
 ///
@@ -80,12 +89,10 @@ pub enum State {
         app: App,
         /// The input read this frame, started on the previous one.
         ///
-        /// A capture is one round of reading: it exists while a thread appends
-        /// to it, and finishing it returns everything that arrived. Keeping it
-        /// across a frame is what makes the read overlap with the frame -- the
-        /// terminal is being read while the window is being encoded -- and it is
-        /// started again immediately after being finished so the next frame has
-        /// one too.
+        /// A capture is one reading of the terminal's reader: the reader runs for
+        /// the whole session, and finishing a capture returns what it collected
+        /// since the last one. Keeping it across a frame is what lets the reading
+        /// happen while the window is being encoded.
         capture: termputs::Capture,
     },
     /// The session is over. Not a failure: it is how a session is meant to finish.
@@ -221,12 +228,7 @@ impl State {
                 render_centered(content, buf, "starting the program...".to_string());
                 match futures::poll!(starting.as_mut()) {
                     std::task::Poll::Ready(Ok(app)) => {
-                        // The first capture starts here, so the terminal is already
-                        // being read by the time the first frame is drawn.
-                        let capture = session
-                            .input_listener
-                            .capture()
-                            .map_err(|e| format!("could not read the terminal: {e}"))?;
+                        let capture = session.input_listener.capture();
                         Ok(State::Streaming {
                             connection,
                             app,
@@ -268,17 +270,11 @@ impl State {
                     return Ok(State::Done);
                 }
 
-                // The input this frame, then the next capture started straight
-                // away so the terminal is being read while this frame is encoded.
-                //
-                // Finishing joins the reader, so nothing is still holding the
-                // input; starting the next one before any of the work below is
-                // what keeps a keystroke from having to wait for a frame.
+                // The input that arrived since the last frame. The reader is still
+                // running, so this is a reading and not a hand-off: the next capture gets
+                // whatever arrives after this one.
                 let events = capture.finish();
-                let capture = session
-                    .input_listener
-                    .capture()
-                    .map_err(|e| format!("could not read the terminal: {e}"))?;
+                let capture = session.input_listener.capture();
                 for event in &events {
                     if let termputs::InputEvent::Key { key, state } = event {
                         app.key(key, *state)
@@ -286,11 +282,14 @@ impl State {
                     }
                 }
                 // A frame if the window has one. Its send is what the frame is for, so it
-                // happens here rather than being handed out.
+                // happens here rather than being handed out. Bounded, because a link that
+                // has stopped draining must be reported rather than waited on.
                 if let Some(jpeg) = app.frame() {
-                    connection
-                        .send(&Message::Frame(jpeg))
+                    tokio::time::timeout(SEND_TIMEOUT, connection.send(&Message::Frame(jpeg)))
                         .await
+                        .map_err(|_| {
+                            format!("the link did not take a frame within {SEND_TIMEOUT:?}")
+                        })?
                         .map_err(|e| format!("the link failed: {e}"))?;
                     return Ok(State::Streaming {
                         connection,
@@ -299,18 +298,21 @@ impl State {
                     });
                 }
 
-                // Nothing to send, so the link gets the turn. A bounded wait, because a
-                // quiet link must not stop the window from being polled.
+                // Nothing to send, so the link gets the turn. Bounded, because a link with
+                // nothing to say must not hold the frame open: the wait ends, this draw
+                // finishes, and the next one looks at the window again.
                 match tokio::time::timeout(QUIET, connection.recv()).await {
                     Ok(Ok(Some(Message::Error(text)))) => {
                         return Err(format!("the server failed: {text}"))
                     }
+                    // A message that is not an error. The frame is over; the next one sends
+                    // whatever the program drew.
                     Ok(Ok(Some(_))) => {}
                     // The server closed. The session is over, which is not a failure.
                     Ok(Ok(None)) => return Ok(State::Done),
                     Ok(Err(e)) => return Err(format!("the link failed: {e}")),
-                    // Nothing arrived within the window. Not an error: the next draw
-                    // looks at the window again.
+                    // Nothing arrived within the window. Not an error: the next draw asks
+                    // again.
                     Err(_) => {}
                 }
                 Ok(State::Streaming {

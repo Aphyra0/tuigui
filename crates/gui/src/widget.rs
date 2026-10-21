@@ -61,7 +61,11 @@ pub const FILL: char = '❋';
 ///
 /// The session holds one of these for its whole life, and `Gui::run` is generic
 /// over what it was given, so the two handles are boxed rather than named.
-pub type Input = Box<dyn std::io::Read + Send>;
+///
+/// The input is `termputs`'s trait rather than plain `Read`: the reader has to
+/// wait on the same descriptor it reads, and a box of `Read` alone has no
+/// descriptor to wait on.
+pub type Input = Box<dyn termputs::Input>;
 /// This terminal's output, boxed for the same reason.
 pub type Output = Box<dyn std::io::Write + Send>;
 
@@ -154,7 +158,21 @@ impl StatefulWidget for GuiWidget {
         // on screen for the next frame to draw.
         let taken = std::mem::replace(&mut session.state, Err(INTERNAL_ERROR.to_string()));
         session.state = taken.and_then(|state| {
-            pollster::block_on(state.render(content, buf, session))
+            // Driven by the **tokio** runtime, not by a bare block-on, and that is the
+            // point: the step awaits tokio IO and tokio timers, and a runtime must be
+            // polled for either to make progress. `pollster::block_on` drives the future
+            // itself and nothing else, so a timer registered with the runtime never
+            // expires and a socket does not wake this thread when it becomes writable --
+            // the future returns `Pending`, nobody unparks, and the thread spins forever
+            // on a step that will never finish.
+            //
+            // `block_in_place` first, because this *is* a runtime worker thread and the
+            // draw is synchronous: it tells the runtime to move other tasks elsewhere
+            // while this one blocks, which is what makes blocking here safe.
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(state.render(content, buf, session))
+            });
+            result
         });
 
         // Whether the step failed just now or failed on an earlier frame, the pane says
