@@ -1,0 +1,21 @@
+[package]
+name = "termputs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Capture a terminal's input into events, and map them to the keys Wayland takes"
+
+[dependencies]
+# The parser. A terminal's input is a byte stream of ANSI escape sequences in
+# two dialects, the 1970s one and kitty's, and this parses both into a common
+# event type. Writing that again would be the several-hundred-line thing it
+# already is, done worse.
+terminput = "0.5"
+# The keycodes. Wayland's input currency is an evdev keycode, a position on the
+# keyboard, and kbvm names every one of them as a typed constant rather than a
+# number. Pure Rust: an implementation of the XKB specification, no
+# libxkbcommon and no C in the build.
+kbvm = { version = "0.2", default-features = false }
+# The input thread logs why it stopped. Every diagnostic goes through the
+# facade, so where it lands is the binary's decision.
+log = { workspace = true }

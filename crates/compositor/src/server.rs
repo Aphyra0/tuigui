@@ -32,6 +32,13 @@ pub enum Request {
         state: KeyState,
         reply: std::sync::mpsc::Sender<Result<(), CompError>>,
     },
+    /// Deliver a synthetic key press/release by evdev code, for a caller that
+    /// knows the key position rather than a character.
+    Keycode {
+        evdev: u32,
+        state: KeyState,
+        reply: std::sync::mpsc::Sender<Result<(), CompError>>,
+    },
     /// Move the pointer to an absolute output position.
     MouseMove {
         x: f64,

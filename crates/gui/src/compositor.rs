@@ -13,10 +13,9 @@
 //! Frames are pulled, not pushed: the session's own loop calls [`App::frame`], so there
 //! is no queue and nothing that can hold a frame this side has not asked for.
 
-use std::io::Read;
 use std::path::Path;
 
-use compositor::{Client, Compositor, Key};
+use compositor::{Client, Compositor};
 use wire::transport::BoxFuture;
 
 /// JPEG quality for a captured window.
@@ -98,6 +97,101 @@ impl App {
         self.client.is_running()
     }
 
+    /// Deliver one key event to the program.
+    ///
+    /// The key goes in as a **position**, not a character: the seat derives the
+    /// character and the modifier state from the keymap it holds, so sending a
+    /// position is what lets a modifier and a shifted key mean anything. That is
+    /// also why the modifiers are pressed as their own keys first: a seat learns
+    /// `ctrl` by being sent the control key, and there is no other way to ask.
+    pub fn key(&self, key: &termputs::Key, state: termputs::KeyState) -> std::io::Result<()> {
+        let compositor_state = match state {
+            termputs::KeyState::Pressed | termputs::KeyState::Repeated => {
+                compositor::KeyState::Pressed
+            }
+            termputs::KeyState::Released => compositor::KeyState::Released,
+        };
+
+        // Modifiers only go down on a press. Releasing them on the way out would
+        // fight the sequence: the caller's release of `c` is not a release of
+        // the control key that is still held.
+        if state == termputs::KeyState::Pressed {
+            for modifier in key.modifiers.keycodes() {
+                self.client
+                    .keycode(modifier.to_evdev(), compositor::KeyState::Pressed)
+                    .map_err(std::io::Error::other)?;
+            }
+        }
+
+        let Some(keycode) = key.keycode() else {
+            // A key with no position: the modifier keys above have already gone
+            // down, so they are put back up rather than left held.
+            return self.release_modifiers(key);
+        };
+        self.client
+            .keycode(keycode.to_evdev(), compositor_state)
+            .map_err(std::io::Error::other)?;
+
+        if state == termputs::KeyState::Released {
+            return self.release_modifiers(key);
+        }
+        Ok(())
+    }
+
+    /// Raise the modifiers a key was holding.
+    fn release_modifiers(&self, key: &termputs::Key) -> std::io::Result<()> {
+        for modifier in key.modifiers.keycodes().into_iter().rev() {
+            self.client
+                .keycode(modifier.to_evdev(), compositor::KeyState::Released)
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    /// Move the pointer, in **output pixels**: the compositor's pointer has no
+    /// idea what a terminal cell is.
+    pub fn mouse_move(&self, x: f64, y: f64) -> std::io::Result<()> {
+        self.client.move_mouse(x, y).map_err(std::io::Error::other)
+    }
+
+    /// Press or release a pointer button at the pointer's current position.
+    pub fn mouse_button(
+        &self,
+        button: termputs::Button,
+        down: bool,
+    ) -> std::io::Result<()> {
+        // The compositor's `click` is a press and release in one call, so a
+        // release has nothing to do: the button is already up.
+        if !down {
+            return Ok(());
+        }
+        let button = match button {
+            termputs::Button::Left => compositor::Button::Left,
+            termputs::Button::Right => compositor::Button::Right,
+            termputs::Button::Middle => compositor::Button::Middle,
+        };
+        self.client.click(button).map_err(std::io::Error::other)
+    }
+
+    /// Scroll by one wheel step in `direction`.
+    pub fn mouse_scroll(&self, direction: termputs::Scroll) -> std::io::Result<()> {
+        // Positive vertical is down, which is what a terminal's scroll-down
+        // means, so the direction maps straight across.
+        let delta = match direction {
+            termputs::Scroll::Up => compositor::ScrollDelta::vertical(-1),
+            termputs::Scroll::Down => compositor::ScrollDelta::vertical(1),
+            termputs::Scroll::Left => compositor::ScrollDelta {
+                vertical: 0,
+                horizontal: -1,
+            },
+            termputs::Scroll::Right => compositor::ScrollDelta {
+                vertical: 0,
+                horizontal: 1,
+            },
+        };
+        self.client.scroll(delta).map_err(std::io::Error::other)
+    }
+
     /// The next frame, as JPEG, or `None` when there is nothing new to send.
     ///
     /// `None` is not an end and not an error: a window that has not repainted has nothing
@@ -135,180 +229,5 @@ impl App {
         };
         self.last = Some(frame.rgba);
         Some(jpeg)
-    }
-
-    /// Deliver everything that arrives on `stdin` to the running program.
-    ///
-    /// Blocking, and on a thread of its own: it reads a descriptor for as long as the
-    /// session lasts, and nothing else in this client may wait like that. Every byte here
-    /// is input — the terminal's answers to this side's graphics escapes are consumed by
-    /// `tui`'s router before they reach this client — so nothing has to be told apart from
-    /// a keystroke.
-    ///
-    /// Borrows the app rather than taking it: the caller keeps reading frames from the same
-    /// program while this thread feeds it keys, and the handle that does either is
-    /// cloneable.
-    pub fn route_input(&self, stdin: impl Read + Send + 'static) -> std::io::Result<()> {
-        let client = self.client.clone();
-        std::thread::Builder::new()
-            .name("gui-input".into())
-            .spawn(move || {
-                let mut input = stdin;
-                let mut buf = [0u8; 1024];
-                loop {
-                    match input.read(&mut buf) {
-                        Ok(0) => return,
-                        Ok(n) => {
-                            for key in keys(&buf[..n]) {
-                                // A failure means the compositor has gone, so there is
-                                // nothing left to type into.
-                                if client.type_key(key).is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(e) => {
-                            log::info!("the keyboard ended: {e}");
-                            return;
-                        }
-                    }
-                }
-            })
-            .map(|_| ())
-    }
-}
-
-/// The key events in one chunk of terminal input.
-///
-/// A terminal sends printable keys as themselves and everything else as an escape
-/// sequence, so this walks the bytes and looks only for the sequences that name a key.
-/// An escape sequence it does not recognize is skipped rather than typed: sending the
-/// bytes of an unknown sequence would type its `ESC`, its `[`, and its parameter digits
-/// into the program, which is worse than doing nothing.
-fn keys(bytes: &[u8]) -> Vec<Key> {
-    let mut keys = Vec::new();
-    let mut rest = bytes;
-    while let Some(&first) = rest.first() {
-        rest = &rest[1..];
-        match first {
-            0x1b => {
-                let Some(body) = rest.strip_prefix(b"[") else {
-                    // A bare `ESC`: the one escape that is its own key. A sequence split
-                    // across two reads is the limit of this, and it costs a stray Esc.
-                    keys.push(Key::Escape);
-                    continue;
-                };
-                // `ESC [ <params> <final>`. The parameters are skipped: which key this is
-                // is decided by the final byte alone, and the modifiers some terminals
-                // append (`1;5A`) are not distinguishable in the compositor's key set.
-                let end = body
-                    .iter()
-                    .position(|b| (0x40..=0x7e).contains(b))
-                    .unwrap_or(body.len());
-                match body.get(end) {
-                    Some(b'A') => keys.push(Key::Up),
-                    Some(b'B') => keys.push(Key::Down),
-                    Some(b'C') => keys.push(Key::Right),
-                    Some(b'D') => keys.push(Key::Left),
-                    Some(b'H') => keys.push(Key::Home),
-                    Some(b'F') => keys.push(Key::End),
-                    _ => {}
-                }
-                // Past the final byte. A truncated sequence ends the chunk.
-                rest = body.get(end + 1..).unwrap_or_default();
-            }
-            b'\r' | b'\n' => keys.push(Key::Return),
-            b'\t' => keys.push(Key::Tab),
-            // Both are what terminals send for the backspace key, depending on whether
-            // the erase character is `^H` or `DEL`.
-            0x08 | 0x7f => keys.push(Key::Backspace),
-            // Printable ASCII, which is what a key press produces. A control byte is not
-            // a key in the compositor's set, and dropping one is better than typing
-            // something the user did not.
-            0x20..=0x7e => keys.push(Key::Char(first as char)),
-            _ => {}
-        }
-    }
-    keys
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// One chunk, the way `route_input` hands it over.
-    fn decoded(input: &str) -> Vec<Key> {
-        keys(input.as_bytes())
-    }
-
-    #[test]
-    fn a_run_of_letters_is_a_run_of_keys() {
-        assert_eq!(
-            decoded("hi"),
-            [Key::Char('h'), Key::Char('i')],
-            "each printable byte is its own key press"
-        );
-    }
-
-    /// The sequences a terminal actually sends for the keys the compositor names.
-    ///
-    /// This is the assertion that matters: the cursor keys are multi-byte escapes, and
-    /// getting the parse wrong types `ESC`, `[`, and `A` into the program instead of
-    /// moving the cursor.
-    #[test]
-    fn cursor_and_editing_sequences_are_named_keys() {
-        assert_eq!(decoded("\x1b[A"), [Key::Up]);
-        assert_eq!(decoded("\x1b[B"), [Key::Down]);
-        assert_eq!(decoded("\x1b[C"), [Key::Right]);
-        assert_eq!(decoded("\x1b[D"), [Key::Left]);
-        assert_eq!(decoded("\x1b[H"), [Key::Home]);
-        assert_eq!(decoded("\x1b[F"), [Key::End]);
-    }
-
-    /// A sequence either side of a printable key must not swallow that key, and the
-    /// printable key must not interrupt the sequence's own parse.
-    #[test]
-    fn a_sequence_next_to_a_letter_is_two_keys() {
-        assert_eq!(decoded("\x1b[Aa"), [Key::Up, Key::Char('a')]);
-        assert_eq!(decoded("a\x1b[A"), [Key::Char('a'), Key::Up]);
-        assert_eq!(decoded("a\x1b[Ab"), [Key::Char('a'), Key::Up, Key::Char('b')]);
-    }
-
-    /// A sequence with parameters, which is what a terminal sends when a modifier is
-    /// held. The key is the final byte regardless of the parameters in front of it.
-    #[test]
-    fn parameters_before_the_final_byte_are_skipped() {
-        assert_eq!(decoded("\x1b[1;5A"), [Key::Up]);
-        assert_eq!(decoded("\x1b[3~"), [], "an unnamed final byte is not a key");
-    }
-
-    #[test]
-    fn control_bytes_are_the_keys_that_have_names() {
-        assert_eq!(decoded("\r"), [Key::Return]);
-        assert_eq!(decoded("\n"), [Key::Return]);
-        assert_eq!(decoded("\t"), [Key::Tab]);
-        assert_eq!(decoded("\x7f"), [Key::Backspace]);
-        assert_eq!(decoded("\x08"), [Key::Backspace]);
-        assert_eq!(decoded("\x1b"), [Key::Escape]);
-    }
-
-    /// A control byte with no name is dropped rather than typed as something else.
-    #[test]
-    fn an_unnamed_control_byte_is_dropped() {
-        assert_eq!(decoded("\x00\x01\x02"), []);
-        // Surrounded, so the drop is a gap and not the end of the run.
-        assert_eq!(
-            decoded("a\x00b"),
-            [Key::Char('a'), Key::Char('b')],
-            "an unnamed byte must not stop the ones after it"
-        );
-    }
-
-    /// A truncated escape is the split-read case: the rest of the sequence has not
-    /// arrived. Only the `ESC` is lost, and nothing is typed from the fragment.
-    #[test]
-    fn a_truncated_sequence_types_nothing_from_its_fragment() {
-        assert_eq!(decoded("\x1b[1;5"), []);
     }
 }

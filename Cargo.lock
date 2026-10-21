@@ -284,6 +284,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstr"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bb31b46c14244e20ee9984b11bf5c992b91fb6939fea616e3512c8baecdbe5f"
+dependencies = [
+ "memchr",
+ "serde_core",
+]
+
+[[package]]
 name = "built"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -683,6 +693,12 @@ dependencies = [
  "quote",
  "syn 3.0.6",
 ]
+
+[[package]]
+name = "debug-fn"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24efe21bd9a78102d1225f10f0a41d9d5b43f4df7ae8235f39a9c79e4d476c1e"
 
 [[package]]
 name = "deltae"
@@ -1168,6 +1184,7 @@ dependencies = [
  "pollster",
  "ratatui",
  "rustix 1.1.5",
+ "termputs",
  "tokio",
  "turbojpeg",
  "wire",
@@ -1326,6 +1343,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "isnt"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1697e6b71679da96d5c41bb9035116141baadbf59a60625fd66cb3c9584e7b0"
+
+[[package]]
 name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1382,6 +1405,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbvm"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87848566101698caf999ac33fca97f46a4127150168280a384ebf2987a46a194"
+dependencies = [
+ "arrayvec",
+ "bstr",
+ "cfg-if",
+ "debug-fn",
+ "hashbrown 0.17.1",
+ "indexmap",
+ "isnt",
+ "kbvm-proc",
+ "linearize",
+ "pkg-config",
+ "secure-execution",
+ "smallvec",
+ "thiserror 2.0.21",
+ "unicode-width",
+]
+
+[[package]]
+name = "kbvm-proc"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "634c57aa7634150e449ddee5625e759a71077e9f71d44677bea5ad7196ca91da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
 name = "lab"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1428,6 +1484,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e752191d037c44ad111a8caa762921926658402f01cc1253f7bef2020ece4f5e"
 dependencies = [
  "bitflags 2.13.2",
+]
+
+[[package]]
+name = "linearize"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f8c5e7ca4987243a1ced6f0ecad7c7731650479bdc52997687eff4e912fef9f"
+dependencies = [
+ "cfg-if",
+ "linearize-derive",
+ "version_check",
+]
+
+[[package]]
+name = "linearize-derive"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "401d53eac39730352d7443646e75fda6cb933bf6dff060fe20a4f0d979f1bef3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -2433,6 +2511,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "secure-execution"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23ceccce47e43305aa02a0d9182ad09364357d073447435d7ae2e219ce750e55"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2766,12 +2853,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "terminput"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33fe296cb813b5bad99a8eb911e6a08e48f0854ee1e8b427073e657a509a7097"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
 name = "termios"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "411c5bf740737c7918b8b1fe232dca4dc9f8e754b8ad5e20966814001ed0ac6b"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "termputs"
+version = "0.1.0"
+dependencies = [
+ "kbvm",
+ "log",
+ "terminput",
 ]
 
 [[package]]

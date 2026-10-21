@@ -57,6 +57,14 @@ pub fn socket_path() -> std::path::PathBuf {
 /// has to be told for the image to have somewhere to be.
 pub const FILL: char = '❋';
 
+/// This terminal's input, boxed so a caller may hand in its own.
+///
+/// The session holds one of these for its whole life, and `Gui::run` is generic
+/// over what it was given, so the two handles are boxed rather than named.
+pub type Input = Box<dyn std::io::Read + Send>;
+/// This terminal's output, boxed for the same reason.
+pub type Output = Box<dyn std::io::Write + Send>;
+
 /// One session: where it is, and what is open over it.
 pub struct Session {
     /// Where the session is, or what went wrong getting there.
@@ -77,16 +85,41 @@ pub struct Session {
     /// Fixed when the session starts: the compositor's output being the window is what
     /// the MVP fixes, so this is read once and reused for every later step.
     pub size: (u32, u32),
+    /// This terminal's input, with the mouse and keyboard protocols requested.
+    ///
+    /// Kept for the whole session and not per frame: it owns the requests that
+    /// turn reporting on, so dropping it between frames would turn a terminal's
+    /// mouse reporting off and on again. The `Capture`s it hands out are the
+    /// disposable part.
+    pub input_listener: termputs::Listener<Input, Output>,
+    /// What one terminal cell is in output pixels.
+    ///
+    /// A mouse event arrives in cells and the compositor's pointer is in pixels,
+    /// so this is the conversion, and it is the same cell size `output_size`
+    /// derived the output from.
+    pub cell: (u32, u32),
 }
 
 impl Session {
-    pub fn new(program: std::path::PathBuf, size: (u32, u32)) -> Self {
+    /// Start a session over a terminal's input.
+    ///
+    /// The listener is made here, not later, because making it is what asks the
+    /// terminal for its mouse and keyboard events: a session that waited until
+    /// it was streaming would miss everything typed while it connected.
+    pub fn new(
+        program: std::path::PathBuf,
+        size: (u32, u32),
+        cell: (u32, u32),
+        input: termputs::Listener<Input, Output>,
+    ) -> Self {
         Self {
             state: Ok(State::ConnSelect),
             popup_state: PopupState::None,
             footer: Footer,
             program,
             size,
+            cell,
+            input_listener: input,
         }
     }
 
@@ -121,7 +154,7 @@ impl StatefulWidget for GuiWidget {
         // on screen for the next frame to draw.
         let taken = std::mem::replace(&mut session.state, Err(INTERNAL_ERROR.to_string()));
         session.state = taken.and_then(|state| {
-            pollster::block_on(state.render(content, buf, &session.program, session.size))
+            pollster::block_on(state.render(content, buf, session))
         });
 
         // Whether the step failed just now or failed on an earlier frame, the pane says

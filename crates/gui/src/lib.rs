@@ -84,8 +84,27 @@ impl Gui {
 
         // The output size is the terminal's own, read once: the compositor's output is the
         // program's window, and it does not change while the session runs.
-        let size = output_size()?;
-        let mut session = Session::new(self.program, size);
+        let Size { output, cell } = output_size()?;
+
+        // The terminal is asked for its mouse and keyboard events before the
+        // session starts, so nothing typed while it connects is lost.
+        //
+        // This end owns its own terminal, and its line discipline has to go: with
+        // `ECHO` on the kernel writes every keystroke straight back out, and with
+        // `ICANON` on nothing is delivered until a newline. Both are invisible to
+        // this process until it fixes them, and both are the difference between
+        // reading keys and reading the echo of keys.
+        // Held for the whole session: dropping it restores the terminal, which is
+        // what the name and the lack of an underscore say.
+        let _tty = Raw::install()?;
+        // Then non-blocking, so a capture's reader can give the descriptor back.
+        make_nonblocking(STDIN_FILENO)?;
+        let listener = termputs::Listener::new(
+            Box::new(stdin) as widget::Input,
+            Box::new(std::io::stdout()) as widget::Output,
+        )?;
+
+        let mut session = Session::new(self.program, output, cell, listener);
 
         loop {
             terminal.draw(|frame| {
@@ -98,10 +117,12 @@ impl Gui {
     }
 }
 
-/// The size of this terminal in pixels, for the compositor's output.
+/// The size of this terminal, in output pixels and in one cell.
 ///
 /// Taken from the terminal itself: the pane's geometry is what the picture is fitted to, so
-/// an output sized to it is one the program lays itself out against correctly.
+/// an output sized to it is one the program lays itself out against correctly. The cell size
+/// is kept as well, because a mouse event arrives in cells and the compositor's pointer is
+/// in pixels, so a click has to be converted with exactly the cell this derived.
 ///
 /// The pixel fields of a terminal's window size are documented as unreliable and often zero
 /// — they are a property of the graphics layer, not the tty. A terminal that does not report
@@ -109,7 +130,7 @@ impl Gui {
 /// reported pixels directly would be `0x0` in that case, and a zero-sized output is not a
 /// small window: it is no surface at all, so a program started into it never commits a
 /// buffer and never says why.
-fn output_size() -> std::io::Result<(u32, u32)> {
+fn output_size() -> std::io::Result<Size> {
     let ws = ratatui::crossterm::terminal::window_size()?;
     let (cols, rows) = (ws.columns as u32, ws.rows as u32);
     let (cell_w, cell_h) = match (ws.width, ws.height) {
@@ -119,15 +140,85 @@ fn output_size() -> std::io::Result<(u32, u32)> {
         ),
         _ => DEFAULT_CELL,
     };
-    let size = (cols.max(1) * cell_w, rows.max(1) * cell_h);
+    let output = (cols.max(1) * cell_w, rows.max(1) * cell_h);
     log::info!(
         "the terminal reports {cols}x{rows} cells, {}x{} pixels -> cell {cell_w}x{cell_h}, output {}x{}",
         ws.width,
         ws.height,
-        size.0,
-        size.1
+        output.0,
+        output.1
     );
-    Ok(size)
+    Ok(Size {
+        output,
+        cell: (cell_w, cell_h),
+    })
+}
+
+/// The terminal's size: the output in pixels, and one cell in pixels.
+struct Size {
+    /// The whole pane, in pixels, which is the compositor's output.
+    output: (u32, u32),
+    /// One cell, in pixels: how a mouse position in cells becomes a pointer in
+    /// pixels.
+    cell: (u32, u32),
+}
+
+/// Put a descriptor into non-blocking mode.
+///
+/// A capture's reader has to return when it is told to stop, and a blocking read
+/// does not: the flag is checked between reads, so a read that never returns is a
+/// capture that never finishes. The descriptor stays non-blocking for the rest of
+/// the session, which is what the reader polls.
+fn make_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // `F_GETFL` then `F_SETFL` with the flag added: setting the flags outright
+    // would clear the ones this did not ask about.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let flags = rustix::fs::fcntl_getfl(fd).map_err(std::io::Error::from)?;
+    rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(std::io::Error::from)?;
+    Ok(())
+}
+
+/// The descriptor a program's own standard input is on.
+const STDIN_FILENO: std::os::fd::RawFd = 0;
+
+/// Holds this terminal in raw mode, and restores the old settings when dropped.
+///
+/// Raw mode is not optional for a program that reads keys: with the line
+/// discipline on, every keystroke is echoed by the kernel, keys are held until a
+/// newline, and `Ctrl+C` never arrives as a byte because `ISIG` turns it into a
+/// signal for this process. The session is a client, so it must be the one that
+/// sees the bytes.
+struct Raw {
+    original: rustix::termios::Termios,
+}
+
+impl Raw {
+    /// Put this process's stdin in raw mode, and put it back on drop.
+    fn install() -> std::io::Result<Self> {
+        let stdin = std::io::stdin();
+        let original = rustix::termios::tcgetattr(&stdin).map_err(std::io::Error::from)?;
+        let mut raw = original.clone();
+        raw.make_raw();
+        // `make_raw` clears `ISIG`, which turns `^C` from a signal into a byte.
+        // It is put back so `^C` still interrupts this process: the session has
+        // no other way out, and a client that cannot be stopped is worse than one
+        // that cannot forward an interrupt.
+        raw.local_modes.insert(rustix::termios::LocalModes::ISIG);
+        rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &raw)
+            .map_err(std::io::Error::from)?;
+        Ok(Self { original })
+    }
+}
+
+impl Drop for Raw {
+    fn drop(&mut self) {
+        let _ = rustix::termios::tcsetattr(
+            std::io::stdin(),
+            rustix::termios::OptionalActions::Now,
+            &self.original,
+        );
+    }
 }
 
 /// The cell size assumed when the terminal does not report one, in pixels.

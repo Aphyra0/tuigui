@@ -13,6 +13,9 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 # The compositor an app runs inside, and the capture of the window it draws there.
 compositor = { workspace = true }
+# The terminal's input, as events, with keys mapped to the codes the compositor's
+# seat takes.
+termputs = { workspace = true }
 # SIMD JPEG encoding. `image`'s encoder is scalar and was the single largest
 # cost in the frame budget; this one is libjpeg-turbo. `image` is no longer a
 # dependency here: frames go from ffmpeg's RGB buffer straight into the encoder.

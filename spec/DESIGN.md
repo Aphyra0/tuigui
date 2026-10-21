@@ -162,6 +162,10 @@ and has no DCT in it.
 | | |
 |---|---|
 | [COMP.md](COMP.md) | the compositor, with Xwayland. Built. |
+| [MULTIWINDOW.md](MULTIWINDOW.md) | who holds a window (compositor: registry; `gui`: layout) and why the compositor does not flatten. Decided, nothing built. |
+| [DIRECTION.md](DIRECTION.md) | wrapping the terminal instead of the muxer, evaluated and rejected; detach mode and the terminal-coverage ladder survive it. |
+| [SHARE.md](SHARE.md) | a `shared` transport: dial out to our relay, get a URL, view in any browser. Escape hatch and standalone sharing feature. An idea. |
+| [DEVSHARE.md](DEVSHARE.md) | the IDE slice of sharing: the run button launching a detached `gui`, and a coworker taking the wheel over a link. An idea. |
 | [REMOTE.md](REMOTE.md) | the app on another machine from the terminal. Planned. |
 | [SSH_SEAM.md](SSH_SEAM.md) | attaching a forward to an ssh we do not own, for that. Planned. |
 | [REVERSE_SSH.md](REVERSE_SSH.md) | the pane ssh-ing back to the user, instead. An idea. |

@@ -414,6 +414,45 @@ impl CompState {
         Ok(())
     }
 
+    /// Deliver a key by its evdev code, with no character resolution here.
+    ///
+    /// The seat takes a keycode and derives its modifier state from the keys it
+    /// sees, so anything that knows a key position can drive it directly. That
+    /// is what makes a modifier and a shifted character expressible at all: the
+    /// `Key` enum is a character plus a small set of named keys, and a character
+    /// cannot carry a modifier.
+    pub fn handle_keycode(
+        &mut self,
+        evdev: u32,
+        state: KeyState,
+    ) -> Result<(), CompError> {
+        let Some(surface) = self.focus_surface() else {
+            return Err(CompError::NotReady);
+        };
+        let keyboard = self.seat.get_keyboard().ok_or(CompError::NotReady)?;
+        if !keyboard.is_focused() {
+            let serial = self.next_serial();
+            keyboard.set_focus(self, Some(surface), serial);
+        }
+        // Wayland keycodes are evdev codes plus 8 (X11's offset), which is the
+        // conversion this compositor's own `Key` also performs.
+        let keycode = smithay::backend::input::Keycode::new(evdev + 8);
+        let serial = self.next_serial();
+        let time = server_time();
+        keyboard.input(
+            self,
+            keycode,
+            match state {
+                KeyState::Pressed => smithay::backend::input::KeyState::Pressed,
+                KeyState::Released => smithay::backend::input::KeyState::Released,
+            },
+            serial,
+            time,
+            |_, _, _| FilterResult::Forward::<()>,
+        );
+        Ok(())
+    }
+
     pub fn handle_mouse_move(&mut self, x: f64, y: f64) -> Result<(), CompError> {
         let Some(surface) = self.focus_surface() else {
             return Err(CompError::NotReady);
@@ -726,6 +765,13 @@ pub fn run_thread(
                 reply,
             } => {
                 let _ = reply.send(state.handle_key(key, ks));
+            }
+            Request::Keycode {
+                evdev,
+                state: ks,
+                reply,
+            } => {
+                let _ = reply.send(state.handle_keycode(evdev, ks));
             }
             Request::MouseMove { x, y, reply } => {
                 let _ = reply.send(state.handle_mouse_move(x, y));

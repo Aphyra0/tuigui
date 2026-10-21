@@ -25,7 +25,7 @@ use wire::unix::UnixSocket;
 
 use crate::compositor::App;
 
-use super::{socket_path, CONNECTIONS, FILL};
+use super::{socket_path, Session, CONNECTIONS, FILL};
 
 /// How long a quiet link is waited on before the window is looked at again.
 ///
@@ -75,7 +75,19 @@ pub enum State {
         starting: BoxFuture<'static, std::io::Result<App>>,
     },
     /// The program's window is being captured and sent, through the link that is up.
-    Streaming(Connection, App),
+    Streaming {
+        connection: Connection,
+        app: App,
+        /// The input read this frame, started on the previous one.
+        ///
+        /// A capture is one round of reading: it exists while a thread appends
+        /// to it, and finishing it returns everything that arrived. Keeping it
+        /// across a frame is what makes the read overlap with the frame -- the
+        /// terminal is being read while the window is being encoded -- and it is
+        /// started again immediately after being finished so the next frame has
+        /// one too.
+        capture: termputs::Capture,
+    },
     /// The session is over. Not a failure: it is how a session is meant to finish.
     ///
     /// A state and not a return, so the one thing left to draw — that it ended — is drawn
@@ -95,8 +107,7 @@ impl State {
         self,
         content: Rect,
         buf: &mut Buffer,
-        program: &std::path::Path,
-        size: (u32, u32),
+        session: &mut Session,
     ) -> Result<State, String> {
         match self {
             // The choice, and then straight past it.
@@ -183,9 +194,15 @@ impl State {
                         // The program's start is begun now and polled from the next frame,
                         // so the frame that says "starting" is flushed before anything
                         // waits on the program.
-                        log::info!("starting {} at {size:?}", program.display());
-                        let starting = App::start(program, size)
-                            .map_err(|e| format!("could not start {}: {e}", program.display()))?;
+                        log::info!(
+                            "starting {} at {:?}",
+                            session.program.display(),
+                            session.size
+                        );
+                        let starting = App::start(&session.program, session.size)
+                            .map_err(|e| {
+                                format!("could not start {}: {e}", session.program.display())
+                            })?;
                         Ok(State::StartingApp {
                             connection,
                             starting,
@@ -203,7 +220,19 @@ impl State {
             } => {
                 render_centered(content, buf, "starting the program...".to_string());
                 match futures::poll!(starting.as_mut()) {
-                    std::task::Poll::Ready(Ok(app)) => Ok(State::Streaming(connection, app)),
+                    std::task::Poll::Ready(Ok(app)) => {
+                        // The first capture starts here, so the terminal is already
+                        // being read by the time the first frame is drawn.
+                        let capture = session
+                            .input_listener
+                            .capture()
+                            .map_err(|e| format!("could not read the terminal: {e}"))?;
+                        Ok(State::Streaming {
+                            connection,
+                            app,
+                            capture,
+                        })
+                    }
                     std::task::Poll::Ready(Err(e)) => Err(e.to_string()),
                     std::task::Poll::Pending => Ok(State::StartingApp {
                         connection,
@@ -214,7 +243,11 @@ impl State {
 
             // One frame out, or one message in: a link that has gone quiet is still
             // noticed, and the window is looked at again rather than waited on.
-            State::Streaming(connection, mut app) => {
+            State::Streaming {
+                connection,
+                mut app,
+                capture,
+            } => {
                 // The picture's area, black. This is the first colour chosen for it, and
                 // every pixel the terminal draws for the image goes over this.
                 buf.set_style(content, Style::new().bg(Color::Black));
@@ -235,6 +268,23 @@ impl State {
                     return Ok(State::Done);
                 }
 
+                // The input this frame, then the next capture started straight
+                // away so the terminal is being read while this frame is encoded.
+                //
+                // Finishing joins the reader, so nothing is still holding the
+                // input; starting the next one before any of the work below is
+                // what keeps a keystroke from having to wait for a frame.
+                let events = capture.finish();
+                let capture = session
+                    .input_listener
+                    .capture()
+                    .map_err(|e| format!("could not read the terminal: {e}"))?;
+                for event in &events {
+                    if let termputs::InputEvent::Key { key, state } = event {
+                        app.key(key, *state)
+                            .map_err(|e| format!("could not deliver a key: {e}"))?;
+                    }
+                }
                 // A frame if the window has one. Its send is what the frame is for, so it
                 // happens here rather than being handed out.
                 if let Some(jpeg) = app.frame() {
@@ -242,7 +292,11 @@ impl State {
                         .send(&Message::Frame(jpeg))
                         .await
                         .map_err(|e| format!("the link failed: {e}"))?;
-                    return Ok(State::Streaming(connection, app));
+                    return Ok(State::Streaming {
+                        connection,
+                        app,
+                        capture,
+                    });
                 }
 
                 // Nothing to send, so the link gets the turn. A bounded wait, because a
@@ -259,7 +313,11 @@ impl State {
                     // looks at the window again.
                     Err(_) => {}
                 }
-                Ok(State::Streaming(connection, app))
+                Ok(State::Streaming {
+                    connection,
+                    app,
+                    capture,
+                })
             }
 
             // Over. Drawn so the pane says so rather than going blank, which would look

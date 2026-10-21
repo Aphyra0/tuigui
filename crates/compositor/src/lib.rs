@@ -718,6 +718,34 @@ impl Client {
         recv_reply(reply_rx)?
     }
 
+    /// Send a key press + release pair by its evdev code.
+    ///
+    /// The counterpart to [`Client::type_key`] for a caller that knows the key
+    /// position rather than a character. A modifier is not expressible as a
+    /// character, and neither is a shifted one, so anything driving shortcuts
+    /// has to come through here.
+    pub fn type_keycode(&self, evdev: u32) -> Result<(), CompError> {
+        self.keycode(evdev, KeyState::Pressed)?;
+        self.keycode(evdev, KeyState::Released)
+    }
+
+    /// Send a single key event by its evdev code with explicit state.
+    ///
+    /// The seat derives its modifier state from the keys it receives, so a
+    /// chord is a sequence of these: press the modifier, press and release the
+    /// key, release the modifier.
+    pub fn keycode(&self, evdev: u32, state: KeyState) -> Result<(), CompError> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(server::Request::Keycode {
+                evdev,
+                state,
+                reply: reply_tx,
+            })
+            .map_err(|_| CompError::Thread("compositor thread stopped".into()))?;
+        recv_reply(reply_rx)?
+    }
+
     /// Move the pointer to an absolute position inside the window.
     pub fn move_mouse(&self, x: f64, y: f64) -> Result<(), CompError> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();

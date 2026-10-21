@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/easytgp", "crates/wire", "crates/tui", "crates/gui", "crates/compositor"]
+members = [
+    "crates/easytgp",
+    "crates/wire",
+    "crates/tui",
+    "crates/gui",
+    "crates/compositor",
+    "crates/termputs",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -54,6 +61,7 @@ wire = { path = "crates/wire" }
 tui = { path = "crates/tui" }
 gui = { path = "crates/gui" }
 compositor = { path = "crates/compositor" }
+termputs = { path = "crates/termputs" }
 
 [package]
 name = "tuigui"
