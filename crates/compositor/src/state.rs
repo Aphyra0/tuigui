@@ -65,9 +65,9 @@ pub fn server_time() -> u32 {
     BOOT.get_or_init(Instant::now).elapsed().as_millis() as u32
 }
 
-/// Overlay a red disc of radius 3 (the software cursor) onto captured RGBA
-/// pixels at `loc`, so the pointer position is visible even though the
-/// headless output has no real cursor plane. `rgba` is `w * h * 4` RGBA8.
+/// Overlay a red disc of radius 3 (the software cursor) onto captured pixels at
+/// `loc`, so the pointer position is visible even though the headless output has
+/// no real cursor plane. `rgba` is `w * h * 4` bytes of Argb8888 little-endian.
 fn draw_cursor(rgba: &mut [u8], w: u32, h: u32, loc: Point<f64, smithay::utils::Logical>) {
     const R: f64 = 3.0;
     let (cx, cy) = (loc.x, loc.y);
@@ -87,10 +87,10 @@ fn draw_cursor(rgba: &mut [u8], w: u32, h: u32, loc: Point<f64, smithay::utils::
             let dy = y as f64 - cy;
             if dx * dx + dy * dy <= r2 {
                 let o = row + (x as usize) * 4;
-                // RGBA8: R, G, B, A. Pure red cursor.
-                rgba[o] = 255;
+                // Argb8888 little-endian, so the bytes are B, G, R, A. Pure red.
+                rgba[o] = 0;
                 rgba[o + 1] = 0;
-                rgba[o + 2] = 0;
+                rgba[o + 2] = 255;
                 rgba[o + 3] = 255;
             }
         }
@@ -145,9 +145,10 @@ impl CompState {
     ///
     /// A client that honours the output's scale multiplies what it is
     /// configured with to get its buffer, so configuring it with the physical
-    /// resolution would have it allocate that many pixels *times* the scale --
-    /// a buffer larger than the output, of which only a corner is ever shown.
-    /// Dividing by the scale is what makes the two agree.
+    /// resolution would have it lay its interface out at that many logical
+    /// pixels and render each at the scale — the same interface, denser, rather
+    /// than the larger one this is asking for. Dividing by the scale is what
+    /// makes one logical pixel cover `scale` of the output's pixels.
     fn logical_size(&self) -> (u32, u32) {
         let scale = if self.output_scale.is_finite() && self.output_scale > 0.0 {
             self.output_scale
@@ -199,6 +200,7 @@ impl CompositorHandler for CompState {
         // owned pixel store and accumulate damage. (No renderer-side
         // on_commit_buffer_handler — we don't run a GPU renderer.)
         let out_size = self.server_size;
+        let out_scale = self.output_scale;
         let Some(win) = self.window.as_ref() else { return };
         let is_win = win.shared.surface == *surface;
         let is_kid = !is_win
@@ -224,7 +226,7 @@ impl CompositorHandler for CompState {
                     release = Some(buffer.clone());
                 }
             }
-            commit_damage(&attrs.current(), out_size, &mut damage);
+            commit_damage(&attrs.current(), out_size, out_scale, &mut damage);
         });
         // Return the consumed buffer to the client. Firefox's buffer pools wait
         // for `wl_buffer.release` before reusing/allocating; never sending it

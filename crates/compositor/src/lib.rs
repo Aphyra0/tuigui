@@ -282,8 +282,10 @@ pub struct CompositorOptions {
     /// A client that honours this draws its content at this many times the
     /// logical size, so the same interface is legible on a high-density panel
     /// rather than half-sized. The **resolution does not change**: the output's
-    /// mode stays what it was, and a client that scales fills the same pixels
-    /// with larger content. Defaults to 1.0, which is neutral.
+    /// mode stays what it was and the window still fills it. What does change is
+    /// the buffer a client commits, which is its logical size times this, so the
+    /// capture scales that back to the output instead of assuming the two are
+    /// the same. Defaults to 1.0, which is neutral.
     pub scale: f64,
 }
 

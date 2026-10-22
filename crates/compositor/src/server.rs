@@ -227,13 +227,27 @@ impl Server {
     }
 }
 
-/// Clamp a logical-space rect to the output and normalize to pixel-space u32.
-pub fn clamp_rect(rect: Rectangle<i32, smithay::utils::Logical>, size: (u32, u32)) -> Option<Rect> {
-    let (ow, oh) = (size.0 as i32, size.1 as i32);
-    let x0 = rect.loc.x.max(0);
-    let y0 = rect.loc.y.max(0);
-    let x1 = (rect.loc.x + rect.size.w as i32).min(ow);
-    let y1 = (rect.loc.y + rect.size.h as i32).min(oh);
+/// Turn a surface-space damage rect into output pixels, clamped to the output.
+///
+/// Damage arrives in surface coordinates, which are logical: one unit is one
+/// interface pixel, not one output pixel, and the output's scale is what
+/// converts. Clamping first would bound a logical box by a pixel count and
+/// report every rect past the top-left as the wrong size.
+pub fn clamp_rect(
+    rect: Rectangle<i32, smithay::utils::Logical>,
+    size: (u32, u32),
+    scale: f64,
+) -> Option<Rect> {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let (ow, oh) = (size.0 as f64, size.1 as f64);
+    let x0 = ((rect.loc.x as f64 * scale).floor().max(0.0)) as i32;
+    let y0 = ((rect.loc.y as f64 * scale).floor().max(0.0)) as i32;
+    let x1 = (((rect.loc.x + rect.size.w) as f64 * scale).ceil().min(ow)) as i32;
+    let y1 = (((rect.loc.y + rect.size.h) as f64 * scale).ceil().min(oh)) as i32;
     if x1 <= x0 || y1 <= y0 {
         return None;
     }
@@ -243,4 +257,44 @@ pub fn clamp_rect(rect: Rectangle<i32, smithay::utils::Logical>, size: (u32, u32
         width: (x1 - x0) as u32,
         height: (y1 - y0) as u32,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::utils::{Rectangle, Size};
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, smithay::utils::Logical> {
+        Rectangle::new((x, y).into(), Size::from((w, h)))
+    }
+
+    /// Damage is reported in surface coordinates, which are logical. One
+    /// logical pixel is `scale` of the output's pixels, so a rect at the far
+    /// side of the interface reaches the far side of the capture. Bounding it
+    /// by the pixel count first is what reported the whole picture as damaged.
+    #[test]
+    fn damage_is_converted_from_surface_to_output_space() {
+        let (ow, oh) = (1200, 800);
+        let scale = 1.75;
+        let far = clamp_rect(rect(685, 456, 1, 1), (ow, oh), scale).expect("a visible rect");
+        assert_eq!(far, crate::Rect { x: 1198, y: 798, width: 2, height: 2 });
+
+        // A whole-window damage is the whole capture, not the logical size.
+        let all = clamp_rect(rect(0, 0, 686, 457), (ow, oh), scale).expect("a visible rect");
+        assert_eq!(all, crate::Rect { x: 0, y: 0, width: 1200, height: 800 });
+    }
+
+    /// A rect that leaves the output is gone, not clamped to a sliver of it.
+    #[test]
+    fn damage_outside_the_output_is_dropped() {
+        assert_eq!(clamp_rect(rect(700, 500, 10, 10), (1200, 800), 1.75), None);
+        assert_eq!(clamp_rect(rect(-50, -50, 10, 10), (1200, 800), 1.75), None);
+    }
+
+    /// A rect that only partly leaves is clamped to the part that is visible.
+    #[test]
+    fn damage_over_the_edge_is_clamped() {
+        let part = clamp_rect(rect(680, 450, 20, 20), (1200, 800), 1.75).expect("a visible rect");
+        assert_eq!(part, crate::Rect { x: 1190, y: 787, width: 10, height: 13 });
+    }
 }
