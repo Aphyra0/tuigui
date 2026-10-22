@@ -101,8 +101,16 @@ impl Proxy {
             mut dest,
             mut watch,
         } = self;
-        let keyboard =
-            thread::spawn(move || copy(&mut *dest.stdout, &mut *source.stdin));
+        // Named, not `thread::spawn`: an unnamed thread is an unnamed track in
+        // the profiler, and a track with no name is not one that can be found.
+        let keyboard = thread::Builder::new()
+            .name("proxy.keyboard".into())
+            .spawn(move || {
+                // The zone is the subsystem: the keyboard half of the proxy.
+                let _zone = tracing::info_span!("proxy.keyboard").entered();
+                copy(&mut *dest.stdout, &mut *source.stdin)
+            })
+            .expect("the keyboard thread starts");
         let shown = copy_transformed(
             &mut *source.stdout,
             &mut *dest.stdin,
@@ -164,6 +172,7 @@ fn copy_watched<R: Read + ?Sized, W: Write + ?Sized>(
 /// replaced by cells that name an image, and the command never sees the result.
 /// The transform is stateful across reads because a character can straddle two of
 /// them.
+#[tracing::instrument(name = "proxy.forward", skip_all)]
 fn copy_transformed<R: Read + ?Sized, W: Write + ?Sized>(
     from: &mut R,
     to: &mut W,

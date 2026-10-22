@@ -377,6 +377,10 @@ impl Compositor {
         let thread = std::thread::Builder::new()
             .name("compositor".into())
             .spawn(move || {
+                // The zone is the subsystem: every span this thread opens nests
+                // under it, so the timeline says which half of the program is
+                // running without each name having to repeat it.
+                let _zone = tracing::info_span!("compositor").entered();
                 if let Err(e) = state::run_thread(srv, rx, win_rx) {
                     tracing::error!("compositor thread failed: {e}");
                 }
@@ -404,6 +408,7 @@ impl Compositor {
     /// commit, and return a handle. Native Wayland clients reach our private
     /// socket via `WAYLAND_DISPLAY`; X11-only clients are routed to the
     /// XWayland server we own via `DISPLAY`.
+    #[tracing::instrument(name = "spawn", skip_all)]
     pub fn spawn(
         &self,
         path: impl AsRef<std::path::Path>,
@@ -474,6 +479,7 @@ impl Compositor {
             std::thread::Builder::new()
                 .name("compositor-out".into())
                 .spawn(move || {
+                    let _zone = tracing::info_span!("compositor.stdout").entered();
                     let mut tmp = [0u8; 2048];
                     while out.read(&mut tmp).is_ok() {}
                 })
@@ -703,6 +709,7 @@ impl Client {
     ///
     /// This is the efficient path the crate exists for: the pixels are read
     /// straight out of the compositor's own buffer, no protocol round-trip.
+    #[tracing::instrument(name = "capture", skip(self))]
     pub fn capture(&self) -> Result<Frame, CompError> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         self.tx

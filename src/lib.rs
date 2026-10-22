@@ -53,6 +53,10 @@ impl TuiGui {
         if self.gui.loop_video {
             args.push("--dbg-loop-video".into());
         }
+        #[cfg(feature = "tracy")]
+        if self.gui.trace_gui {
+            args.push("--dbg-trace-gui".into());
+        }
         args
     }
 
@@ -66,6 +70,18 @@ impl TuiGui {
     /// the raw text and never an image. Piping the client through the pty also makes
     /// the server the only reader of fd 0, so nothing steals a keystroke.
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // One profiler per session, and one half to look at. The two flags name
+        // the same thing from either end — which half is being profiled — so
+        // both at once is a contradiction rather than a request for more.
+        //
+        // Checked here rather than with clap's `conflicts_with`, which names the
+        // other argument and panics on a command that has no such argument: `tui`
+        // and `gui` each see only their own flag. Only this command sees both.
+        #[cfg(feature = "tracy")]
+        if self.tui.trace_tui && self.gui.trace_gui {
+            return Err("--dbg-trace-tui and --dbg-trace-gui name the same choice; pass one"
+                .into());
+        }
         let session = tui::Tui {
             command: server_command(&self.runnable, &self.client_args()),
             debug: self.tui.clone(),

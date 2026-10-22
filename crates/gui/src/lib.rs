@@ -48,6 +48,10 @@ pub struct Gui {
 /// session has two ends and either can be the reason nothing appears, so each end has its
 /// own switches and each stays with the code it changes.
 #[derive(Debug, Clone, Copy, Default, clap::Args)]
+// A group id of its own: `tuigui` flattens this beside `tui`'s own DebugOptions,
+// and clap names a flattened group after the struct — two of them called the
+// same thing is a command that refuses to build at all.
+#[group(id = "gui-debug")]
 pub struct DebugOptions {
     /// Play the runnable again from the start when it ends, forever.
     ///
@@ -56,6 +60,20 @@ pub struct DebugOptions {
     /// of these switches is needed at all.
     #[arg(long = "dbg-loop-video")]
     pub loop_video: bool,
+    /// Profile this half of the session, so a frame can be looked at rather than
+    /// guessed at.
+    ///
+    /// Turns on the Tracy client, which is what turns this crate's spans into
+    /// zones the profiler can show. Off unless it is asked for: the client is a
+    /// compiled library with a background thread of its own, and a session
+    /// nobody is looking at should not carry it.
+    ///
+    /// Present only in a build with the `tracy` feature — the client is a
+    /// compiled library, so a build without one has nothing to turn on and offers
+    /// no way to ask for one either.
+    #[cfg(feature = "tracy")]
+    #[arg(long = "dbg-trace-gui")]
+    pub trace_gui: bool,
 }
 
 impl Gui {
@@ -74,6 +92,10 @@ impl Gui {
         // Before anything can fail, so the first failure is in the log rather than missing
         // from it.
         let log_path = install_logger();
+        #[cfg(feature = "tracy")]
+        if self.debug.trace_gui {
+            install_tracing()?;
+        }
         log::info!("gui {} starting, log at {}", self.program.display(), log_path.display());
 
         // Drawn to the writer the caller gave, not to `io::stdout()`: the caller is what
@@ -105,6 +127,8 @@ impl Gui {
         let mut session = Session::new(self.program, output, cell, listener);
 
         loop {
+            // The frame's span is on `GuiWidget::render`, which is what one call
+            // to `draw` actually is.
             terminal.draw(|frame| {
                 frame.render_stateful_widget(GuiWidget, frame.area(), &mut session)
             })?;
@@ -242,6 +266,74 @@ fn install_logger() -> std::path::PathBuf {
         log::set_max_level(log::LevelFilter::Trace);
     }
     path
+}
+
+/// Send `tracing`'s spans to the Tracy profiler, so a session can be looked at
+/// rather than guessed at.
+///
+/// The client is the right half to hold it: it is the process that runs the
+/// compositor, and a frame is a capture here, an encode here, and a round trip to
+/// the server — one timeline with all three on it is the whole point.
+///
+/// Cheap enough to be unconditional. Tracy's client records into a lock-free
+/// ring and a background thread drains it to the profiler, so a span costs a few
+/// nanoseconds and nothing at all when no profiler is attached. A switch would
+/// have to be set before the interesting session started, which is the one that
+/// is not already being profiled.
+/// Send `tracing`'s spans to the Tracy profiler, so a session can be looked at
+/// rather than guessed at.
+///
+/// The client is the right half to hold it: it is the process that runs the
+/// compositor, and a frame is a capture here, an encode here, and a round trip
+/// to the server — one timeline with all three on it is the whole point.
+#[cfg(feature = "tracy")]
+fn install_tracing() -> std::io::Result<()> {
+    use tracing::Level;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    // This workspace's crates, and nothing else. A dependency's spans are a wall
+    // of zones that answers none of the questions a frame is profiled for, and
+    // there are far more of them than there are of ours — enough to bury the
+    // picture. Filtered here rather than hidden in the profiler's own UI, so a
+    // trace is clean wherever it is opened and however many processes are
+    // writing to it.
+    let ours = Targets::new()
+        .with_target("compositor", Level::TRACE)
+        .with_target("gui", Level::TRACE)
+        .with_target("tui", Level::TRACE)
+        .with_target("tuigui", Level::TRACE)
+        .with_target("wire", Level::TRACE)
+        .with_target("termputs", Level::TRACE);
+
+    let layer = tracing_tracy::TracyLayer::default();
+
+    // Reported, and not dropped. The client is built by `TracyLayer::default()`,
+    // so it starts listening *before* this returns: a profiler connects and then
+    // shows an empty timeline whenever no subscriber ever reached the spans.
+    //
+    // `set_global_default` and **not** `try_init`. `try_init` also installs a
+    // bridge that takes over the `log` facade, and this process has already
+    // given `log` its own logger — the file every other diagnostic goes to. The
+    // bridge refuses to replace it, `try_init` reports that as its own failure,
+    // and the tracing subscriber is never installed at all. That is the whole
+    // shape of "the profiler connects and there is nothing there".
+    //
+    // A second call fails here too, which is right: one subscriber per process.
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(ours).with(layer))
+    .map_err(|e| {
+        log::error!("could not install the profiler: {e}");
+        std::io::Error::other(format!("could not install the profiler: {e}"))
+    })?;
+
+    // One span, guaranteed, before anything else is instrumented. It answers "is
+    // anything reaching the profiler at all", which is the first question when a
+    // timeline comes back empty.
+    tracing::info!(target: "gui", "profiler installed");
+    // And in the file, so the question can be answered without a profiler at all:
+    // `gui.log` either says this or says why not.
+    log::info!("profiler installed; spans are being sent");
+    Ok(())
 }
 
 /// The one logger: every record is appended to the log file.

@@ -143,6 +143,13 @@ pub struct GuiWidget;
 impl StatefulWidget for GuiWidget {
     type State = Session;
 
+    /// One frame.
+    ///
+    /// The span is here and not around the draw that calls it: this is the one
+    /// call that knows what a frame is made of — the session's step, the
+    /// capture, the encode — so this is where the profiler's timeline should be
+    /// divided. Every stage below it lands inside the frame it belongs to.
+    #[tracing::instrument(name = "frame", skip_all)]
     fn render(self, area: Rect, buf: &mut Buffer, session: &mut Session) {
         // The bottom line holds the buttons, and the rest belongs to the session. Split
         // once, so the state and the buttons agree about where the content ends.

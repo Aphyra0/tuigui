@@ -35,6 +35,19 @@ futures = "0.3"
 # The logging facade. Every diagnostic goes through it rather than to the pane, and the
 # capturer in this crate is the one logger installed.
 log = { workspace = true }
+# Spans become zones in the Tracy profiler, for seeing where a frame's time goes.
+tracing = { workspace = true }
+# The profiler's client, optional and off by default: it is a compiled C++
+# library with a background thread, and it is only worth carrying when a session
+# is being profiled. `just trace` is what turns it on. `tracing` itself stays
+# unconditional — a span with no subscriber is a no-op, so the instrumented code
+# is the same code either way and a `tracy` build sees what actually runs.
+tracing-tracy = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+default = []
+tracy = ["dep:tracing-tracy", "dep:tracing-subscriber"]
 
 [[bin]]
 name = "gui"

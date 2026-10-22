@@ -47,6 +47,29 @@ tracing = "0.1"
 # The logging facade. A binary installs its own capturer, so which crate records a
 # diagnostic is not the same decision as where it ends up.
 log = "0.4"
+# Tracy: a `tracing` span becomes a profiler zone. A binary installs the
+# subscriber, and the profiler it talks to is in the dev shell.
+#
+# Pinned, not ranged. Tracy's protocol is versioned and the profiler refuses a
+# client that speaks a different one, so the crate that bundles the client and
+# the profiler in the dev shell are one decision. `=0.11.4` resolves to
+# `tracy-client-sys` 0.28.0, which bundles Tracy 0.13.x — the version nixpkgs
+# ships and `flake.nix` puts in the dev shell. Bumping either alone breaks the
+# link, so bump both or neither.
+#
+# Only what makes the client work. `system-tracing`, `context-switch-tracing`
+# and `sampling` are on by default, and they record the kernel's context
+# switches and call stacks for **every** process on the machine: a timeline
+# crowded with unnamed threads belonging to everything else that is running,
+# and sample columns standing where the real zones should be. The spans we care
+# about stop being the picture and become the noise. A profile is for this
+# program's threads.
+tracing-subscriber = "0.3"
+tracing-tracy = { version = "=0.11.4", default-features = false, features = [
+    "enable",
+    "broadcast",
+    "callstack-inlines",
+] }
 # `signal` for SIGWINCH: the real terminal reports a resize by signalling, not by sending
 # bytes, and the pty the command runs on has to be told the new size.
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "process", "sync", "time", "macros", "signal"] }
@@ -69,6 +92,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Run the tui server and a gui client as a single unit"
+
+[features]
+default = []
+# Profile the session. Forwards to the two halves, which are the ones that
+# install the subscriber — this crate only starts them. `just trace` builds
+# with it; a plain build links no profiler at all.
+tracy = ["tui/tracy", "gui/tracy"]
 
 [[bin]]
 name = "tuigui"

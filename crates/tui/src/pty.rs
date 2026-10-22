@@ -156,7 +156,13 @@ impl Pty {
         // `select!` arm takes its future by value, and this one has to survive the passes a
         // resize causes. `spawn_blocking`'s handle is cancel-safe, so a pass the resize wins
         // leaves the pump running where it was.
-        let mut forwarded = std::pin::pin!(tokio::task::spawn_blocking(move || proxy.run()));
+        let mut forwarded = std::pin::pin!(tokio::task::spawn_blocking(move || {
+            // The zone is the subsystem: the byte pump between the pty and the
+            // screen, which is the thread every chunk of the command's output
+            // crosses.
+            let _zone = tracing::info_span!("pty.pump").entered();
+            proxy.run()
+        }));
 
         // The real terminal tells us it changed size by signalling, not by sending bytes, so
         // this is a signal stream and not something the proxy's read loop could see: a

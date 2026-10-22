@@ -57,6 +57,7 @@ impl Window {
 /// number. Cropping assumes the two agree, which loses a client's right and
 /// bottom edges when it renders at a higher density and leaves it in a corner
 /// when it does not.
+#[tracing::instrument(name = "map_rgba", skip(buffer, out))]
 pub fn map_rgba(
     buffer: &WlBuffer,
     out: &mut Vec<u8>,
@@ -108,6 +109,7 @@ pub fn map_rgba(
 ///
 /// `src` is `src_size.0 * 4` bytes of picture per row with `src_stride` bytes
 /// between rows, and `dst` is written densely at `dst_size.0 * 4` per row.
+#[tracing::instrument(name = "scale_bgra", skip(src, dst))]
 fn scale_bgra(
     src: &[u8],
     src_stride: usize,
@@ -153,6 +155,7 @@ fn wl_bpp(f: wl_shm::Format) -> usize {
 }
 
 /// Extract commit damage as output-space pixel rects.
+#[tracing::instrument(name = "commit_damage", skip(attrs, out))]
 pub fn commit_damage(
     attrs: &smithay::wayland::compositor::SurfaceAttributes,
     out_size: (u32, u32),

@@ -78,6 +78,39 @@
             '';
           };
 
+          # revdiff — TUI diff-review tool used by the repo's Crush skill
+          # (.agents/skills/revdiff). Not packaged in this nixpkgs pin, so
+          # fetch the upstream static release tarball (hashes match the
+          # published checksums.txt for v1.13.0).
+          revdiff =
+            let
+              srcs = {
+                x86_64-linux = {
+                  url = "https://github.com/umputun/revdiff/releases/download/v1.13.0/revdiff_1.13.0_linux_amd64.tar.gz";
+                  sha256 = "sha256-bML8vcsuhlpwY5RfBzX2mRb2jMIaiGhUIXIzx5PttMc=";
+                };
+                aarch64-linux = {
+                  url = "https://github.com/umputun/revdiff/releases/download/v1.13.0/revdiff_1.13.0_linux_arm64.tar.gz";
+                  sha256 = "sha256-QEkq6zalfxDCvKGlzJX66GnXI2v7BO+32dHD2ChRr/U=";
+                };
+              };
+            in
+            pkgs.stdenv.mkDerivation {
+              pname = "revdiff";
+              version = "1.13.0";
+              src = pkgs.fetchurl srcs.${system};
+              sourceRoot = ".";
+              installPhase = ''
+                install -Dm755 revdiff $out/bin/revdiff
+              '';
+              meta = with pkgs.lib; {
+                description = "Terminal UI for reviewing and annotating diffs";
+                license = licenses.mit;
+                platforms = platforms.linux;
+                mainProgram = "revdiff";
+              };
+            };
+
           # buildRustPackage splits the build into a `cargoDeps` derivation
           # hashed only on Cargo.lock plus the app derivation itself, so
           # dependency objects stay in the store across rebuilds that only
@@ -188,6 +221,18 @@
               pkgs.mesa-demos         # glxgears — classic X11/GL gears test app
               pkgs.xvfb-run
               pkgs.xdotool
+              # The profiler the instrumented halves stream their spans to, and
+              # the version the bundled client speaks to. Tracy's protocol is
+              # versioned: 0.13.1 speaks protocol 76, and the cargo side pins
+              # `tracing-tracy =0.11.4`, which resolves to `tracy-client-sys`
+              # 0.28.0 — the same protocol. A mismatch is a profiler that
+              # refuses the connection, so the two are one decision: bump both
+              # or neither. No nixpkgs revision ships 0.14, so this stays on the
+              # packaged 0.13.1 rather than building one from source.
+              pkgs.tracy
+              # diff-review TUI invoked by .agents/skills/revdiff (binary
+              # release, defined in packages above)
+              self.packages.${system}.revdiff
             ];
           };
         }

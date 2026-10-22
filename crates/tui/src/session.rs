@@ -169,6 +169,14 @@ impl<F: Format> Session<F> {
     /// is decoded here and rebuilt as a request in this session's medium. Which
     /// medium that is is the type parameter, not a runtime choice: [`Format::request`]
     /// is what turns pixels into a request for it.
+    ///
+    /// One span per frame, so the profiler's timeline is divided at the same
+    /// boundary the pane's is. The awaits are inside it, which is why this is
+    /// `#[instrument]` rather than a held guard: `Span::enter`'s guard must not
+    /// outlive an `.await`, and the attribute enters and exits per poll instead.
+    /// The two waits it contains — the terminal's acknowledgement of the
+    /// transmit, and of the placement — are the two numbers this exists to see.
+    #[tracing::instrument(name = "frame", skip(self, jpeg))]
     async fn paint(&mut self, jpeg: &[u8]) -> Result<()> {
         let pixels = if self.state.debug.blue_pixel {
             // The frame is ignored on purpose, so nothing in the wire path, the codec

@@ -2,12 +2,21 @@
 #
 # The recipes exist because the invocations are long and fixed: a target directory that must
 # be `./target` (a different one invalidates every fingerprint and rebuilds the TLS stack), a
-# package to build, and a binary to run. Spelling that out each time is where it goes wrong.
+# package to build, the feature to build it with, and a binary to run. Spelling that out each
+# time is where it goes wrong.
 #
 # Run inside the dev shell (`nix develop`), which is where cargo and the system libraries it
 # links against come from.
 
 target := "./target"
+
+# The profiler's client, linked into every build these recipes make.
+#
+# It is a compiled C++ library, so it only exists when the `tracy` feature is on — and the
+# flags that turn it on (`--dbg-trace-tui`, `--dbg-trace-gui`) are compiled out along with
+# it. Built with it here so a session can be looked at without needing a second way of
+# building it; a plain `cargo build` links no profiler and offers no way to ask for one.
+tracy := "--features=tracy"
 
 # Build the server around a command, then run it in this terminal.
 #
@@ -15,8 +24,7 @@ target := "./target"
 # client inside the server — which is the usual shape, since the client announces itself in
 # the pane's output and the server is what reads it.
 tui *command:
-    CARGO_TARGET_DIR={{target}} cargo build --release -p tui --bins
-    {{target}}/release/tui {{command}}
+    CARGO_TARGET_DIR={{target}} cargo run --release -p tui --bin tui {{tracy}} -- {{command}}
 
 # Build and run the client.
 #
@@ -24,11 +32,9 @@ tui *command:
 # server is reading the pane it draws in. `just tui` with this as the command is the usual
 # way to start it.
 gui *args:
-    CARGO_TARGET_DIR={{target}} cargo build --release -p gui --bins
-    {{target}}/release/gui {{args}}
+    CARGO_TARGET_DIR={{target}} cargo run --release -p gui --bin gui {{tracy}} -- {{args}}
 
 # Build and run both halves as one command: the server owns this terminal, and the client
 # runs inside the pty it creates.
 tuigui *args:
-    CARGO_TARGET_DIR={{target}} cargo build --release -p tuigui --bins
-    {{target}}/release/tuigui {{args}}
+    CARGO_TARGET_DIR={{target}} cargo run --release -p tuigui --bin tuigui {{tracy}} -- {{args}}

@@ -51,6 +51,7 @@ impl App {
     ///
     /// The future owns the compositor, so nothing else has to keep it alive while the wait
     /// runs, and dropping the future shuts both the compositor and the program down.
+    #[tracing::instrument(name = "app.start", skip_all)]
     pub fn start(
         path: &Path,
         size: (u32, u32),
@@ -113,6 +114,7 @@ impl App {
     /// converts a mouse position: an event arrives in the terminal's cells and the
     /// compositor's pointer is in output pixels, so the two do not agree on what a
     /// coordinate means, and the caller is the side that knows the cell.
+    #[tracing::instrument(name = "input", skip(self))]
     pub fn input(
         &self,
         event: &termputs::InputEvent,
@@ -261,6 +263,11 @@ impl App {
     /// to send, and re-sending the frame it already shows would spend the whole budget on
     /// identical bytes. A capture that fails is also `None`, and the caller asks again:
     /// one missed round-trip is not the end of the stream.
+    ///
+    /// Instrumented because this is the one function that knows what a frame cost:
+    /// the capture is a round trip to the compositor's thread, the encode is the
+    /// single largest cost in the budget, and neither is visible from outside.
+    #[tracing::instrument(name = "app.frame", skip(self))]
     pub fn frame(&mut self) -> Option<Vec<u8>> {
         let frame = match self.client.capture() {
             Ok(frame) => frame,
