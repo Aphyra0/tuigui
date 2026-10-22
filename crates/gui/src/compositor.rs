@@ -277,13 +277,16 @@ impl App {
             }
         };
 
+        let _compare = tracing::info_span!("compare").entered();
         if self.last.as_deref() == Some(frame.rgba.as_slice()) {
             return None;
         }
+        drop(_compare);
 
         // The captured buffer is a Wayland `Argb8888` buffer copied byte for byte, whose
         // bytes are B, G, R, A on a little-endian machine. Encoded as `BGRX` so the
         // terminal shows the colours the program used, not a red/blue swap.
+        let _encode = tracing::info_span!("encode").entered();
         let jpeg = match self.encoder.compress_to_vec(turbojpeg::Image {
             pixels: frame.rgba.as_slice(),
             width: frame.width as usize,

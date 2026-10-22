@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use tracing::Instrument;
 use easytgp::{Controller, DynImage, Format, PlacementRequest};
 use wire::message::Message;
 use wire::transport::Connection;
@@ -184,6 +185,7 @@ impl<F: Format> Session<F> {
             // the encode, the transmit and the placement alone.
             image::RgbImage::from_pixel(BLUE.0, BLUE.1, image::Rgb([0, 0, 255]))
         } else {
+            let _decode = tracing::info_span!("decode").entered();
             let decoded = turbojpeg::decompress(jpeg, turbojpeg::PixelFormat::RGB)
                 .map_err(|source| Error::Decode {
                     len: jpeg.len(),
@@ -238,15 +240,20 @@ impl<F: Format> Session<F> {
         // Timed, because this is the one await in the program that a terminal can leave
         // hanging: the acknowledgement it waits for is a reply a terminal may not send,
         // and a session that stalls here shows an empty pane forever with no clue why.
+        let transplace_span = tracing::info_span!("transplace");
         let mut image =
-            tokio::time::timeout(TRANSMIT_TIMEOUT, request.transplace(IMAGE_ID, placement))
-                .await
-                .map_err(|_| Error::TransmitTimeout(TRANSMIT_TIMEOUT))?
-                .map_err(Error::Graphics)?;
+            tokio::time::timeout(
+                TRANSMIT_TIMEOUT,
+                request.transplace(IMAGE_ID, placement).instrument(transplace_span),
+            )
+            .await
+            .map_err(|_| Error::TransmitTimeout(TRANSMIT_TIMEOUT))?
+            .map_err(Error::Graphics)?;
 
         // Waited on: until the placement lands nothing is on screen, so a frame that was
         // not placed is a frame the user never sees.
-        image.sync().await.map_err(Error::Graphics)?;
+        let ack_span = tracing::info_span!("image.sync");
+        image.sync().instrument(ack_span).await.map_err(Error::Graphics)?;
         self.state.image = Some(image);
         Ok(())
     }

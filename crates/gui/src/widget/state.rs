@@ -110,6 +110,7 @@ impl State {
     ///
     /// A failure is handed back rather than drawn: the pane is the widget's, and a step
     /// that drew its own failures would be drawing in a place it does not own.
+    #[tracing::instrument(name = "session.render", skip_all)]
     pub async fn render(
         self,
         content: Rect,

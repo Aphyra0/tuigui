@@ -68,6 +68,7 @@ pub fn server_time() -> u32 {
 /// Overlay a red disc of radius 3 (the software cursor) onto captured pixels at
 /// `loc`, so the pointer position is visible even though the headless output has
 /// no real cursor plane. `rgba` is `w * h * 4` bytes of Argb8888 little-endian.
+#[tracing::instrument(name = "draw_cursor", skip(rgba))]
 fn draw_cursor(rgba: &mut [u8], w: u32, h: u32, loc: Point<f64, smithay::utils::Logical>) {
     const R: f64 = 3.0;
     let (cx, cy) = (loc.x, loc.y);
@@ -195,6 +196,7 @@ impl CompositorHandler for CompState {
         panic!("client has neither ClientState nor XWaylandClientData");
     }
 
+    #[tracing::instrument(name = "commit", skip_all)]
     fn commit(&mut self, surface: &WlSurface) {
         // Software compositing: read the committed buffer straight into our
         // owned pixel store and accumulate damage. (No renderer-side
@@ -376,6 +378,7 @@ impl CompState {
         let _ = reply.send(self.capture_now());
     }
 
+    #[tracing::instrument(name = "capture_now", skip_all)]
     fn capture_now(&mut self) -> Result<crate::Frame, CompError> {
         let Some(win) = self.window.as_ref() else {
             return Err(CompError::NotReady);
@@ -400,6 +403,7 @@ impl CompState {
         // a red disc of radius 3 at the pointer's location. Skipped with
         // `--no-cursor`.
         if self.show_cursor {
+            let _cursor = tracing::info_span!("draw_cursor").entered();
             draw_cursor(&mut rgba, w, h, self.pointer_loc);
         }
         let damage = std::mem::take(&mut *win.damage.lock().unwrap());
