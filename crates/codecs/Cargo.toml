@@ -11,6 +11,12 @@ description = "The codec pair a session streams with, behind traits a codec can 
 # Both halves of the codec live in this one dependency, which is also how the
 # two halves of a session agree on the codec: by sharing it.
 rusty_h264 = "0.16"
+# The JPEG pair: libjpeg-turbo, SIMD, linked via pkg-config against the dev
+# shell's library. Chosen because it was the codec the project streamed with
+# before H.264, and because a JPEG frame is a complete picture, which makes it
+# the codec of least commitment for a pane that does not need temporal
+# compression.
+turbojpeg = { version = "1.5", default-features = false, features = ["pkg-config", "require-simd"] }
 # One error type for both halves of the codec pair.
 thiserror = { workspace = true }
 # The codec id a session announces travels in a message archive, so it must be

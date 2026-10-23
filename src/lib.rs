@@ -37,6 +37,9 @@ pub struct TuiGui {
     /// The server's switches, used by the server this command starts.
     #[command(flatten)]
     pub tui: tui::DebugOptions,
+    /// The codec the session streams with, chosen here and announced on the wire.
+    #[command(flatten)]
+    pub streaming: gui::StreamingOptions,
     /// The client's switches, passed on to the client this command starts.
     #[command(flatten)]
     pub gui: gui::DebugOptions,
@@ -50,6 +53,15 @@ impl TuiGui {
     /// and it sits next to the code that passes it on.
     fn client_args(&self) -> Vec<String> {
         let mut args = Vec::new();
+        // The codec is a choice the client process is told about, because the
+        // announcement on the wire is its to make. Neither flag means the
+        // client's own default, which is JPEG.
+        if self.streaming.h264 {
+            args.push("--h264".into());
+        }
+        if self.streaming.jpeg {
+            args.push("--jpeg".into());
+        }
         if self.gui.loop_video {
             args.push("--dbg-loop-video".into());
         }

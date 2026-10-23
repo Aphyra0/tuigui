@@ -13,6 +13,7 @@
 //! own history.
 
 pub mod h264;
+pub mod jpeg;
 
 /// The codec a session streams with, named so both halves can agree.
 ///
@@ -57,17 +58,14 @@ pub trait Decoder {
     fn decode(&mut self, stream: &[u8]) -> Result<Option<Frame>, Error>;
 }
 
-/// Build the encoder the client will stream with, for the codec it announced.
-///
-/// The stream's size is not known until the first capture arrives, so what
-/// this builds is the codec's shell; the encoder itself is built from the
-/// first frame's dimensions.
-///
-/// # Errors
-///
-/// Fails for a codec this build does not carry, which the client reports
-/// rather than streams past.
 impl CodecId {
+    /// Build the decoder for the codec the client announced, which the server
+    /// keeps for the session.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a codec this build does not carry, which is the server's to
+    /// report back as an [`wire::message::Message::Error`] rather than a guess.
     /// Build the decoder for the codec the client announced, which the server
     /// keeps for the session.
     ///
@@ -78,7 +76,7 @@ impl CodecId {
     pub fn to_decoder(self) -> Result<Box<dyn Decoder>, Error> {
         match self {
             Self::H264 => Ok(Box::new(h264::Decoder::new())),
-            Self::Jpeg => Err(Error::Unsupported(self)),
+            Self::Jpeg => Ok(Box::new(jpeg::Decoder::new()?)),
         }
     }
 }
@@ -130,7 +128,8 @@ impl std::fmt::Debug for Frame {
 ///
 /// A caller cannot fix a codec error; what it does with one is decided by
 /// whose side it is on, and the type exists so that decision is a match arm
-/// rather than a string comparison.
+/// rather than a string comparison. Each codec's own error travels as the
+/// source, so its wording is not lost.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The encoder refused a frame.
@@ -139,7 +138,7 @@ pub enum Error {
         width: u32,
         height: u32,
         #[source]
-        source: rusty_h264::EncodeError,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// The decoder refused a stretch of stream.
@@ -147,8 +146,12 @@ pub enum Error {
     Decode {
         len: usize,
         #[source]
-        source: rusty_h264::DecodeError,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    /// The codec itself could not be built.
+    #[error("the codec could not be built: {0}")]
+    Build(Box<dyn std::error::Error + Send + Sync>),
 
     /// A codec this build does not carry was asked for.
     #[error("the {0:?} codec is not implemented")]
@@ -157,4 +160,11 @@ pub enum Error {
     /// A pixel conversion between the capture's colors and the codec's failed.
     #[error("converting pixels: {0}")]
     Conversion(#[from] yuvutils_rs::YuvError),
+}
+
+impl Error {
+    /// A codec's own error, as the source of this one.
+    pub fn boxed(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Build(Box::new(error))
+    }
 }

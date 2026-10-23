@@ -51,9 +51,9 @@ impl Encoder {
         config.gop_size = GOP;
         config.lookahead = 0;
         let inner = rusty_h264::Encoder::new(config).map_err(|e| Error::Encode {
-            width,
-            height,
-            source: e,
+        width,
+        height,
+        source: Box::new(e),
         })?;
         Ok(Self { inner })
     }
@@ -132,7 +132,7 @@ impl crate::Decoder for Decoder {
             Ok(None) => Ok(self.last.clone()),
             Err(e) => Err(Error::Decode {
                 len: stream.len(),
-                source: e,
+                source: Box::new(e),
             }),
         }
     }

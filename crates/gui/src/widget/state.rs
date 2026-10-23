@@ -19,7 +19,6 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget as _};
-use codecs::CodecId;
 use wire::message::Message;
 use wire::transport::{BoxFuture, Connection, Transport};
 use wire::unix::UnixSocket;
@@ -206,7 +205,7 @@ impl State {
                         // announcement is reported rather than waited on.
                         tokio::time::timeout(
                             SEND_TIMEOUT,
-                            connection.send(&Message::InitStreaming { codec: CodecId::H264 }),
+                            connection.send(&Message::InitStreaming { codec: session.codec }),
                         )
                         .await
                         .map_err(|_| format!("the link did not take the codec within {SEND_TIMEOUT:?}"))?
@@ -219,7 +218,7 @@ impl State {
                             session.program.display(),
                             session.size
                         );
-                        let starting = App::start(&session.program, session.size)
+                        let starting = App::start(&session.program, session.size, session.codec)
                             .map_err(|e| {
                                 format!("could not start {}: {e}", session.program.display())
                             })?;

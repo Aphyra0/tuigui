@@ -17,6 +17,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, StatefulWidget, Widget as _};
+use codecs::CodecId;
 
 /// What the session holds while a step is running.
 ///
@@ -84,6 +85,9 @@ pub struct Session {
     pub footer: Footer,
     /// The program to run, once a socket has been dialed.
     pub program: std::path::PathBuf,
+    /// The codec the session streams with, chosen at the command line and
+    /// announced on the wire before any frame.
+    pub codec: CodecId,
     /// The compositor's output size, which is also the program's window size.
     ///
     /// Fixed when the session starts: the compositor's output being the window is what
@@ -115,12 +119,14 @@ impl Session {
         size: (u32, u32),
         cell: (u32, u32),
         input: termputs::Listener<Input, Output>,
+        codec: CodecId,
     ) -> Self {
         Self {
             state: Ok(State::ConnSelect),
             popup_state: PopupState::None,
             footer: Footer,
             program,
+            codec,
             size,
             cell,
             input_listener: input,

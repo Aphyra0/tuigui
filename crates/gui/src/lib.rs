@@ -21,6 +21,7 @@
 
 use std::io::{Read, Write};
 
+use codecs::CodecId;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use widget::{GuiWidget, Session};
@@ -37,9 +38,37 @@ mod widget;
 pub struct Gui {
     /// The program to run and draw.
     pub program: std::path::PathBuf,
+    /// The codec the session streams with.
+    #[command(flatten)]
+    pub streaming: StreamingOptions,
     /// The diagnostic switches, which belong to the client.
     #[command(flatten)]
     pub debug: DebugOptions,
+}
+
+/// The codec a session streams with: the one choice a session is used with.
+///
+/// JPEG is the default, because a JPEG is a picture of least commitment: no
+/// stream history, no temporal compression, and every terminal grid can show
+/// one. The two flags are mutually exclusive, and neither given means JPEG.
+#[derive(Debug, Clone, Copy, Default, clap::Args)]
+pub struct StreamingOptions {
+    /// Stream JPEG: one complete picture per frame (Default).
+    #[arg(long, conflicts_with = "h264")]
+    pub jpeg: bool,
+    /// Stream H.264: temporally compressed, at the cost of stream history.
+    #[arg(long, conflicts_with = "jpeg")]
+    pub h264: bool,
+}
+
+impl StreamingOptions {
+    /// The codec this session streams with.
+    pub fn codec(&self) -> CodecId {
+        match self.h264 {
+            true => CodecId::H264,
+            false => CodecId::Jpeg,
+        }
+    }
 }
 
 /// The switches that exist to diagnose a session, not to use one.
@@ -124,7 +153,7 @@ impl Gui {
             Box::new(std::io::stdout()) as widget::Output,
         )?;
 
-        let mut session = Session::new(self.program, output, cell, listener);
+        let mut session = Session::new(self.program, output, cell, listener, self.streaming.codec());
 
         loop {
             // The frame's span is on `GuiWidget::render`, which is what one call

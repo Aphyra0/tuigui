@@ -63,13 +63,10 @@ fn the_first_frame_is_available_before_anything_else_arrives() {
     );
 }
 
-/// The announced codec builds both halves; one this build does not carry is
-/// refused with a named error rather than a guess.
+/// The announced codec builds the decoder; each codec this build carries has
+/// one, and it is built before any frame arrives.
 #[test]
 fn the_announced_codec_picks_the_implementations() {
     assert!(CodecId::H264.to_decoder().is_ok());
-    assert!(matches!(
-        CodecId::Jpeg.to_decoder(),
-        Err(codecs::Error::Unsupported(CodecId::Jpeg))
-    ));
+    assert!(CodecId::Jpeg.to_decoder().is_ok());
 }

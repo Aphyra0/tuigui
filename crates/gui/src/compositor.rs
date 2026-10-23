@@ -15,6 +15,7 @@
 
 use std::path::Path;
 
+use codecs::CodecId;
 use compositor::{Client, Compositor};
 use wire::transport::BoxFuture;
 
@@ -54,6 +55,7 @@ impl App {
     pub fn start(
         path: &Path,
         size: (u32, u32),
+        codec: CodecId,
     ) -> std::io::Result<BoxFuture<'static, std::io::Result<Self>>> {
         let compositor = Compositor::init_with_options(
             size,
@@ -91,9 +93,16 @@ impl App {
             // 4:2:0 chroma needs them, and the capture is padded to the output's cells
             // rather than the other way round.
             let (ew, eh) = (size.0 & !1, size.1 & !1);
-            let encoder = codecs::h264::Encoder::new(ew, eh)
-                .map_err(|e| std::io::Error::other(format!("building the encoder: {e}")))?;
-            let encoder: Box<dyn codecs::Encoder> = Box::new(encoder);
+            let encoder: Box<dyn codecs::Encoder> = match codec {
+                CodecId::H264 => Box::new(
+                    codecs::h264::Encoder::new(ew, eh)
+                        .map_err(|e| std::io::Error::other(format!("building the H.264 encoder: {e}")))?,
+                ),
+                CodecId::Jpeg => Box::new(
+                    codecs::jpeg::Encoder::new()
+                        .map_err(|e| std::io::Error::other(format!("building the JPEG encoder: {e}")))?,
+                ),
+            };
 
             Ok(App {
                 client,
