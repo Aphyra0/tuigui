@@ -6,8 +6,28 @@ license.workspace = true
 description = "Wire protocol, transport abstraction and session file shared by the tui server and the gui client"
 
 [dependencies]
-# `io-util` for the framing and the socket; `net` for the unix socket itself; `sync` for the
+# `io-util` for the socket; `net` for the unix socket itself; `sync` for the
 # mutexes a transport holds its link behind; `rt` and `macros` for what drives it.
 tokio = { version = "1", features = ["io-util", "net", "sync", "rt", "macros", "time"] }
+# The framed transport: a byte stream becomes a Stream of messages and a Sink
+# for them, with the length prefix and the reassembly it implies. This replaces
+# the framing this crate used to hand-roll, and it is generic over every
+# transport that is an AsyncRead plus an AsyncWrite — the unix socket, an ssh
+# channel, a quic or iroh stream.
+tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
+# Messages are serialized with rkyv, which archives them into bytes and reads
+# them back with validation: the tag byte and the hand-rolled encode/decode this
+# used to carry are gone, and the enum's shape is what describes the wire.
+rkyv = { workspace = true }
+# The codec ids a session announces, which live with the codecs they name.
+codecs = { workspace = true }
+# The codec library works in `BytesMut`s, and `SinkExt::send`/`StreamExt::next`
+# are what drive the two halves of a framed link.
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink", "std"] }
+# Spans become zones in the Tracy profiler, for seeing where a message's time
+# goes; and a span with no subscriber is a no-op, so the instrumented code is
+# the same code either way.
+tracing = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

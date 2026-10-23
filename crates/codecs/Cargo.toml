@@ -1,0 +1,25 @@
+[package]
+name = "codecs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The codec pair a session streams with, behind traits a codec can be swapped behind"
+
+[dependencies]
+# A ground-up pure-Rust H.264 encoder and decoder: SIMD by default, no C, no
+# GPU, no driver, so a session works on any machine that can run the binary.
+# Both halves of the codec live in this one dependency, which is also how the
+# two halves of a session agree on the codec: by sharing it.
+rusty_h264 = "0.16"
+# One error type for both halves of the codec pair.
+thiserror = { workspace = true }
+# The codec id a session announces travels in a message archive, so it must be
+# archivable itself.
+rkyv = { workspace = true }
+# The color conversions around the codec: B,G,R,A in, I420 to the codec, and
+# back. SIMD, maintained by someone whose job it is.
+yuvutils-rs = "0.8"
+# Spans become zones in the Tracy profiler, for seeing where a frame's time
+# goes; a span with no subscriber is a no-op, so the instrumented code is the
+# same code either way.
+tracing = { workspace = true }

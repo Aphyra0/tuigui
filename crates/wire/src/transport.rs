@@ -3,7 +3,7 @@
 //!
 //! A transport **is** the thing a caller talks to. It is not a factory that hands out
 //! something else to talk to: it holds its own connection, so `send` and `try_recv` need
-//! no argument and a caller that has one has everything — the framing, the address, and
+//! no argument and a caller that has one has everything — the codec, the address, and
 //! whatever state the channel keeps between messages.
 //!
 //! The two sides are peers, not a client and a server in the protocol sense. Either may
@@ -11,13 +11,13 @@
 //! session between two processes on one machine needs no more than a socket at a known
 //! path, and neither end has to be told which role it plays.
 
-
-use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use bytes::{BufMut as _, BytesMut};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
 use crate::message::Message;
 
@@ -67,127 +67,74 @@ pub trait Stream: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Stream for T {}
 
-/// One message, framed on a plain byte stream.
+/// The longest message that will be read off a link.
 ///
-/// A stream has no message boundaries, so the reader has to be told how much to read: one
-/// tag byte and a body, with the body's length in a 4-byte prefix. [`Message::encode`]
-/// alone would rely on the write boundary surviving, which is true of a datagram and false
-/// of `SOCK_STREAM`.
-pub async fn write_message<S>(stream: &mut S, message: &Message) -> io::Result<()>
-where
-    S: AsyncWrite + Send + Unpin + ?Sized,
-{
-    let body = message.encode();
-    let len = (body.len() as u32).to_be_bytes();
-    stream.write_all(&len).await?;
-    stream.write_all(&body).await?;
-    stream.flush().await
+/// A cap because a length prefix is a number the peer chose, and a peer that is
+/// wrong — or not a peer at all — must not be able to ask for gigabytes with four
+/// bytes. A frame is one encoded picture, so tens of megabytes is far past what a
+/// session legitimately sends; past it the link is desynchronized anyway.
+pub const MAX_MESSAGE_LEN: usize = 32 * 1024 * 1024;
+
+/// The codec that turns a byte stream into messages and back.
+///
+/// Four bytes of big-endian length, then the message's rkyv archive. Reassembly
+/// is the codec library's job: bytes arrive in pieces, and [`Decoder::decode`]
+/// is asked only with what has actually arrived, so a stalled peer holds nothing.
+/// The length cap is what keeps a corrupt prefix from being obeyed.
+pub struct MessageCodec;
+
+impl Encoder<Message> for MessageCodec {
+    type Error = io::Error;
+
+    #[tracing::instrument(name = "msg.encode", skip_all)]
+    fn encode(&mut self, message: Message, dst: &mut BytesMut) -> io::Result<()> {
+        let body = message
+            .to_bytes()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("a message would not serialize: {e}")))?;
+        dst.reserve(4 + body.len());
+        dst.put_u32(body.len() as u32);
+        dst.put_slice(&body);
+        Ok(())
+    }
 }
 
-/// The framing state for one link: bytes in, whole messages out.
-///
-/// Reading a message to completion inside one future cannot be used in a `select!`: a peer
-/// that sends a length and then stalls would hold the whole task. So a transport feeds
-/// this whatever a read returned, and asks it whether a message has come out — which never
-/// waits for a byte that has not arrived.
-///
-/// Bytes rather than a stream because the read belongs to the transport: only it knows how
-/// its own IO works, and a caller that had to hand back a stream could not be the thing
-/// holding the routing.
-#[derive(Debug, Default)]
-pub struct Framing {
-    /// Length-prefix bytes, as they arrive.
-    ///
-    /// Needed because one read can return fewer than four bytes, and dropping the rest
-    /// would desynchronize the stream rather than delay it.
-    pending_len: Vec<u8>,
-    /// The length prefix, once four of its bytes have arrived.
-    len: Option<u32>,
-    /// The body, as much of it as has arrived.
-    body: Vec<u8>,
-    /// A whole message that came out, waiting for its caller to take it.
-    ///
-    /// Held rather than returned by `push`, because one read can carry more than one
-    /// message: the second one must not be lost between calls.
-    ready: VecDeque<Message>,
+impl Decoder for MessageCodec {
+    type Item = Message;
+    type Error = io::Error;
+
+    #[tracing::instrument(name = "msg.decode", skip_all)]
+    fn decode(&mut self, src: &mut BytesMut) -> io::Result<Option<Message>> {
+        if src.len() < 4 {
+            return Ok(None);
+        }
+        let len = u32::from_be_bytes(src[..4].try_into().expect("checked above")) as usize;
+        if len > MAX_MESSAGE_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("a peer announced a {len} byte message"),
+            ));
+        }
+        if src.len() < 4 + len {
+            return Ok(None);
+        }
+        let frame = src.split_to(4 + len);
+        Message::from_bytes(&frame[4..]).map(Some).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("a {len} byte message did not decode: {e}"),
+            )
+        })
+    }
 }
 
-impl Framing {
-    pub fn new() -> Self {
-        Self::default()
-    }
+/// One half of a byte stream, reading whole messages.
+pub fn framed_read<S: AsyncRead>(stream: S) -> FramedRead<S, MessageCodec> {
+    FramedRead::new(stream, MessageCodec)
+}
 
-    /// Feed bytes that were read, and take whatever whole messages they completed.
-    ///
-    /// Never waits and never reads: what came in is all it works with, so a caller that
-    /// has nothing to feed has nothing to do. Messages come out in the order they arrived.
-    pub fn push(&mut self, mut bytes: &[u8]) -> io::Result<Vec<Message>> {
-        let before = self.ready.len();
-        // One pass over what was read, consuming a prefix at a time. A read that carries
-        // two messages must yield both.
-        while !bytes.is_empty() || self.needs_body() {
-            if self.len.is_none() {
-                let need = 4 - self.pending_len.len();
-                let take = need.min(bytes.len());
-                self.pending_len.extend_from_slice(&bytes[..take]);
-                bytes = &bytes[take..];
-                if self.pending_len.len() < 4 {
-                    break;
-                }
-                let mut len = [0u8; 4];
-                len.copy_from_slice(&self.pending_len[..4]);
-                self.pending_len.clear();
-                self.len = Some(u32::from_be_bytes(len));
-            }
-
-            let len = self.len.expect("set just above, or by an earlier push") as usize;
-            let need = len.saturating_sub(self.body.len());
-            let take = need.min(bytes.len());
-            self.body.extend_from_slice(&bytes[..take]);
-            bytes = &bytes[take..];
-            if self.body.len() < len {
-                break;
-            }
-
-            let body = std::mem::take(&mut self.body);
-            self.len = None;
-            self.ready.push_back(Message::decode(&body)?);
-            // A read that ended exactly on a message boundary has nothing left to do.
-            if bytes.is_empty() && !self.needs_body() {
-                break;
-            }
-        }
-        Ok(self.ready.split_off(before).into())
-    }
-
-    /// Take one whole message, if one is ready.
-    ///
-    /// `None` is not an error and not the end: nothing complete has arrived yet.
-    pub fn next(&mut self) -> Option<Message> {
-        self.ready.pop_front()
-    }
-
-    /// Whether a message is waiting.
-    pub fn has_message(&self) -> bool {
-        !self.ready.is_empty()
-    }
-
-    /// Whether half a message is held.
-    ///
-    /// A peer mid-message is worth distinguishing from a quiet one: the first is progress
-    /// and the second is not, and a log that could not tell them apart would be useless
-    /// when a client stalls.
-    pub fn partial(&self) -> bool {
-        !self.pending_len.is_empty() || self.len.is_some() || !self.body.is_empty()
-    }
-
-    /// Whether a length has been read and its body is still short.
-    fn needs_body(&self) -> bool {
-        match self.len {
-            Some(len) => self.body.len() < len as usize,
-            None => false,
-        }
-    }
+/// One half of a byte stream, writing whole messages.
+pub fn framed_write<S: AsyncWrite>(stream: S) -> FramedWrite<S, MessageCodec> {
+    FramedWrite::new(stream, MessageCodec)
 }
 
 /// A link to one peer: the transport carrying it, and who is at the other end.
@@ -197,7 +144,7 @@ impl Framing {
 /// the handshake, so what a caller gets back is a link that is *established* — there is no
 /// half-dialed link to pass around and nothing for a state machine to describe.
 ///
-/// Sending and receiving go through the transport, which holds the framing and any
+/// Sending and receiving go through the transport, which holds the codec and any
 /// routing: a socket writes a length prefix, a transport carrying several peers decides
 /// which one a message is for. Nothing here decides either.
 pub struct Connection {

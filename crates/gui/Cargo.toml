@@ -16,15 +16,9 @@ compositor = { workspace = true }
 # The terminal's input, as events, with keys mapped to the codes the compositor's
 # seat takes.
 termputs = { workspace = true }
-# SIMD JPEG encoding. `image`'s encoder is scalar and was the single largest
-# cost in the frame budget; this one is libjpeg-turbo. `image` is no longer a
-# dependency here: frames go from ffmpeg's RGB buffer straight into the encoder.
-#
-# Linked against the system libjpeg-turbo rather than building it from source:
-# Nix's build is already SIMD-optimized, and the pkg-config route needs neither
-# cmake nor nasm. `require-simd` makes a scalar fallback a build error instead of
-# a silent return to the slow encoder this exists to avoid.
-turbojpeg = { version = "1.5", default-features = false, features = ["pkg-config", "require-simd"] }
+# The codec the client encodes with, behind the trait a codec can be swapped
+# behind. Which codec it is, is announced on the wire, not assumed here.
+codecs = { workspace = true }
 ffmpeg-sidecar = { workspace = true }
 rustix = { workspace = true }
 clap = { workspace = true }

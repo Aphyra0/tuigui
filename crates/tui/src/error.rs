@@ -15,17 +15,12 @@
 /// A failure while serving a session.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The frame that arrived is not a JPEG, or not one this decoder accepts.
+    /// The codec failed, encoding or decoding.
     ///
-    /// Carries the frame's length because it is the one fact available when the bytes
-    /// themselves cannot be shown: a truncated frame and a corrupted header look
-    /// identical otherwise, and the length tells them apart.
-    #[error("decoding a {len} byte frame: {source}")]
-    Decode {
-        len: usize,
-        #[source]
-        source: turbojpeg::Error,
-    },
+    /// Carried through because which half failed is the codec's own error to say;
+    /// this is the boundary where it becomes the session's.
+    #[error(transparent)]
+    Codec(#[from] codecs::Error),
 
     /// The decoder returned pixels that do not match the size it declared.
     ///

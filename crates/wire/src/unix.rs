@@ -22,11 +22,13 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::io::AsyncReadExt;
+use futures_util::{SinkExt as _, StreamExt as _};
+use tokio::io::ReadHalf;
 use tokio::sync::Mutex;
+use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::message::Message;
-use crate::transport::{write_message, BoxFuture, Connection, Framing, Transport};
+use crate::transport::{BoxFuture, Connection, MessageCodec, Transport, framed_read, framed_write};
 
 /// Stable key for this transport, as it appears in an announcement.
 pub const NAME: &str = "unix";
@@ -62,10 +64,14 @@ pub struct UnixSocket {
     link: Arc<Mutex<Option<Link>>>,
 }
 
-/// The connected half: the stream, and what has arrived on it.
+/// The connected half: the stream, split so a read never holds up a write.
+///
+/// The two halves are one socket behind two `Arc`s, and each carries its own
+/// half of the codec: a read that returns fewer bytes than a message holds is
+/// the codec library's problem, not this file's.
 struct Link {
-    stream: tokio::net::UnixStream,
-    framing: Framing,
+    read: FramedRead<ReadHalf<tokio::net::UnixStream>, MessageCodec>,
+    write: FramedWrite<tokio::io::WriteHalf<tokio::net::UnixStream>, MessageCodec>,
 }
 
 impl UnixSocket {
@@ -117,9 +123,10 @@ impl UnixSocket {
     ///
     /// Shared by dialing and accepting, which differ only in where the stream came from.
     async fn adopt(&self, stream: tokio::net::UnixStream) {
+        let (read, write) = tokio::io::split(stream);
         *self.link.lock().await = Some(Link {
-            stream,
-            framing: Framing::new(),
+            read: framed_read(read),
+            write: framed_write(write),
         });
     }
 }
@@ -142,6 +149,7 @@ impl Transport for UnixSocket {
     /// The greeting is here and not in the caller because the two halves of the handshake
     /// only make sense together: the side that dialed is the side that knows the link is new,
     /// so it greets, and a caller that forgot to would leave the other end waiting forever.
+    #[tracing::instrument(name = "msg.connect", skip_all)]
     fn connect(&self) -> BoxFuture<'_, io::Result<Connection>> {
         Box::pin(async move {
             let stream = tokio::net::UnixStream::connect(&self.path).await?;
@@ -163,6 +171,7 @@ impl Transport for UnixSocket {
     /// The mirror of [`Transport::connect`]. The order is fixed here rather than left to a
     /// caller: answering before the greeting arrives would be answering nothing, and reading
     /// after it would be reading a greeting already consumed.
+    #[tracing::instrument(name = "msg.accept", skip_all)]
     fn accept(&self) -> BoxFuture<'_, io::Result<Connection>> {
         Box::pin(async move {
             let listener = {
@@ -190,13 +199,14 @@ impl Transport for UnixSocket {
         })
     }
 
+    #[tracing::instrument(name = "msg.send", skip_all)]
     fn send<'a>(&'a self, message: &'a Message) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             let mut link = self.link.lock().await;
             let link = link
                 .as_mut()
                 .ok_or_else(|| io::Error::other("this socket has no link yet"))?;
-            write_message(&mut link.stream, message).await
+            link.write.send(message.clone()).await
         })
     }
 
@@ -204,31 +214,22 @@ impl Transport for UnixSocket {
     ///
     /// A read that returns the instant it is asked would ask before the peer has had a chance
     /// to write, and every handshake would fail on a peer that was merely not instant. So this
-    /// waits, and `None` means the peer closed rather than "nothing yet".
+    /// waits, and `None` means the peer closed rather than "nothing yet" — an `Err` here is
+    /// a peer that closed *mid-message*, which the codec reports rather than calling clean.
     ///
     /// The lock is held across the read, which is what keeps two readers from interleaving on
     /// one stream.
+    #[tracing::instrument(name = "msg.recv", skip_all)]
     fn recv(&self) -> BoxFuture<'_, io::Result<Option<Message>>> {
         Box::pin(async move {
             let mut guard = self.link.lock().await;
             let link = guard
                 .as_mut()
                 .ok_or_else(|| io::Error::other("this socket has no link yet"))?;
-            loop {
-                let mut buf = [0u8; 8192];
-                let n = link.stream.read(&mut buf).await?;
-                if n == 0 {
-                    // A clean close between messages is the normal end of a peer, not a
-                    // failure: nothing was half-read.
-                    return Ok(None);
-                }
-                // `push` returns the messages this read completed, and takes them out of the
-                // framing: reading its return is the whole point, because `next` after it would
-                // find nothing and the loop below would wait forever on a socket with nothing
-                // left to say.
-                if let Some(message) = link.framing.push(&buf[..n])?.into_iter().next() {
-                    return Ok(Some(message));
-                }
+            match link.read.next().await {
+                Some(Ok(message)) => Ok(Some(message)),
+                Some(Err(e)) => Err(e),
+                None => Ok(None),
             }
         })
     }

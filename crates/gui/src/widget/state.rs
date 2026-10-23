@@ -19,6 +19,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget as _};
+use codecs::CodecId;
 use wire::message::Message;
 use wire::transport::{BoxFuture, Connection, Transport};
 use wire::unix::UnixSocket;
@@ -199,6 +200,17 @@ impl State {
                 match futures::poll!(waiting.as_mut()) {
                     std::task::Poll::Ready(Ok(connection)) => {
                         log::info!("dialed");
+                        // The codec is announced before anything else, so the server
+                        // builds its decoder before the first frame of one arrives.
+                        // Bounded like every send: a link that will not take the
+                        // announcement is reported rather than waited on.
+                        tokio::time::timeout(
+                            SEND_TIMEOUT,
+                            connection.send(&Message::InitStreaming { codec: CodecId::H264 }),
+                        )
+                        .await
+                        .map_err(|_| format!("the link did not take the codec within {SEND_TIMEOUT:?}"))?
+                        .map_err(|e| format!("the link failed: {e}"))?;
                         // The program's start is begun now and polled from the next frame,
                         // so the frame that says "starting" is flushed before anything
                         // waits on the program.
@@ -303,6 +315,12 @@ impl State {
                 match tokio::time::timeout(QUIET, connection.recv()).await {
                     Ok(Ok(Some(Message::Error(text)))) => {
                         return Err(format!("the server failed: {text}"))
+                    }
+                    Ok(Ok(Some(Message::ReinitStreaming))) => {
+                        // The server's decoder lost its state, so what it needs is
+                        // not the stored bytes but a fresh keyframe, even if the
+                        // window has not changed since.
+                        app.keyframe_next = true;
                     }
                     // A message that is not an error. The frame is over; the next one sends
                     // whatever the program drew.

@@ -1,0 +1,183 @@
+# Configuration
+
+## Config File
+
+Location: `~/.config/revdiff/config` (INI format). Override with `--config` flag or `REVDIFF_CONFIG` env var.
+
+Precedence: CLI flags > env vars > config file > built-in defaults.
+
+Generate a default config:
+```bash
+mkdir -p ~/.config/revdiff
+revdiff --dump-config > ~/.config/revdiff/config
+```
+
+Then uncomment and edit the values you want to change.
+
+## Options
+
+| Option | Env var | Description | Default |
+|--------|---------|-------------|---------|
+| `--staged` | `REVDIFF_STAGED` | Show staged changes | `false` |
+| `--untracked` | `REVDIFF_UNTRACKED` | Show untracked files in the tree | `false` |
+| `--tree-width` | `REVDIFF_TREE_WIDTH` | File tree panel width in units (1-10) | `2` |
+| `--tab-width` | `REVDIFF_TAB_WIDTH` | Spaces per tab character | `4` |
+| `--no-colors` | `REVDIFF_NO_COLORS` | Disable all colors including syntax highlighting | `false` |
+| `--no-status-bar` | `REVDIFF_NO_STATUS_BAR` | Hide the status bar | `false` |
+| `--wrap` | `REVDIFF_WRAP` | Enable line wrapping in diff view | `false` |
+| `--wrap-indent` | `REVDIFF_WRAP_INDENT` | Indent wrap continuation rows by N columns so they hang under the first row's content (helps when reviewing markdown lists where unindented continuation can be misread as a new bullet) | `0` |
+| `--page-overlap` | `REVDIFF_PAGE_OVERLAP` | Keep N lines from the previous screen when paging the diff | `0` |
+| `--start-at-change` | `REVDIFF_START_AT_CHANGE` | Position the cursor on the first changed line | `false` |
+| `--collapsed` | `REVDIFF_COLLAPSED` | Start in collapsed diff mode | `false` |
+| `--compact` | `REVDIFF_COMPACT` | Start in compact diff mode (small context around changes) | `false` |
+| `--compact-context` | `REVDIFF_COMPACT_CONTEXT` | Number of context lines around changes when in compact mode | `5` |
+| `--cross-file-hunks` | `REVDIFF_CROSS_FILE_HUNKS` | Allow `[` and `]` to continue into adjacent files | `false` |
+| `--cross-file-motion` | `REVDIFF_CROSS_FILE_MOTION` | Allow cursor motion (`j`/`k`, `PgDown`/`PgUp`, `Ctrl+d`/`Ctrl+u`) to continue into adjacent files at a boundary | `false` |
+| `--line-numbers` | `REVDIFF_LINE_NUMBERS` | Show line numbers in diff gutter | `false` |
+| `--blame` | `REVDIFF_BLAME` | Show blame gutter | `false` |
+| `--word-diff` | `REVDIFF_WORD_DIFF` | Highlight intra-line word-level changes in paired add/remove lines | `false` |
+| `--filter-unreviewed` | `REVDIFF_FILTER_UNREVIEWED` | Show only files not marked reviewed | `false` |
+| `--annotation-marker` | `REVDIFF_ANNOTATION_MARKER` | Prefix shown before annotation lines | `💬` |
+| `--exit-code-on-annotations` | `REVDIFF_EXIT_CODE_ON_ANNOTATIONS` | Exit 10 when annotations are produced | `false` |
+| `--no-confirm-discard` | `REVDIFF_NO_CONFIRM_DISCARD` | Skip confirmation when discarding annotations with Q | `false` |
+| `--no-confirm-reload` | `REVDIFF_NO_CONFIRM_RELOAD` | Skip confirmation when dropping annotations on reload with R | `false` |
+| `--no-mouse` | `REVDIFF_NO_MOUSE` | Disable mouse support (scroll wheel, click) | `false` |
+| `--no-tree` | `REVDIFF_NO_TREE` | Hide the file tree pane | `false` |
+| `--vim-motion` | `REVDIFF_VIM_MOTION` | Enable vim-style motion preset (counts, `gg`, `G`, `H`/`M`/`L`, `zz`/`zt`/`zb`, `ZZ`/`ZQ`) | `false` |
+| `--chroma-style` | `REVDIFF_CHROMA_STYLE` | Chroma color theme for syntax highlighting | `catppuccin-macchiato` |
+| `--theme` | `REVDIFF_THEME` | Load color theme from `~/.config/revdiff/themes/`; use `auto` to choose by terminal background | |
+| `--auto-theme-dark` | `REVDIFF_AUTO_THEME_DARK` | Theme used by `--theme auto` on dark terminal backgrounds | `revdiff` |
+| `--auto-theme-light` | `REVDIFF_AUTO_THEME_LIGHT` | Theme used by `--theme auto` on light terminal backgrounds | `catppuccin-latte` |
+| `--dump-theme` | | Print currently resolved colors as theme file and exit | |
+| `--list-themes` | | Print available theme names and exit | |
+| `--init-themes` | | Write bundled theme files to themes dir and exit | |
+| `--init-all-themes` | | Write all gallery themes (bundled + community) to themes dir and exit | |
+| `--install-theme` | | Install theme(s) from gallery or local file (repeatable) | |
+| `-A`, `--all-files` | | Browse all tracked files (git and jj only), not just diffs (CLI-only, not saved in config) | `false` |
+| `--description` | | Prose context shown in the info popup (markdown; CLI-only, not saved in config) | |
+| `--description-file` | | Read the info-popup description from this file (markdown; CLI-only, not saved in config) | |
+| `-I`, `--include` | `REVDIFF_INCLUDE` | Include only files matching prefix (may be repeated; comma-separated in env) | |
+| `-X`, `--exclude` | `REVDIFF_EXCLUDE` | Exclude files matching prefix (may be repeated; comma-separated in env) | |
+| `-F`, `--only` | | Show only matching files (may be repeated, matches by path or suffix) | |
+| `-o`, `--output` | `REVDIFF_OUTPUT` | Write annotations to file instead of stdout | |
+| `--post-flush-command` | `REVDIFF_POST_FLUSH_COMMAND` | Run command after a successful `O` flush | |
+| `--history-dir` | `REVDIFF_HISTORY_DIR` | Directory for review history auto-saves | `~/.config/revdiff/history/` |
+| `--keys` | `REVDIFF_KEYS` | Path to keybindings file | `~/.config/revdiff/keybindings` |
+| `--dump-keys` | | Print effective keybindings to stdout and exit | |
+| `--config` | `REVDIFF_CONFIG` | Path to config file | `~/.config/revdiff/config` |
+| `--dump-config` | | Print default config to stdout and exit | |
+
+Config-backed options use long flag names without leading `--`; for annotation exit status use `exit-code-on-annotations = true`.
+
+## Popup Size (Claude Code plugin)
+
+When launched via the Claude Code plugin skill, revdiff opens in a terminal overlay. The popup size is configurable via env vars:
+
+| Env var | Description | Default |
+|---------|-------------|---------|
+| `REVDIFF_POPUP_WIDTH` | Tmux/Zellij popup width (e.g., `100%`, `80%`) | `90%` |
+| `REVDIFF_POPUP_HEIGHT` | Tmux/Zellij popup height / wezterm split percent | `90%` |
+| `REVDIFF_AGTERM_SIZE_PERCENT` | agterm floating panel percent (1-100) | unset (full session) |
+
+## Disconnect-Resilient Window Mode (tmux)
+
+Set `REVDIFF_TMUX_WINDOW=1` in the launcher's environment to open revdiff in a persistent, server-owned tmux window instead of a client-owned `display-popup`. A dropped SSH or tmux client tears down a popup and kills the review, but a server-owned window survives the disconnect — reattach and the live review is still there. This is a launcher environment variable, not a revdiff flag.
+
+## Pane-Scoped Overlay (herdr)
+
+Set `REVDIFF_HERDR_PANE=1` in the launcher's environment to open revdiff in a zoomed split of the agent's own herdr pane instead of a new fullscreen tab, so the agent pane stays one keypress away. It needs a herdr whose CLI carries `pane split`, `pane get` and `pane close`; an unsupported CLI or a refused split falls back to the tab overlay; a split that succeeds but returns no usable pane id fails closed with a warning rather than opening a second surface, and may leave a stray pane to close by hand. This is a launcher environment variable, not a revdiff flag.
+
+## Pane-Scoped Overlay (agterm)
+
+Set `REVDIFF_AGTERM_PANE=1` in the launcher's environment to open revdiff in the agent's own split pane instead of over the whole session, leaving the sibling pane live and visible. It applies only when that session is split — the session-wide overlay stands otherwise, and the launcher retries session-wide if agterm refuses the pane. The review gets pane width rather than session width, which is why it is opt-in. This is a launcher environment variable, not a revdiff flag.
+
+## Floating Panel (agterm)
+
+Set `REVDIFF_AGTERM_SIZE_PERCENT=N` (1-100) in the launcher's environment to open the session-wide overlay as a floating panel at N percent of the session instead of full-size, so the agent's chat stays visible around the review; a trailing `%` is accepted. A pane-scoped overlay is always full-pane, so with `REVDIFF_AGTERM_PANE=1` in a split the size applies only when the launcher falls back to the session-wide overlay. This is a launcher environment variable, not a revdiff flag.
+
+## Themes
+
+Eight bundled themes: **basic**, **catppuccin-latte**, **catppuccin-mocha**, **dracula**, **gruvbox**, **nord**, **revdiff**, **solarized-dark**. Stored in `~/.config/revdiff/themes/`, auto-created on first run.
+
+Press `T` inside revdiff to open the interactive theme selector with live preview — browse themes, see colors applied instantly, and persist your choice on confirm.
+
+```bash
+revdiff --theme dracula          # apply a theme
+revdiff --theme auto             # choose by terminal background
+revdiff --list-themes            # list available themes
+revdiff --init-themes            # re-create bundled themes
+revdiff --install-theme nord     # install a specific gallery theme
+revdiff --init-all-themes        # install all gallery themes
+revdiff --dump-theme > ~/.config/revdiff/themes/my-custom  # export current colors
+```
+
+Set default theme in config: `theme = dracula`. Or env: `REVDIFF_THEME=dracula`. Use `theme = auto` to query the terminal background and choose `auto-theme-dark` or `auto-theme-light`.
+
+**Custom themes:** customize colors in config or via `--color-*` flags, then `revdiff --dump-theme > ~/.config/revdiff/themes/my-custom`. Or copy a bundled theme file and edit directly — each has all 23 color keys + `chroma-style`.
+
+Precedence: `--theme` takes over completely — overwrites all color fields, ignoring `--color-*` flags and env vars. Without `--theme`: built-in defaults → config file → env vars → CLI flags. `--theme` + `--no-colors` prints warning and applies theme.
+
+## Color Customization
+
+All color options accept hex values (`#rrggbb`) and have corresponding `REVDIFF_COLOR_*` env vars.
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--color-accent` | Active pane borders and directory names | `#D5895F` |
+| `--color-border` | Inactive pane borders | `#585858` |
+| `--color-normal` | File entries and context lines | `#d0d0d0` |
+| `--color-muted` | Divider lines and status bar | `#585858` |
+| `--color-selected-fg` | Selected file text | `#ffffaf` |
+| `--color-selected-bg` | Selected file background | `#D5895F` |
+| `--color-annotation` | Annotation text and markers | `#ffd700` |
+| `--color-cursor-fg` | Cursor indicator color | `#bbbb44` |
+| `--color-cursor-bg` | Cursor indicator background | terminal default |
+| `--color-add-fg` | Added line text | `#87d787` |
+| `--color-add-bg` | Added line background | `#123800` |
+| `--color-remove-fg` | Removed line text | `#ff8787` |
+| `--color-remove-bg` | Removed line background | `#4D1100` |
+| `--color-word-add-bg` | Intra-line word-diff add background | auto-derived from add-bg |
+| `--color-word-remove-bg` | Intra-line word-diff remove background | auto-derived from remove-bg |
+| `--color-modify-fg` | Modified line text (collapsed mode) | `#f5c542` |
+| `--color-modify-bg` | Modified line background (collapsed mode) | `#3D2E00` |
+| `--color-tree-bg` | File tree pane background | terminal default |
+| `--color-diff-bg` | Diff pane background | terminal default |
+| `--color-status-fg` | Status bar foreground | `#202020` |
+| `--color-status-bg` | Status bar background | `#C5794F` |
+| `--color-search-fg` | Search match text | `#1a1a1a` |
+| `--color-search-bg` | Search match background | `#4a4a00` |
+
+## Chroma Syntax Highlighting Styles
+
+Set via `--chroma-style=<name>`, env var `REVDIFF_CHROMA_STYLE`, or config file `chroma-style = <name>`.
+
+**Dark themes:** `aura-theme-dark`, `aura-theme-dark-soft`, `base16-snazzy`, `catppuccin-frappe`, `catppuccin-macchiato` (default), `catppuccin-mocha`, `doom-one`, `doom-one2`, `dracula`, `evergarden`, `fruity`, `github-dark`, `gruvbox`, `hrdark`, `monokai`, `modus-vivendi`, `native`, `nord`, `nordic`, `onedark`, `paraiso-dark`, `rose-pine`, `rose-pine-moon`, `rrt`, `solarized-dark`, `solarized-dark256`, `tokyonight-moon`, `tokyonight-night`, `tokyonight-storm`, `vim`, `vulcan`, `witchhazel`, `xcode-dark`
+
+**Light themes:** `autumn`, `borland`, `catppuccin-latte`, `colorful`, `emacs`, `friendly`, `github`, `gruvbox-light`, `igor`, `lovelace`, `manni`, `modus-operandi`, `monokailight`, `murphy`, `paraiso-light`, `pastie`, `perldoc`, `pygments`, `rainbow_dash`, `rose-pine-dawn`, `solarized-light`, `tango`, `tokyonight-day`, `trac`, `vs`, `xcode`
+
+**Other:** `RPGLE`, `abap`, `algol`, `algol_nu`, `arduino`, `ashen`, `average`, `bw`, `hr_high_contrast`, `onesenterprise`, `swapoff`
+
+## Custom Keybindings
+
+Location: `~/.config/revdiff/keybindings`. Override with `--keys` flag or `REVDIFF_KEYS` env var.
+
+Format: `map <key> <action>` to bind, `unmap <key>` to remove a default binding. `#` comments and blank lines are ignored. Defaults are preserved unless explicitly unmapped.
+
+Generate a template: `revdiff --dump-keys > ~/.config/revdiff/keybindings`
+
+Example:
+```
+map x quit
+unmap q
+map ctrl+d half_page_down
+```
+
+Available actions: `down`, `up`, `page_down`, `page_up`, `half_page_down`, `half_page_up`, `home`, `end`, `scroll_left`, `scroll_right`, `scroll_center`, `scroll_top`, `scroll_bottom`, `scroll_diff_down`, `scroll_diff_up`, `scroll_diff_page_down`, `scroll_diff_page_up`, `scroll_diff_half_page_down`, `scroll_diff_half_page_up`, `next_item`, `prev_item`, `jump_file`, `next_hunk`, `prev_hunk`, `open_file_in_editor`, `toggle_pane`, `focus_tree`, `focus_diff`, `search`, `confirm`, `annotate_file`, `delete_annotation`, `annot_list`, `open_editor`, `next_annotation`, `prev_annotation`, `flush_output`, `toggle_collapsed`, `toggle_compact`, `toggle_wrap`, `toggle_tree`, `toggle_line_numbers`, `toggle_blame`, `toggle_word_diff`, `toggle_hunk`, `toggle_untracked`, `mark_reviewed`, `filter_unreviewed`, `theme_select`, `filter`, `info`, `reload`, `quit`, `discard_quit`, `help`, `dismiss`
+
+The `scroll_diff_page_*` and `scroll_diff_half_page_*` actions are the page-sized versions of `J`/`K`: they scroll the diff viewport from either pane. They ship with no default key, so they appear in neither the help overlay nor `--dump-keys` until bound. Binding them to `pgdown`/`pgup`/`ctrl+d`/`ctrl+u` gives lazygit-style paging that always targets the diff. Doing so takes those keys away from tree and markdown TOC paging, replaces cursor paging in the diff pane, and — since `page_down`, `page_up`, `half_page_down` and `half_page_up` have no other default key — leaves them unbound everywhere, including the help and info overlays.
+
+Fixed modal keys (Enter, Esc in annotation/search input, confirm discard) are not remappable. Keymap-resolved actions like `open_editor` work during annotation input and can be rebound. Chord bindings do not fire during text input — use single-key `ctrl+*` bindings for actions that need to work during annotation input.
+
+The `flush_output` action (default `O`) exports the current annotations without exiting revdiff. `--output` writes the full snapshot to a file; `--post-flush-command` sends it to a command on stdin. They work independently or together. At least one must be configured, and an empty annotation store produces only a status hint.
+
+For clipboard-only flushes on macOS, set `post-flush-command = pbcopy` in the config file. No `--output` flag is required. On Linux, use `xclip -selection clipboard` for X11 or `wl-copy` for Wayland.

@@ -12,10 +12,12 @@
 //! Each frame replaces the image and re-places it, because a transmit under an
 //! existing id frees that image's placements in the terminal.
 
+use std::io;
 use std::sync::Arc;
 
 use tracing::Instrument;
 use easytgp::{Controller, DynImage, Format, PlacementRequest};
+use codecs::CodecId;
 use wire::message::Message;
 use wire::transport::Connection;
 
@@ -31,7 +33,6 @@ use crate::DebugOptions;
 /// pane exists.
 pub const IMAGE_ID: u32 = 99;
 
-/// The placement id of the virtual placement the cells resolve against.
 ///
 /// Distinct from [`IMAGE_ID`] because the two are different facts: the image is
 /// the pixels, the placement is the box they are fitted into.
@@ -74,6 +75,14 @@ pub struct State<F: Format> {
     /// those to land. `None` until the first frame, since an image cannot be created
     /// before there are pixels for it.
     pub image: Option<DynImage<F>>,
+    /// The codec's decoder, kept across frames, built when the client announces
+    /// its codec. A decoder that cannot follow the stream is dropped here and
+    /// rebuilt after a `ReinitStreaming` — its state is the only thing the trait
+    /// object owns, which is why losing it is a message rather than a guess.
+    pub decoder: Option<Box<dyn codecs::Decoder>>,
+    /// The codec the client announced, which is what the decoder is built from
+    /// whenever one must be built: an announcement, a reset, a rebuild.
+    pub codec: Option<CodecId>,
     /// Creates image requests, and owns the reply router behind them.
     pub controller: Arc<Controller>,
     /// The one writer to the screen.
@@ -113,6 +122,8 @@ impl<F: Format> Session<F> {
                 rows,
                 debug,
                 image: None,
+                decoder: None,
+                codec: None,
                 controller,
                 sink,
             },
@@ -135,6 +146,27 @@ impl<F: Format> Session<F> {
     pub async fn handle_msg(&mut self, message: Message) {
         if let Err(e) = match message {
             Message::Frame(jpeg) => self.paint(&jpeg).await,
+            Message::InitStreaming { codec } => {
+                // The client named its codec; the decoder for it is built now and
+                // kept, because building one per frame is the expensive part. The
+                // codec is reported rather than assumed: a client speaking a
+                // codec this server does not have is told so.
+                eprintln!("tui: a client will stream {codec:?}");
+                match codec.to_decoder() {
+                    Ok(d) => {
+                        self.state.decoder = Some(d);
+                        Ok(())
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+            Message::ReinitStreaming => {
+                // Reinit is a server-to-client message: the side that owns the
+                // decoder is the side that asks for a keyframe. A client that
+                // sends one has the halves backwards, and the error is what goes
+                // back — reported, not obeyed.
+                Err(io::Error::other("a client cannot ask its server for a keyframe; that is a server-to-client message").into())
+            }
             Message::Error(text) => {
                 eprintln!("tui: a client reported: {text}");
                 Ok(())
@@ -165,11 +197,10 @@ impl<F: Format> Session<F> {
     }
 
     /// Paint one frame into this pane.
-    ///
-    /// The frame that arrived is a JPEG, and the terminal does not accept JPEG, so it
-    /// is decoded here and rebuilt as a request in this session's medium. Which
-    /// medium that is is the type parameter, not a runtime choice: [`Format::request`]
-    /// is what turns pixels into a request for it.
+    /// The frame that arrives is a stretch of the codec's stream, and the terminal does
+    /// not accept that, so it is decoded here and rebuilt as a request in this session's
+    /// medium. Which medium that is is the type parameter, not a runtime choice:
+    /// [`Format::request`] is what turns pixels into a request for it.
     ///
     /// One span per frame, so the profiler's timeline is divided at the same
     /// boundary the pane's is. The awaits are inside it, which is why this is
@@ -177,27 +208,44 @@ impl<F: Format> Session<F> {
     /// outlive an `.await`, and the attribute enters and exits per poll instead.
     /// The two waits it contains — the terminal's acknowledgement of the
     /// transmit, and of the placement — are the two numbers this exists to see.
-    #[tracing::instrument(name = "frame", skip(self, jpeg))]
-    async fn paint(&mut self, jpeg: &[u8]) -> Result<()> {
+    #[tracing::instrument(name = "frame", skip(self, stream))]
+    async fn paint(&mut self, stream: &[u8]) -> Result<()> {
         let pixels = if self.state.debug.blue_pixel {
             // The frame is ignored on purpose, so nothing in the wire path, the codec
             // or the decode is exercised: what appears on screen is attributable to
             // the encode, the transmit and the placement alone.
             image::RgbImage::from_pixel(BLUE.0, BLUE.1, image::Rgb([0, 0, 255]))
         } else {
-            let _decode = tracing::info_span!("decode").entered();
-            let decoded = turbojpeg::decompress(jpeg, turbojpeg::PixelFormat::RGB)
-                .map_err(|source| Error::Decode {
-                    len: jpeg.len(),
-                    source,
+            // The decoder is built from the codec the client announced, and kept:
+            // building one per frame is the expensive part, not the decoding.
+            if self.state.decoder.is_none() {
+                let codec = self.state.codec.ok_or_else(|| {
+                    io::Error::other("a frame arrived before any codec was announced")
                 })?;
-            let (width, height) = (decoded.width as u32, decoded.height as u32);
-            // The buffer is moved into the image rather than copied out of it: at
-            // frame sizes a copy is the whole frame again.
-            image::RgbImage::from_raw(width, height, decoded.pixels).ok_or(Error::FrameSize {
-                width,
-                height,
-            })?
+                self.state.decoder = Some(codec.to_decoder()?);
+            }
+            let _decode = tracing::info_span!("decode").entered();
+            let decoder = self.state.decoder.as_mut().unwrap();
+            match decoder.decode(stream) {
+                Ok(Some(frame)) => image::RgbImage::from_raw(frame.width, frame.height, frame.rgb)
+                    .ok_or(Error::FrameSize {
+                        width: frame.width,
+                        height: frame.height,
+                    })?,
+                // Headers, or a frame the codec held back: nothing to show yet,
+                // and nothing to ask for — the next frame the client sends is what
+                // the decoder held, and a static window sends again when it moves.
+                Ok(None) => return Ok(()),
+                // The decoder's state is what failed: drop it, and ask the client
+                // for a keyframe — the frame after this one rebuilds the decoder
+                // from the announced codec and starts the stream over.
+                Err(e) => {
+                    self.state.decoder = None;
+                    let _ = self.connection.send(&Message::ReinitStreaming).await;
+                    eprintln!("tui: the codec failed: {e}");
+                    return Ok(());
+                }
+            }
         };
 
         let request = F::request(&self.state.controller, pixels).map_err(Error::Stage)?;
@@ -241,19 +289,24 @@ impl<F: Format> Session<F> {
         // hanging: the acknowledgement it waits for is a reply a terminal may not send,
         // and a session that stalls here shows an empty pane forever with no clue why.
         let transplace_span = tracing::info_span!("transplace");
-        let mut image =
-            tokio::time::timeout(
-                TRANSMIT_TIMEOUT,
-                request.transplace(IMAGE_ID, placement).instrument(transplace_span),
-            )
-            .await
-            .map_err(|_| Error::TransmitTimeout(TRANSMIT_TIMEOUT))?
-            .map_err(Error::Graphics)?;
+        let mut image = tokio::time::timeout(
+            TRANSMIT_TIMEOUT,
+            request
+                .transplace(IMAGE_ID, placement)
+                .instrument(transplace_span),
+        )
+        .await
+        .map_err(|_| Error::TransmitTimeout(TRANSMIT_TIMEOUT))?
+        .map_err(Error::Graphics)?;
 
         // Waited on: until the placement lands nothing is on screen, so a frame that was
         // not placed is a frame the user never sees.
         let ack_span = tracing::info_span!("image.sync");
-        image.sync().instrument(ack_span).await.map_err(Error::Graphics)?;
+        image
+            .sync()
+            .instrument(ack_span)
+            .await
+            .map_err(Error::Graphics)?;
         self.state.image = Some(image);
         Ok(())
     }
@@ -309,23 +362,17 @@ mod tests {
         }
     }
 
-    /// A JPEG frame of one flat colour, which is all the painter looks at.
+    /// A codec frame of one flat colour, which is all the painter looks at.
     ///
-    /// Encoded through the raw pixel form rather than the `image` integration: that
-    /// integration is a feature this crate does not need, and a test should not be
-    /// the reason to add one.
-    fn jpeg(width: u32, height: u32) -> Vec<u8> {
-        let mut encoder = turbojpeg::Compressor::new().expect("a JPEG encoder");
-        encoder.set_quality(80).expect("quality");
-        encoder
-            .compress_to_vec(turbojpeg::Image {
-                pixels: &vec![20u8; width as usize * height as usize * 3],
-                width: width as usize,
-                pitch: width as usize * 3,
-                height: height as usize,
-                format: turbojpeg::PixelFormat::RGB,
-            })
-            .expect("encode a frame")
+    /// Encoded through the codec itself rather than anything simpler: a test that
+    /// feeds the decoder bytes another codec produced would pass by accident.
+    fn codec_frame(width: u32, height: u32) -> Vec<u8> {
+        let mut encoder = codecs::h264::Encoder::new(width, height).expect("an encoder");
+        let bgra = vec![20u8, 20, 20, 255].repeat((width * height) as usize);
+        let stream = codecs::Encoder::encode(&mut encoder, &bgra, width, height, false)
+            .expect("encode a frame");
+        assert!(!stream.is_empty(), "the first frame of a stream carries its picture");
+        stream
     }
 
     /// A connection to throw away, so a session can be built.
@@ -387,8 +434,10 @@ mod tests {
             controller,
             sink,
         );
-        session.handle_msg(Message::Frame(jpeg(8, 8))).await;
-
+        session
+            .handle_msg(Message::InitStreaming { codec: CodecId::H264 })
+            .await;
+        session.handle_msg(Message::Frame(codec_frame(8, 8))).await;
         let first = String::from_utf8(written.lock().unwrap().clone()).expect("escapes are text");
         // One command, `a=T`, that both replaces the pixels and makes the placement.
         // The two used to be separate, and the terminal frees an image's placements when
@@ -412,7 +461,7 @@ mod tests {
         assert!(first.contains("C=1"), "{first:?}");
 
         let after_first = first.len();
-        session.handle_msg(Message::Frame(jpeg(8, 8))).await;
+        session.handle_msg(Message::Frame(codec_frame(8, 8))).await;
 
         let all = written.lock().unwrap().clone();
         let second = String::from_utf8(all[after_first..].to_vec()).expect("escapes are text");

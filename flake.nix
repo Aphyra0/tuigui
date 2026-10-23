@@ -221,14 +221,7 @@
               pkgs.mesa-demos         # glxgears — classic X11/GL gears test app
               pkgs.xvfb-run
               pkgs.xdotool
-              # The profiler the instrumented halves stream their spans to, and
-              # the version the bundled client speaks to. Tracy's protocol is
-              # versioned: 0.13.1 speaks protocol 76, and the cargo side pins
-              # `tracing-tracy =0.11.4`, which resolves to `tracy-client-sys`
-              # 0.28.0 — the same protocol. A mismatch is a profiler that
-              # refuses the connection, so the two are one decision: bump both
-              # or neither. No nixpkgs revision ships 0.14, so this stays on the
-              # packaged 0.13.1 rather than building one from source.
+              # profiler GUI the client half streams its spans to
               pkgs.tracy
               # diff-review TUI invoked by .agents/skills/revdiff (binary
               # release, defined in packages above)

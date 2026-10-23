@@ -7,7 +7,7 @@
 //! presented is already in this address space, so a frame is a copy and an encode.
 //!
 //! ```text
-//!   start(program) ──▶ the program commits a window ──▶ frame() ──▶ JPEG
+//!   start(program) ──▶ the program commits a window ──▶ frame() ──▶ H.264
 //! ```
 //!
 //! Frames are pulled, not pushed: the session's own loop calls [`App::frame`], so there
@@ -18,12 +18,6 @@ use std::path::Path;
 use compositor::{Client, Compositor};
 use wire::transport::BoxFuture;
 
-/// JPEG quality for a captured window.
-///
-/// The same value the video path uses, and for the same reason: these pixels are on their
-/// way to a grid of terminal cells, where legibility is bought long before fidelity is.
-const QUALITY: i32 = 80;
-
 /// A program running in a compositor, with its window ready to be read.
 pub struct App {
     /// The program's window, and the only handle that reads it.
@@ -33,11 +27,16 @@ pub struct App {
     /// Held rather than dropped: the compositor's thread stops when every control sender
     /// is gone, so this is what keeps the session alive. Dropping the `App` ends it.
     _compositor: Compositor,
-    /// The JPEG encoder, kept across frames: building one per frame is the expensive part
-    /// of encoding, not the encoding.
-    encoder: turbojpeg::Compressor,
-    /// The last frame sent, so an idle window is not re-encoded and re-transmitted.
+    /// The codec's encoder, kept across frames: building one per frame is the expensive
+    /// part of encoding, not the encoding. Which codec is inside is announced on the
+    /// wire, not assumed here.
+    encoder: Box<dyn codecs::Encoder>,
+    /// The last frame captured, so an idle window is not re-encoded and re-transmitted.
     last: Option<Vec<u8>>,
+    /// Encode the next frame as a keyframe even if nothing changed, and do not
+    /// take the stored one: the server's decoder lost its state and asked for a
+    /// picture it can start from.
+    pub keyframe_next: bool,
 }
 
 impl App {
@@ -87,18 +86,21 @@ impl App {
                 .spawn(&path, size)
                 .map_err(std::io::Error::other)?;
 
-            // Built after the program is up, because a compressor is only worth making for
-            // a session that has something to encode.
-            let mut encoder = turbojpeg::Compressor::new().map_err(std::io::Error::other)?;
-            encoder
-                .set_quality(QUALITY)
-                .map_err(std::io::Error::other)?;
+            // Built after the program is up, because an encoder is only worth making for
+            // a session that has something to encode. Dimensions are rounded down to even:
+            // 4:2:0 chroma needs them, and the capture is padded to the output's cells
+            // rather than the other way round.
+            let (ew, eh) = (size.0 & !1, size.1 & !1);
+            let encoder = codecs::h264::Encoder::new(ew, eh)
+                .map_err(|e| std::io::Error::other(format!("building the encoder: {e}")))?;
+            let encoder: Box<dyn codecs::Encoder> = Box::new(encoder);
 
             Ok(App {
                 client,
                 _compositor: compositor,
                 encoder,
                 last: None,
+                keyframe_next: false,
             })
         }))
     }
@@ -257,7 +259,8 @@ impl App {
         self.client.scroll(delta).map_err(std::io::Error::other)
     }
 
-    /// The next frame, as JPEG, or `None` when there is nothing new to send.
+    /// The next frame, as whatever the codec produced, or `None` when there is nothing
+    /// new to send.
     ///
     /// `None` is not an end and not an error: a window that has not repainted has nothing
     /// to send, and re-sending the frame it already shows would spend the whole budget on
@@ -278,29 +281,35 @@ impl App {
         };
 
         let _compare = tracing::info_span!("compare").entered();
-        if self.last.as_deref() == Some(frame.rgba.as_slice()) {
+        if self.last.as_deref() == Some(frame.rgba.as_slice()) && !self.keyframe_next {
             return None;
         }
         drop(_compare);
 
-        // The captured buffer is a Wayland `Argb8888` buffer copied byte for byte, whose
-        // bytes are B, G, R, A on a little-endian machine. Encoded as `BGRX` so the
-        // terminal shows the colours the program used, not a red/blue swap.
+        // The capture is already the B,G,R,A the codec trait takes; the conversion
+        // to what the codec itself wants is the codec's, not this file's.
         let _encode = tracing::info_span!("encode").entered();
-        let jpeg = match self.encoder.compress_to_vec(turbojpeg::Image {
-            pixels: frame.rgba.as_slice(),
-            width: frame.width as usize,
-            height: frame.height as usize,
-            pitch: frame.width as usize * 4,
-            format: turbojpeg::PixelFormat::BGRX,
-        }) {
-            Ok(jpeg) => jpeg,
+        let force = std::mem::take(&mut self.keyframe_next);
+        let stream = match self
+            .encoder
+            .encode(&frame.rgba, frame.width, frame.height, force)
+        {
+            Ok(stream) => stream,
             Err(e) => {
                 log::error!("could not encode a {}x{} frame: {e}", frame.width, frame.height);
                 return None;
             }
         };
+        drop(_encode);
+
         self.last = Some(frame.rgba);
-        Some(jpeg)
+        // An empty stream is a frame the codec held back rather than one that does
+        // not exist: it arrives as the output of a later frame, and there is
+        // nothing to send this round.
+        if stream.is_empty() {
+            return None;
+        }
+        Some(stream)
     }
 }
+

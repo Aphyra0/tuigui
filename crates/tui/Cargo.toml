@@ -20,9 +20,9 @@ thiserror = { workspace = true }
 # The cursor move a real placement needs, as the bytes a terminal expects rather than a
 # sequence spelled out here.
 crossterm = { workspace = true }
-# Decoding a frame off the wire. The client encodes with the same library, so the
-# two halves agree on the codec by sharing it rather than by documenting one.
-turbojpeg = { version = "1.5", default-features = false, features = ["pkg-config", "require-simd"] }
+# The codec the server decodes with, behind the trait a codec can be swapped
+# behind. Which codec it is arrives on the wire, and is not assumed here.
+codecs = { workspace = true }
 # `select_all` and `StreamExt`, for reading every attached client in one loop
 # without spawning a task per client. Not already reachable through tokio.
 futures-util = { version = "0.3", features = ["alloc"] }
