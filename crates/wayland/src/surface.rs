@@ -1,48 +1,12 @@
-//! Per-window bookkeeping: the one admitted toplevel, its committed buffers,
-//! pending frame callbacks, and damage accumulation.
-
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+//! Reading committed buffers into pixels, and damage extraction.
 
 use smithay::backend::allocator::format::get_bpp;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_shm;
-use smithay::utils::{Logical, Point, Rectangle, Size};
-use smithay::wayland::shm;
+use smithay::utils::Rectangle;
 
-use crate::server::{clamp_rect, WindowShared};
+use crate::Rect;
 use crate::CompError;
-
-/// The one admitted window.
-pub struct Window {
-    /// Shared with the `Client` API handle.
-    pub shared: Arc<WindowShared>,
-    /// The surface's own coordinate space == output space (scale 1, offset 0).
-    pub geometry: Rectangle<i32, Logical>,
-    /// Latest committed contents, owned by us, written on commit.
-    pub pixels: Mutex<Vec<u8>>,
-    /// Damage since the last capture (output pixel space).
-    pub damage: Mutex<Vec<crate::Rect>>,
-    /// Serial of the last configure sent (spawn waits for the first commit).
-    pub last_configure_serial: Mutex<Option<u64>>,
-}
-
-impl Window {
-    pub fn new(shared: Arc<WindowShared>) -> Self {
-        let (w, h) = shared.size;
-        Window {
-            shared,
-            geometry: Rectangle::from_size(Size::from((w as i32, h as i32))),
-            pixels: Mutex::new(Vec::new()),
-            damage: Mutex::new(Vec::new()),
-            last_configure_serial: Mutex::new(None),
-        }
-    }
-
-    pub fn mark_dead(&self) {
-        self.shared.dead.store(true, Ordering::SeqCst);
-    }
-}
 
 /// Convert a committed wl_shm buffer into pixels in `out`, sized `out_size`.
 ///
@@ -160,7 +124,7 @@ pub fn commit_damage(
     attrs: &smithay::wayland::compositor::SurfaceAttributes,
     out_size: (u32, u32),
     scale: f64,
-    out: &mut Vec<crate::Rect>,
+    out: &mut Vec<Rect>,
 ) {
     for d in &attrs.damage {
         if let smithay::wayland::compositor::Damage::Surface(rect) = d {
@@ -174,13 +138,36 @@ pub fn commit_damage(
     }
 }
 
-/// Whether the pointer is inside `window.geometry` at `point`.
-pub fn window_contains(window: &Window, point: Point<f64, Logical>) -> bool {
-    let g = &window.geometry;
-    point.x >= g.loc.x as f64
-        && point.x < (g.loc.x + g.size.w) as f64
-        && point.y >= g.loc.y as f64
-        && point.y < (g.loc.y + g.size.h) as f64
+/// Turn a surface-space damage rect into output pixels, clamped to the output.
+///
+/// Damage arrives in surface coordinates, which are logical: one unit is one
+/// interface pixel, not one output pixel, and the output's scale is what
+/// converts. Clamping first would bound a logical box by a pixel count and
+/// report every rect past the top-left as the wrong size.
+pub(crate) fn clamp_rect(
+    rect: Rectangle<i32, smithay::utils::Logical>,
+    size: (u32, u32),
+    scale: f64,
+) -> Option<Rect> {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let (ow, oh) = (size.0 as f64, size.1 as f64);
+    let x0 = ((rect.loc.x as f64 * scale).floor().max(0.0)) as i32;
+    let y0 = ((rect.loc.y as f64 * scale).floor().max(0.0)) as i32;
+    let x1 = (((rect.loc.x + rect.size.w) as f64 * scale).ceil().min(ow)) as i32;
+    let y1 = (((rect.loc.y + rect.size.h) as f64 * scale).ceil().min(oh)) as i32;
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(Rect {
+        x: x0 as u32,
+        y: y0 as u32,
+        width: (x1 - x0) as u32,
+        height: (y1 - y0) as u32,
+    })
 }
 
 #[cfg(test)]
@@ -276,5 +263,52 @@ mod tests {
         let mut dst = vec![0xffu8; 4 * 4 * 4];
         scale_bgra(&src, 4 * 4, (4, 4), &mut dst, (0, 4));
         assert!(dst.iter().all(|&b| b == 0xff), "an empty target was written");
+    }
+
+    /// Damage is reported in surface coordinates, which are logical. One
+    /// logical pixel is `scale` of the output's pixels, so a rect at the far
+    /// side of the interface reaches the far side of the capture. Bounding it
+    /// by the pixel count first is what reported the whole picture as damaged.
+    #[test]
+    fn damage_is_converted_from_surface_to_output_space() {
+        let (ow, oh) = (1200, 800);
+        let scale = 1.75;
+        let far = clamp_rect(
+            Rectangle::new((685, 456).into(), smithay::utils::Size::from((1, 1))),
+            (ow, oh),
+            scale,
+        )
+        .expect("a visible rect");
+        assert_eq!(far, Rect { x: 1198, y: 798, width: 2, height: 2 });
+
+        // A whole-window damage is the whole capture, not the logical size.
+        let all = clamp_rect(
+            Rectangle::new((0, 0).into(), smithay::utils::Size::from((686, 457))),
+            (ow, oh),
+            scale,
+        )
+        .expect("a visible rect");
+        assert_eq!(all, Rect { x: 0, y: 0, width: 1200, height: 800 });
+    }
+
+    /// A rect that leaves the output is gone, not clamped to a sliver of it.
+    #[test]
+    fn damage_outside_the_output_is_dropped() {
+        let big = Rectangle::new((700, 500).into(), smithay::utils::Size::from((10, 10)));
+        assert_eq!(clamp_rect(big, (1200, 800), 1.75), None);
+        let negative = Rectangle::new((-50, -50).into(), smithay::utils::Size::from((10, 10)));
+        assert_eq!(clamp_rect(negative, (1200, 800), 1.75), None);
+    }
+
+    /// A rect that only partly leaves is clamped to the part that is visible.
+    #[test]
+    fn damage_over_the_edge_is_clamped() {
+        let part = clamp_rect(
+            Rectangle::new((680, 450).into(), smithay::utils::Size::from((20, 20))),
+            (1200, 800),
+            1.75,
+        )
+        .expect("a visible rect");
+        assert_eq!(part, Rect { x: 1190, y: 787, width: 10, height: 13 });
     }
 }

@@ -9,12 +9,13 @@ description = "Client side: draw a runnable's output into the pane the tui serve
 wire = { workspace = true }
 easytgp = { workspace = true }
 ratatui = { workspace = true }
-# Reading this terminal's size in pixels, for the compositor's output.
+# Reading this terminal's size in pixels, for the session's output.
 crossterm = { workspace = true }
-# The compositor an app runs inside, and the capture of the window it draws there.
-compositor = { workspace = true }
-# The terminal's input, as events, with keys mapped to the codes the compositor's
-# seat takes.
+# The headless Wayland session an app runs inside, and the capture of the
+# window it draws there.
+wayland = { workspace = true }
+# The terminal's input, as events, with keys mapped to the codes the
+# session's seat takes.
 termputs = { workspace = true }
 # The codec the client encodes with, behind the trait a codec can be swapped
 # behind. Which codec it is, is announced on the wire, not assumed here.

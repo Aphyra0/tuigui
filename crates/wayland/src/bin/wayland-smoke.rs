@@ -2,6 +2,8 @@
 //! xdg_toplevel, draws a solid color via wl_shm, and repaints on input
 //! events (key, click, scroll).
 
+#![cfg(target_os = "linux")]
+
 use std::os::unix::io::AsFd;
 
 use wayland_client::globals::GlobalListContents;

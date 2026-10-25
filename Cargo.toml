@@ -5,7 +5,7 @@ members = [
     "crates/wire",
     "crates/tui",
     "crates/gui",
-    "crates/compositor",
+    "crates/wayland",
     "crates/termputs",
     "crates/codecs",
 ]
@@ -13,7 +13,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 thiserror = "2"
@@ -42,6 +42,7 @@ fxhash = "0.2"
 crossterm = { version = "0.28", default-features = false, features = ["events"] }
 derive_deref = "1.1"
 derive-getters = "0.5"
+derive_setters = "0.1"
 smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend", "renderer_pixman", "desktop", "xwayland"] }
 wayland-protocols = { version = "0.32", features = ["client"] }
 tracing = "0.1"
@@ -90,7 +91,7 @@ codecs = { path = "crates/codecs" }
 wire = { path = "crates/wire" }
 tui = { path = "crates/tui" }
 gui = { path = "crates/gui" }
-compositor = { path = "crates/compositor" }
+wayland = { path = "crates/wayland" }
 termputs = { path = "crates/termputs" }
 
 [package]

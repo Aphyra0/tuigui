@@ -15,6 +15,18 @@ Goal: run any X11 or Wayland app; see it pixel-accurate; interact with it from t
 terminal at interface-class bandwidth with nothing on the client side but a
 terminal that speaks TGP.
 
+## Maintenability goals
+
+Minimal is a feature of the design, not a byproduct. The tool is glue — if it
+grows a subsystem's worth of code per feature, it has become the thing it was
+meant to replace. Two hard requirements:
+
+- **Keep all code under 10,000 LoC** (all `.rs` in the repository, excluding
+  build output and vendored dependencies). A feature that does not fit is a
+  design problem to solve, not budget to raise.
+- **Prefer deletion.** New capability comes first from removing or unifying
+  what exists; growth is the exception that needs an argument.
+
 ## Architecture
 
 ```
