@@ -709,15 +709,8 @@ fn random_surface() -> SurfaceId {
 
     // Glyphs that no program draws by accident: block elements and geometric shapes,
     // nowhere near the ASCII a terminal UI is made of.
-    // A large alphabet, on purpose. The symbol is what the mask matches on *with* both
-    // colours, but a collision in the symbol alone is what the debug log surfaces, and
-    // with sixteen glyphs two windows take the same one often enough to be seen. Sixty-
-    // four makes that rare, and costs nothing.
     const SYMBOLS: &[char] = &[
         '░', '▒', '▓', '█', '▚', '▞', '◧', '◨', '◩', '◪', '⬒', '⬓', '⬔', '⬕', '▛', '▜',
-        '▙', '▟', '◰', '◱', '◲', '◳', '◴', '◵', '◶', '◷', '◸', '◹', '◺', '◿', '◐', '◑',
-        '◒', '◓', '▖', '▗', '▘', '▝', '▤', '▥', '▦', '▧', '▨', '▩', '◘', '◙', '◚', '◛',
-        '⣿', '⣷', '⣯', '⣟', '⡿', '⢿', '⣻', '⣽', '⢾', '⢗', '⡷', '⣆', '⡇', '⢸', '⠿', '⣾',
     ];
     // Two independent colours, each drawn from its own hash. Deriving one from the other
     // — `rgb(b)` and `rgb(b >> 8)` — leaves their bytes overlapping, and a signature whose

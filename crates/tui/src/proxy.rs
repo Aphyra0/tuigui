@@ -173,7 +173,6 @@ fn blank_existing(screen: &vt100::Screen, live: &[SurfaceId], still_pending: &mu
     let (rows, cols) = screen.size();
     let mut out = Vec::new();
     let mut cursor: Option<(u16, u16)> = None;
-    let mut blanked = 0usize;
 
     for surface in live {
         let mut found = false;
@@ -189,7 +188,6 @@ fn blank_existing(screen: &vt100::Screen, live: &[SurfaceId], still_pending: &mu
                     continue;
                 }
                 found = true;
-                blanked += 1;
                 if cursor != Some((col, row)) {
                     let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
                 }
@@ -208,10 +206,6 @@ fn blank_existing(screen: &vt100::Screen, live: &[SurfaceId], still_pending: &mu
             *still_pending = true;
         }
     }
-    log::info!(
-        "correcting {blanked} cells for {} live surface(s) in a {rows}x{cols} grid",
-        live.len()
-    );
     out
 }
 
@@ -325,12 +319,6 @@ fn copy_rewritten<R: Read + ?Sized, W: Write + ?Sized>(
         // A chunk rather than a one-off write because the same parser and the same
         // rewriter handle it, so the model and the terminal stay in step.
         let mut parser = screen.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-        // A cell whose symbol matches a live surface but whose colours do not is the one
-        // failure the mask cannot report: it looks like ordinary content, so the cell is
-        // simply passed through and the signature stays on screen. Logged once per run
-        // per surface, because that is enough to identify it.
-        let mut unmatched: Vec<SurfaceId> = Vec::new();
-        let mut masked = 0usize;
         let rewritten = cells.map(&mut parser, chunk, &mut |cell: Cell| {
             // A cell of a registered surface is blanked, and blanked on the *default*
             // background. Keeping the surface's own bg would paint over the picture:
@@ -341,7 +329,6 @@ fn copy_rewritten<R: Read + ?Sized, W: Write + ?Sized>(
             // fired, so "the mask never matched" and "the image never arrived" are
             // different symptoms instead of the same blank pane.
             if live.iter().any(|surface| surface.matches(&cell)) {
-                masked += 1;
                 Cell {
                     symbol: if pink { '*' } else { ' ' },
                     fg: if pink {
@@ -352,31 +339,10 @@ fn copy_rewritten<R: Read + ?Sized, W: Write + ?Sized>(
                     bg: vt100::Color::Default,
                 }
             } else {
-                // Not a signature. If it is a live surface's symbol with the wrong
-                // colours, the mask will never catch it and the pane keeps the glyph.
-                let almost = live.iter().find(|surface| {
-                    surface.symbol == cell.symbol
-                        && !unmatched.contains(surface)
-                });
-                if let Some(surface) = almost {
-                    log::warn!(
-                        "cell {:?} is {:?}/{:?} but {surface:?} wanted {:?}/{:?}",
-                        cell.symbol,
-                        cell.fg,
-                        cell.bg,
-                        surface.fg,
-                        surface.bg
-                    );
-                    unmatched.push(*surface);
-                }
                 cell
             }
         });
         drop(parser);
-
-        if masked > 0 {
-            log::info!("the mask blanked {masked} cells in this chunk");
-        }
 
         from.consume(len);
         to.write_all(&rewritten)?;

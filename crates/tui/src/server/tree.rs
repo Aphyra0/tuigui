@@ -111,14 +111,6 @@ impl<F: Format> Window<F> {
             .iter_mut()
             .any(|child| child.remove_child(surface))
     }
-
-    /// Append this window and its toplevels to `out`, in tree order.
-    fn collect<'a>(&'a self, out: &mut Vec<&'a Window<F>>) {
-        out.push(self);
-        for child in &self.children {
-            child.collect(out);
-        }
-    }
 }
 
 /// Whether `cell` carries `surface`'s signature.
@@ -162,16 +154,17 @@ impl<F: Format> Client<F> {
 
     /// The window whose cells are `surface`, preferring the tree of the client at `pid`.
     ///
-    /// The surface is the identity: it is what the cells say, and only a window whose cells
-    /// are on screen is being drawn into. The pid says which tree to try first, and is a
-    /// hint rather than a requirement — a program can open more than one connection, and a
-    /// frame then arrives with the pid of the connection rather than of the process that
-    /// drew. Falling back to the surface alone is what keeps that frame from being dropped
-    /// forever, which is what happens when the two disagree and neither side notices.
+    /// The surface is the identity: it is what the cells say, and it is unique. The pid is
+    /// a preference, not a requirement, because a window is not always filed under the pid
+    /// its frames carry: a program that opens more than one connection gets its windows
+    /// attached to the root, while the frames still name the connection's pid. Looking up
+    /// by pid alone would then never find the window again, and every frame for it would
+    /// be dropped — a pane with the window's signature and no picture.
     pub fn get_window_mut(&mut self, pid: u32, surface: SurfaceId) -> Option<&mut Window<F>> {
-        // The tree the pid names, first: that is the answer when it is right.
-        if self.pid == pid && self.window.find_mut(surface).is_some() {
-            return self.window.find_mut(surface);
+        if self.pid == pid {
+            if self.window.find_mut(surface).is_some() {
+                return self.window.find_mut(surface);
+            }
         }
         if let Some(found) = self
             .sub_clients
@@ -189,17 +182,6 @@ impl<F: Format> Client<F> {
             return Some(self);
         }
         self.sub_clients.iter_mut().find_map(|c| c.find_mut(pid))
-    }
-
-    /// Every window in this tree, appended in tree order.
-    ///
-    /// What a frame walks: each window is captured and sent on its own, so an idle
-    /// one costs its capture and nothing more.
-    pub fn windows<'a>(&'a self, out: &mut Vec<&'a Window<F>>) {
-        self.window.collect(out);
-        for sub in &self.sub_clients {
-            sub.windows(out);
-        }
     }
 
     /// Remove the window whose cells are `surface`, wherever it sits.
