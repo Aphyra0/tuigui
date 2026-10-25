@@ -54,7 +54,11 @@ derive_setters = "0.1"
 sysinfo = "0.37"
 smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend", "renderer_pixman", "desktop", "xwayland"] }
 wayland-protocols = { version = "0.32", features = ["client"] }
-tracing = "0.1"
+# `log` so a `tracing` event also reaches a `log` capturer. Every binary here
+# installs the `log` facade, so without this an `info!` written through `tracing`
+# — which is what the wayland crate uses — would go nowhere at all and the log
+# would look like the code had never run.
+tracing = { version = "0.1", features = ["log"] }
 # The logging facade. A binary installs its own capturer, so which crate records a
 # diagnostic is not the same decision as where it ends up.
 log = "0.4"

@@ -143,7 +143,11 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
     /// child gets this as `XDG_RUNTIME_DIR` so the only Wayland socket it can
     /// auto-discover is ours; the host compositor simply isn't there.
     fn new_runtime_dir() -> Result<PathBuf, CompError> {
-        let runtime_dir = std::env::temp_dir().join(format!(
+        // `/tmp` and not `temp_dir()`: `TMPDIR` is whatever launched us, and under a
+        // shell that is a per-shell directory that a grandchild does not inherit. The
+        // socket's path travels to the child as an absolute path, so it has to be a
+        // path every process can reach — and `/tmp` is the one that is.
+        let runtime_dir = Path::new("/tmp").join(format!(
             "wayland-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -300,7 +304,7 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
 
         // The command that can reach both display stacks, scrubbed of
         // everything that could reach a host compositor.
-        let mut command = Self::new_command(path.as_ref(), &self.socket_name, &self.runtime_dir);
+        let mut command = Self::new_command(path.as_ref(), &self.socket_name);
 
         // X11-only clients are routed to our XWayland; step until it is up.
         if self.use_x11 {
@@ -308,6 +312,21 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
         } else {
             command.env_remove("DISPLAY");
         }
+
+        // What the child is told, said out loud: a program that reports "no display"
+        // cannot be asked which value it read, so the value goes in the log next to
+        // whether the socket is really there. The diff between this line and what the
+        // program says is the whole diagnosis.
+        //
+        // Through `log`, not `tracing`: the binary installs a `log` capturer, and a
+        // `tracing` event only reaches it when no tracing subscriber is installed. The
+        // profiler build installs one that keeps every event to itself.
+        log::info!(
+            "launching {} with WAYLAND_DISPLAY={} (socket exists: {})",
+            path.as_ref().display(),
+            self.socket_name.display(),
+            self.socket_name.exists()
+        );
 
         // A program's own diagnostics go to a file, not the pane: this process owns the
         // terminal, and a toolkit's warnings written to stdout would land in the middle
@@ -318,7 +337,7 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
         let chatter = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(std::env::temp_dir().join("tuigui-client.log"))
+            .open("/tmp/tuigui-client.log")
             .map_err(|e| CompError::Spawn(format!("opening the client log: {e}")))?;
         let chatter_err = chatter
             .try_clone()
@@ -344,21 +363,20 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
     /// The command a client is launched with: a native Wayland client
     /// connects to us via `WAYLAND_DISPLAY`; an X11-only one falls back to
     /// our XWayland via `DISPLAY` (routed separately, in `route_display`).
-    /// The env is scrubbed so the only display it can reach is ours.
-    fn new_command(
-        path: &Path,
-        socket_name: &Path,
-        runtime_dir: &Path,
-    ) -> std::process::Command {
-        let wl_name = socket_name
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default();
+    ///
+    /// `WAYLAND_DISPLAY` is the socket's **absolute path**, not a name. A bare name is
+    /// resolved against `XDG_RUNTIME_DIR`, and the only way to make that point at us
+    /// would be to override `XDG_RUNTIME_DIR` — which is the session directory, shared
+    /// with dbus, audio, and everything else under `$XDG_RUNTIME_DIR`. Overriding it
+    /// breaks all of that, and it does not survive a process in between: a program that
+    /// spawns its own child hands it a runtime dir and a socket name that no longer
+    /// agree, and the child finds no display at all. An absolute path needs neither,
+    /// and travels through any number of grandchildren unchanged.
+    fn new_command(path: &Path, socket_name: &Path) -> std::process::Command {
         let mut command = std::process::Command::new(path);
         command
-            .env("WAYLAND_DISPLAY", wl_name)
+            .env("WAYLAND_DISPLAY", socket_name)
             .env_remove("WAYLAND_SOCKET")
-            .env("XDG_RUNTIME_DIR", runtime_dir)
             .env_remove("GDK_BACKEND")
             .env_remove("QT_QPA_PLATFORM")
             .env_remove("HYPRLAND_INSTANCE_SIGNATURE");

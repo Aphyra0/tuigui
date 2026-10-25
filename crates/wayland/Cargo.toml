@@ -14,6 +14,11 @@ proto = { workspace = true }
 smithay = { workspace = true }
 wayland-protocols = { workspace = true }
 tracing = { workspace = true }
+# Diagnostics through the `log` facade, like the rest of the workspace: the binary
+# installs a `log` capturer, so a message written through `tracing` reaches the log
+# file only when a tracing subscriber is also installed, and the profiler build
+# installs one that keeps events to itself.
+log = { workspace = true }
 thiserror = { workspace = true }
 derive-getters = { workspace = true }
 derive_setters = { workspace = true }

@@ -3727,6 +3727,7 @@ dependencies = [
  "derive-getters",
  "derive_setters",
  "libc",
+ "log",
  "memmap2",
  "proto",
  "rustix 1.1.5",

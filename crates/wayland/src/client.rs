@@ -22,7 +22,7 @@ pub use sub_client::SubClient;
 
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use proto::windowing::Client as _;
 use smithay::wayland::compositor::CompositorClientState;
@@ -80,66 +80,74 @@ where
             // connection was never admitted would make the next attempt look like a
             // helper's, and its parent lookup fail for a reason that is not true.
             root.connected.store(true, Ordering::SeqCst);
-            tracing::info!("wayland: admitted the root client, pid {}", root.pid());
+            log::info!("admitted the root client, pid {}", root.pid());
             return Ok(());
         }
 
         let pid = peer_pid(&stream)
             .ok_or_else(|| CompError::Server("peer pid of a connection unmeasurable".into()))?;
-        let parent = proc_parent(pid)
-            .ok_or_else(|| CompError::Server(format!("no parent pid for {pid}")))?;
 
-        // A process we started ourselves is a child of *us*, not of the client that
-        // happens to be our root. A program that opens a second connection — a toolkit
-        // opening its display after probing, or a helper it forks directly — names this
-        // process as its parent, and there is no client record with that pid because the
-        // root record is the *program*, not us.
+        // The connection belongs to the nearest **ancestor that is already a client**, not
+        // to its immediate parent. A session is a process tree, and most of it never
+        // connects: a terminal emulator starts a shell, the shell starts a browser, and
+        // only the emulator and the browser speak Wayland. Looking one level up would
+        // refuse the browser because the shell has no connection to find.
         //
-        // Such a connection belongs to the session's program, so it hangs under the root.
-        if parent == std::process::id() {
-            let sub = Arc::new(SubClient::new(pid));
-            root.sub_clients.write().unwrap().push(Arc::downgrade(&sub));
-            self.display_handle
-                .insert_client(stream, sub)
-                .map_err(|e| CompError::Server(format!("insert_client: {e}")))?;
-            tracing::info!("wayland: admitted {pid}, started by this process");
-            return Ok(());
-        }
+        // Walking up also keeps the trust chain that makes a private socket safe: a
+        // process can only attach under an ancestor, and an ancestor is a process that
+        // started it. The walk stops at us, which is the whole session's parent.
+        let me = std::process::id();
+        let mut parent = proc_parent(pid);
+        let mut depth = 0;
+        let root_pid = root.pid();
 
-        // Every connected client, flat, straight from the display: the new
-        // connection's parent must be one of them, and the new client attaches
-        // to that parent's sub-clients.
+        // Every connected client, read once: the walk compares against these, so the
+        // set does not have to be re-read per step.
         let handle = self.display_handle.backend_handle();
         let mut ids = Vec::new();
         handle.with_all_clients(|id| ids.push(id));
+        let mut connected: Vec<u32> = Vec::new();
         for id in ids {
             let data = handle
                 .get_client_data(id)
                 .map_err(|e| CompError::Server(e.to_string()))?;
-            // Helpers connect most often, so test them first. Each arm yields
-            // the record's pid and its children list; the pid check happens
-            // once, right here.
-            let (found, children) = if let Some(sub_c) = data.downcast_ref::<SubClient<C, W>>() {
-                (sub_c.pid, &sub_c.sub_clients)
-            } else if let Some(root_c) = data.downcast_ref::<RootClient<C, W>>() {
-                (root_c.pid(), &root_c.sub_clients)
-            } else {
-                continue;
-            };
-            if found != parent {
-                continue;
+            if let Some(sub) = data.downcast_ref::<SubClient<C, W>>() {
+                connected.push(sub.pid);
+            } else if data.downcast_ref::<RootClient<C, W>>().is_some() {
+                connected.push(root_pid);
             }
-            let sub = Arc::new(SubClient::new(pid));
-            children.write().unwrap().push(Arc::downgrade(&sub));
-            self.display_handle
-                .insert_client(stream, sub)
-                .map_err(|e| CompError::Server(format!("insert_client: {e}")))?;
-            return Ok(());
+        }
+        connected.push(me);
+
+        while let Some(candidate) = parent {
+            depth += 1;
+            // A floor on the walk: a process tree is deep but not endless, and a loop
+            // that never found a client would otherwise climb to pid 1 and stop there.
+            if depth > 64 {
+                break;
+            }
+            if connected.contains(&candidate) {
+                break;
+            }
+            parent = proc_parent(candidate);
         }
 
-        tracing::warn!(
-            "parent {parent} of {pid} is not a connected client; ignoring the connection"
-        );
+        let Some(owner) = parent else {
+            log::warn!("{pid} has no ancestor in the session; ignoring the connection");
+            return Ok(());
+        };
+
+        // Every process we started is under the root, whether its parent is us or
+        // something we started: a session is one program and what that program spawned.
+        let sub = Arc::new(SubClient::new(pid));
+        root.sub_clients
+            .write()
+            .unwrap()
+            .push(Arc::downgrade(&sub));
+        self.display_handle
+            .insert_client(stream, sub)
+            .map_err(|e| CompError::Server(format!("insert_client: {e}")))?;
+        log::info!("admitted {pid}, nearest ancestor {owner}");
         Ok(())
     }
 }

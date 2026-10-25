@@ -2,7 +2,7 @@
 //! startup, and the frame-callback replay.
 
 use std::process::Child;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use smithay::input::keyboard::XkbConfig;
 use smithay::input::{Seat, SeatState};

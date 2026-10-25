@@ -328,7 +328,7 @@ fn install_tracing() -> std::io::Result<()> {
     // trace is clean wherever it is opened and however many processes are
     // writing to it.
     let ours = Targets::new()
-        .with_target("compositor", Level::TRACE)
+        .with_target("wayland", Level::TRACE)
         .with_target("gui", Level::TRACE)
         .with_target("tui", Level::TRACE)
         .with_target("tuigui", Level::TRACE)

@@ -1,7 +1,5 @@
 //! `wl_compositor` handler: buffer commits become owned pixels.
 
-use std::sync::Weak;
-
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::compositor::{

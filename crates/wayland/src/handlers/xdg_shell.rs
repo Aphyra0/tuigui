@@ -1,7 +1,5 @@
 //! `xdg_shell` handler: the window-tree admission and its configure.
 
-use std::sync::Weak;
-
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::utils::Serial;
