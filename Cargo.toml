@@ -61,7 +61,9 @@ wayland-protocols = { version = "0.32", features = ["client"] }
 tracing = { version = "0.1", features = ["log"] }
 # The logging facade. A binary installs its own capturer, so which crate records a
 # diagnostic is not the same decision as where it ends up.
-log = "0.4"
+# `std` for the boxed-logger entry point: without it a binary can only install a
+# `&'static` logger, which a capturer holding a file cannot be.
+log = { version = "0.4", features = ["std"] }
 # Tracy: a `tracing` span becomes a profiler zone. A binary installs the
 # subscriber, and the profiler it talks to is in the dev shell.
 #

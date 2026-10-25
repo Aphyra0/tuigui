@@ -72,6 +72,18 @@ pub struct State<C: 'static = (), W: 'static = ()> {
     /// known to be unavailable. Read at `spawn` time to set `DISPLAY` for
     /// X11-routed clients.
     pub x11_display: Option<std::result::Result<String, String>>,
+    /// Commits that arrived before the surface had a window to draw into.
+    ///
+    /// A client may commit between being configured and being admitted: `xdg-shell`
+    /// sends the configure while the window is still being built, and Wayland delivers
+    /// that first commit before the window exists. The commit used to be dropped, and
+    /// the window it belonged to then never had pixels — nothing else asks it to draw,
+    /// because frame callbacks are fired by `capture`, which only runs once a window
+    /// exists.
+    ///
+    /// Held by surface, drained by the admission that creates the window. Bounded by the
+    /// number of surfaces mid-admission, which is one per client at a time.
+    pub pending_commits: std::collections::HashMap<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface, (Vec<u8>, (u32, u32))>,
 }
 
 impl<C, W> State<C, W>
@@ -120,6 +132,7 @@ where
             output_scale,
             show_cursor,
             x11_display: None,
+            pending_commits: std::collections::HashMap::new(),
         };
         seat.add_keyboard(XkbConfig::default(), 200, 25)
             .map_err(|e| CompError::Server(format!("keyboard init: {e}")))?;

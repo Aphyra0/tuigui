@@ -41,13 +41,21 @@ where
         };
         if let Some(root) = client.get_data::<crate::client::RootClient<C, W>>() {
             let mut tree = root.root_window.write().unwrap();
-            if let Some(win) = tree.as_mut().and_then(|t| t.commit_target(surface)) {
-                commit_into(win, out_size, surface);
+            match tree.as_mut().and_then(|t| t.commit_target(surface)) {
+                Some(win) => commit_into(win, out_size, surface),
+                None => hold(self, surface, out_size),
             }
         } else if let Some(sub) = client.get_data::<crate::client::SubClient<C, W>>() {
             let mut tree = sub.root_window.write().unwrap();
-            if let Some(win) = tree.as_mut().and_then(|t| t.commit_target(surface)) {
-                commit_into(win, out_size, surface);
+            match tree.as_mut().and_then(|t| t.commit_target(surface)) {
+                Some(win) => commit_into(win, out_size, surface),
+                // A client may commit between being configured and being admitted:
+                // `xdg-shell` sends the configure while the window is still being built,
+                // and this commit arrives before the window exists. Holding it is what
+                // gives the window its first picture — nothing else would ask the client
+                // to draw again, because frame callbacks are fired by `capture`, which
+                // only runs once a window exists.
+                None => hold(self, surface, out_size),
             }
         } else {
             // XWayland's connection: its admitted surface is the root
@@ -76,6 +84,45 @@ where
             }
         }
     }
+}
+
+/// Hold a commit whose surface has no window yet.
+///
+/// The pixels are copied out now, because the buffer is released immediately after the
+/// commit: waiting until the window exists would mean reading a buffer the client has
+/// already been told to reuse.
+///
+/// The buffer is still released here for the same reason — a client waiting on
+/// `wl_buffer.release` would otherwise never draw again, and the window would be waiting
+/// for a picture from a client that is waiting for its buffer.
+fn hold<C, W>(state: &mut State<C, W>, surface: &WlSurface, out_size: (u32, u32))
+where
+    C: proto::Shared + Default,
+    W: proto::Shared + Default,
+{
+    let mut pixels = Vec::new();
+    let mut release: Option<smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer> =
+        None;
+    smithay::wayland::compositor::with_states(surface, |states| {
+        let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+        if let Some(BufferAssignment::NewBuffer(buffer)) = &attrs.current().buffer {
+            if map_rgba(buffer, &mut pixels, out_size).is_ok() {
+                release = Some(buffer.clone());
+            }
+        }
+    });
+    if let Some(buffer) = release {
+        buffer.release();
+    }
+    if pixels.is_empty() {
+        // No buffer in this commit: it was a state change, not a picture. Nothing to
+        // hold, and no reason to say so.
+        return;
+    }
+    log::info!("holding a commit from a surface whose window is not built yet");
+    state
+        .pending_commits
+        .insert(surface.clone(), (pixels, out_size));
 }
 
 /// Read the committed buffer into `win`'s pixel store.

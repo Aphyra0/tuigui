@@ -118,7 +118,14 @@ pub(crate) fn map_rgba(
     shm::with_buffer_contents(buffer, |ptr, len, data| {
         let bpp = wl_bpp(data.format);
         if bpp != 4 {
-            // Unsupported layout for the MVP: leave the previous frame.
+            // Unsupported layout. Said out loud, because the consequence is invisible:
+            // the window keeps its previous frame — which, for a window that has never
+            // captured one, is no picture at all, so the pane shows the mask's blank and
+            // nothing behind it.
+            log::warn!(
+                "a committed buffer is in {:?}, which this capture cannot read",
+                data.format
+            );
             return;
         }
         // Every dimension is the client's, so none of them is trusted to be

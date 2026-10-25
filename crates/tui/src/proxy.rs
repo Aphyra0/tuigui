@@ -159,7 +159,63 @@ impl Proxy {
     }
 }
 
-/// Copy from `from` to `to` until it ends, flushing after each read.
+/// The escapes that blank every cell already on the grid that carries a live surface.
+///
+/// Built from the grid, not from what the stream said: the cells are in the model, and
+/// the terminal holds a copy of them because ratatui wrote them before this side knew
+/// they were a window's. One cursor move per run of matching cells, so a row is one move
+/// rather than one per cell.
+///
+/// The background goes to default: the image is drawn behind cell backgrounds, so a
+/// blank on the surface's own colour would cover the picture it exists to reveal.
+fn blank_existing(screen: &vt100::Screen, live: &[SurfaceId], still_pending: &mut bool) -> Vec<u8> {
+    use std::io::Write as _;
+    let (rows, cols) = screen.size();
+    let mut out = Vec::new();
+    let mut cursor: Option<(u16, u16)> = None;
+    let mut blanked = 0usize;
+
+    for surface in live {
+        let mut found = false;
+        for row in 0..rows.get() {
+            for col in 0..cols.get() {
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                let mine = cell.contents() == surface.symbol.to_string()
+                    && cell.fgcolor() == vt100::Color::Rgb(surface.fg.0, surface.fg.1, surface.fg.2)
+                    && cell.bgcolor() == vt100::Color::Rgb(surface.bg.0, surface.bg.1, surface.bg.2);
+                if !mine {
+                    continue;
+                }
+                found = true;
+                blanked += 1;
+                if cursor != Some((col, row)) {
+                    let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
+                }
+                // Reset everything, not just the background. A cell's glyph is drawn in its
+                // foreground colour, so leaving that set draws the space in the surface's
+                // own colour — invisible against a default background, which is why the
+                // background reset alone looked like it worked and the glyph stayed.
+                //
+                // The image sits behind the cell backgrounds, so the cell has to be a
+                // plain space on defaults for the picture to show through.
+                out.extend_from_slice(b"\x1b[0m ");
+                cursor = Some((col + 1, row));
+            }
+        }
+        if !found {
+            *still_pending = true;
+        }
+    }
+    log::info!(
+        "correcting {blanked} cells for {} live surface(s) in a {rows}x{cols} grid",
+        live.len()
+    );
+    out
+}
+
+
 ///
 /// `EINTR` is retried rather than reported: signals are routine here, and
 /// treating one as an end would stop forwarding for the rest of the session.
@@ -227,6 +283,14 @@ fn copy_rewritten<R: Read + ?Sized, W: Write + ?Sized>(
     pink: bool,
 ) -> io::Result<()> {
     let mut from = BufReader::new(from);
+    // The surfaces whose cells this side has already blanked on the terminal. A surface
+    // appearing here for the first time needs its existing cells corrected, because they
+    // were drawn before anything knew they were a window's.
+    //
+    // Compared against the live set every chunk: a correction is owed whenever the two
+    // disagree, which is both "a surface appeared" and "a surface's cells have not been
+    // found yet".
+    let mut blanked: Vec<SurfaceId> = Vec::new();
     loop {
         let chunk = match from.fill_buf() {
             Ok([]) => return Ok(()),
@@ -252,7 +316,21 @@ fn copy_rewritten<R: Read + ?Sized, W: Write + ?Sized>(
             .collect();
         drop(registered);
 
+        // A surface that has just been registered has cells *already on the terminal*,
+        // written before this side had heard of it, and ratatui only emits cells that
+        // changed — so those cells would keep the signature for the rest of the session
+        // and cover the picture. This is the correction: one synthetic chunk that blanks
+        // them, built from the grid so it names exactly the cells that carry a surface.
+        //
+        // A chunk rather than a one-off write because the same parser and the same
+        // rewriter handle it, so the model and the terminal stay in step.
         let mut parser = screen.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A cell whose symbol matches a live surface but whose colours do not is the one
+        // failure the mask cannot report: it looks like ordinary content, so the cell is
+        // simply passed through and the signature stays on screen. Logged once per run
+        // per surface, because that is enough to identify it.
+        let mut unmatched: Vec<SurfaceId> = Vec::new();
+        let mut masked = 0usize;
         let rewritten = cells.map(&mut parser, chunk, &mut |cell: Cell| {
             // A cell of a registered surface is blanked, and blanked on the *default*
             // background. Keeping the surface's own bg would paint over the picture:
@@ -263,6 +341,7 @@ fn copy_rewritten<R: Read + ?Sized, W: Write + ?Sized>(
             // fired, so "the mask never matched" and "the image never arrived" are
             // different symptoms instead of the same blank pane.
             if live.iter().any(|surface| surface.matches(&cell)) {
+                masked += 1;
                 Cell {
                     symbol: if pink { '*' } else { ' ' },
                     fg: if pink {
@@ -273,13 +352,60 @@ fn copy_rewritten<R: Read + ?Sized, W: Write + ?Sized>(
                     bg: vt100::Color::Default,
                 }
             } else {
+                // Not a signature. If it is a live surface's symbol with the wrong
+                // colours, the mask will never catch it and the pane keeps the glyph.
+                let almost = live.iter().find(|surface| {
+                    surface.symbol == cell.symbol
+                        && !unmatched.contains(surface)
+                });
+                if let Some(surface) = almost {
+                    log::warn!(
+                        "cell {:?} is {:?}/{:?} but {surface:?} wanted {:?}/{:?}",
+                        cell.symbol,
+                        cell.fg,
+                        cell.bg,
+                        surface.fg,
+                        surface.bg
+                    );
+                    unmatched.push(*surface);
+                }
                 cell
             }
         });
         drop(parser);
 
+        if masked > 0 {
+            log::info!("the mask blanked {masked} cells in this chunk");
+        }
+
         from.consume(len);
         to.write_all(&rewritten)?;
         to.flush()?;
+
+        // A surface that is registered but has no cells yet is one whose drawing has not
+        // been parsed. Those cells, when they arrive, are already on the terminal — so
+        // the correction is retried until every live surface has been found, not once when
+        // it is first heard of.
+        // A surface that is registered but has no cells yet is one whose drawing has not
+        // been parsed. Those cells, when they arrive, are already on the terminal — so the
+        // correction is retried until every live surface has been found, and re-armed
+        // whenever the live set changes.
+        if live != blanked {
+            let mut correction = Vec::new();
+            let mut still_pending = false;
+            if let Ok(parser) = screen.read() {
+                correction = blank_existing(parser.screen(), &live, &mut still_pending);
+            }
+            if !correction.is_empty() {
+                log::info!("blanking cells that were drawn before their surface registered");
+                to.write_all(&correction)?;
+                to.flush()?;
+                // Recorded only for what was actually found: a surface still missing its
+                // cells has to be looked for again on the next chunk.
+                if !still_pending {
+                    blanked = live.clone();
+                }
+            }
+        }
     }
 }

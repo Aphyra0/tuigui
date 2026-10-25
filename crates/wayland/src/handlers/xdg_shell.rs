@@ -165,13 +165,33 @@ where
         Some(tree) => tree.children.push(win),
         None => *tree = Some(win),
     }
+    // A commit that arrived before this window existed was held for it: that picture is
+    // the only one the client will draw until something asks it again, so it goes in
+    // now. See `hold` in `handlers/compositor.rs`.
+    let held = state.pending_commits.remove(&surface.wl_surface().clone());
+    if let Some(tree) = tree.as_mut() {
+        apply_pending(held, tree);
+    }
     drop(tree);
 
     // The window "fills" the output. Send `wl_surface.enter` so the client
     // knows an output is attached and can start presenting. Clients like
     // Firefox's WebRender withhold content until they see this.
     state.output.enter(surface.wl_surface());
-    tracing::info!("compositor: admitted a window into the root client's tree");
+    log::info!("admitted a window into the root client's tree");
+}
+
+/// Apply a commit held for a window that has just been admitted.
+fn apply_pending<W>(
+    held: Option<(Vec<u8>, (u32, u32))>,
+    tree: &mut crate::window::Window<W>,
+) {
+    let Some((pixels, _size)) = held else {
+        return;
+    };
+    *tree.surface.pixels.lock().unwrap() = pixels;
+    tree.surface.committed = true;
+    log::info!("applied a held commit to the window it belongs to");
 }
 
 /// Admit a toplevel into a sub-client's window tree.
@@ -198,8 +218,14 @@ where
         Some(tree) => tree.children.push(win),
         None => *tree = Some(win),
     }
+    // The commit that raced this admission goes in now: it is the picture the client
+    // drew when it was configured, and nothing else will ask it to draw.
+    let held = state.pending_commits.remove(&surface.wl_surface().clone());
+    if let Some(tree) = tree.as_mut() {
+        apply_pending(held, tree);
+    }
     drop(tree);
 
     state.output.enter(surface.wl_surface());
-    tracing::info!("compositor: admitted a window into a sub-client's tree");
+    log::info!("admitted a window into a sub-client's tree");
 }

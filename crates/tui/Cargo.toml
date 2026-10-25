@@ -34,6 +34,10 @@ codecs = { workspace = true }
 futures-util = { version = "0.3", features = ["alloc"] }
 # Spans become zones in the Tracy profiler, for seeing where a frame's time goes.
 tracing = { workspace = true }
+# Diagnostics through the `log` facade, and a file capturer in the binary: a session's
+# failures have nowhere else to go, because the pane is the screen and this process owns
+# it.
+log = { workspace = true }
 # The profiler's client, optional and off by default: it is a compiled C++
 # library with a background thread, and it is only worth carrying when a session
 # is being profiled. `just trace` is what turns it on. `tracing` itself stays

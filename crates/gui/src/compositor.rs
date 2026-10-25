@@ -709,26 +709,35 @@ fn random_surface() -> SurfaceId {
 
     // Glyphs that no program draws by accident: block elements and geometric shapes,
     // nowhere near the ASCII a terminal UI is made of.
+    // A large alphabet, on purpose. The symbol is what the mask matches on *with* both
+    // colours, but a collision in the symbol alone is what the debug log surfaces, and
+    // with sixteen glyphs two windows take the same one often enough to be seen. Sixty-
+    // four makes that rare, and costs nothing.
     const SYMBOLS: &[char] = &[
         '░', '▒', '▓', '█', '▚', '▞', '◧', '◨', '◩', '◪', '⬒', '⬓', '⬔', '⬕', '▛', '▜',
+        '▙', '▟', '◰', '◱', '◲', '◳', '◴', '◵', '◶', '◷', '◸', '◹', '◺', '◿', '◐', '◑',
+        '◒', '◓', '▖', '▗', '▘', '▝', '▤', '▥', '▦', '▧', '▨', '▩', '◘', '◙', '◚', '◛',
+        '⣿', '⣷', '⣯', '⣟', '⡿', '⢿', '⣻', '⣽', '⢾', '⢗', '⡷', '⣆', '⡇', '⢸', '⠿', '⣾',
     ];
+    // Two independent colours, each drawn from its own hash. Deriving one from the other
+    // — `rgb(b)` and `rgb(b >> 8)` — leaves their bytes overlapping, and a signature whose
+    // halves share bytes is one another window's cells can match.
     SurfaceId {
         symbol: SYMBOLS[(a % SYMBOLS.len() as u64) as usize],
-        // 24-bit in each channel, kept away from 0 and 255 so a surface never looks
-        // like a plain default colour.
-        fg: rgb(b >> 8),
-        bg: rgb(b),
+        fg: colour(a ^ 0x9e37_79b9_7f4a_7c15),
+        bg: colour(b),
     }
 }
 
-/// Three bytes of `seed` as a colour, avoiding the extremes.
-fn rgb(seed: u64) -> (u8, u8, u8) {
-    let channel = |shift: u32| {
-        let byte = ((seed >> shift) & 0xff) as u8;
-        // 1..=254: a surface is never a pure black or white cell.
-        byte.clamp(1, 254)
-    };
-    (channel(0), channel(8), channel(16))
+/// A colour from `seed`, kept away from the extremes so a surface never looks like a
+/// plain default cell.
+fn colour(seed: u64) -> (u8, u8, u8) {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(seed);
+    let value = hasher.finish().to_le_bytes();
+    // 1..=254: never a pure black or a pure white, both of which read as "no colour".
+    (value[0].clamp(1, 254), value[1].clamp(1, 254), value[2].clamp(1, 254))
 }
 
 impl StatefulWidget for &mut Compositor {

@@ -160,18 +160,25 @@ impl<F: Format> Client<F> {
         }
     }
 
-    /// The window that belongs to the client at `pid`, whose cells are `surface`.
+    /// The window whose cells are `surface`, preferring the tree of the client at `pid`.
     ///
-    /// Both facts are needed, not one: a pid alone names a client, which owns a tree
-    /// of windows, and a surface alone names cells, which could belong to any
-    /// client's tree. A frame arrives carrying the surface it draws, so this is what
-    /// turns it into the window whose decoder that stream continues.
+    /// The surface is the identity: it is what the cells say, and only a window whose cells
+    /// are on screen is being drawn into. The pid says which tree to try first, and is a
+    /// hint rather than a requirement — a program can open more than one connection, and a
+    /// frame then arrives with the pid of the connection rather than of the process that
+    /// drew. Falling back to the surface alone is what keeps that frame from being dropped
+    /// forever, which is what happens when the two disagree and neither side notices.
     pub fn get_window_mut(&mut self, pid: u32, surface: SurfaceId) -> Option<&mut Window<F>> {
-        if self.pid != pid {
-            return self
-                .sub_clients
-                .iter_mut()
-                .find_map(|c| c.get_window_mut(pid, surface));
+        // The tree the pid names, first: that is the answer when it is right.
+        if self.pid == pid && self.window.find_mut(surface).is_some() {
+            return self.window.find_mut(surface);
+        }
+        if let Some(found) = self
+            .sub_clients
+            .iter_mut()
+            .find_map(|client| client.get_window_mut(pid, surface))
+        {
+            return Some(found);
         }
         self.window.find_mut(surface)
     }

@@ -170,6 +170,11 @@ impl Tui {
         stdin: impl Read + Send + 'static,
         stdout: impl Write + Send + Sync + 'static,
     ) -> io::Result<()> {
+        // Before anything else can fail. The pane is this process's screen, so a
+        // diagnostic written to stdout would land in the middle of it; a file is the only
+        // place left. Installed unconditionally, because the failures this exists for are
+        // the ones nobody asked to reproduce.
+        install_logger();
         #[cfg(feature = "tracy")]
         if self.debug.trace_tui {
             install_tracing()?;
@@ -297,6 +302,50 @@ pub use raw::Raw;
 /// inside the pty.
 /// Send `tracing`'s spans to the Tracy profiler, so a session can be looked at
 /// rather than guessed at.
+/// Send every `log` record to `/tmp/tuigui.log`.
+///
+/// The path is fixed rather than per process, so the log of the run that just failed is
+/// the one that is read. A single line per record: this is a file to grep, not to read.
+fn install_logger() {
+    struct File(log::LevelFilter);
+
+    impl log::Log for File {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= self.0
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            // Opened per record and appended: a session is long and a file held open
+            // across it would be one more thing to get wrong on the way out. The cost is
+            // one open per line, which these diagnostics can afford.
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/tuigui.log")
+            {
+                let _ = writeln!(
+                    file,
+                    "[{}] {}: {}",
+                    record.level(),
+                    record.target(),
+                    record.args()
+                );
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    // A logger already installed wins: one capturer per process, and the second call is
+    // a caller that has nothing to say.
+    let _ = log::set_boxed_logger(Box::new(File(log::LevelFilter::Debug)));
+    log::set_max_level(log::LevelFilter::Debug);
+}
+
 ///
 /// The server is the right half to hold it: this is the process that decodes a
 /// frame, transmits it, and waits on the terminal's acknowledgement — three

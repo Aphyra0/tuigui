@@ -183,6 +183,10 @@ impl<F: Format> Session<F> {
         let surface = Arc::new(surface);
         if let Ok(mut registered) = self.registered_surfaces.write() {
             registered.push(Arc::downgrade(&surface));
+            log::info!(
+                "registered surface {surface:?} ({} now live) for the mask to blank",
+                registered.len()
+            );
         }
         surface
     }
@@ -261,17 +265,34 @@ impl<F: Format> Session<F> {
             // that client's root window, addressed under the same pid.
             Message::NewWindow { pid, surface, z } => {
                 let surface = self.register(surface);
-                match self.root.as_mut().and_then(|root| root.find_mut(pid)) {
-                    Some(owner) => {
-                        owner
-                            .window
-                            .children
-                            .push(crate::server::Window::new(surface, z));
+                // The pid names which client's tree the window belongs to, and a program
+                // can open more than one connection: the window may be announced on a
+                // connection whose tree does not list that pid. It still belongs to this
+                // session — a session is one program and what it started — so an unknown
+                // pid attaches to the root rather than turning a deliverable window into
+                // an error. Rejecting it here is what left a surface registered and
+                // unpainted, which reads on screen as the signature with no picture.
+                match self.root.as_mut() {
+                    Some(root) => {
+                        match root.find_mut(pid) {
+                            Some(client) => client
+                                .window
+                                .children
+                                .push(crate::server::Window::new(surface, z)),
+                            None => {
+                                log::warn!(
+                                    "a window for pid {pid} attached to the root: no client by that pid"
+                                );
+                                root.window
+                                    .children
+                                    .push(crate::server::Window::new(surface, z));
+                            }
+                        }
                         Ok(())
                     }
-                    None => Err(io::Error::other(format!(
-                        "a window arrived for an unknown client {pid}"
-                    ))
+                    None => Err(io::Error::other(
+                        "a window arrived before any client was reported",
+                    )
                     .into()),
                 }
             }
@@ -367,6 +388,26 @@ impl<F: Format> Session<F> {
             window.rectangle(screen.screen())
         };
         let Some((left, top, width, height)) = rectangle else {
+            // No cell of the grid carries this surface, so there is nowhere to put the
+            // picture. Either the window has not been drawn into the pane yet, or what
+            // was drawn does not match its signature exactly — both look like a pane
+            // showing the signature itself and no image, so the cell is worth naming.
+            let sample = self.screen.read().map(|screen| {
+                let (rows, cols) = screen.screen().size();
+                (0..rows.get())
+                    .flat_map(|row| (0..cols.get()).map(move |col| (row, col)))
+                    .find_map(|(row, col)| {
+                        let cell = screen.screen().cell(row, col)?;
+                        (cell.contents() == surface.symbol.to_string())
+                            .then(|| (row, col, cell.fgcolor(), cell.bgcolor()))
+                    })
+            });
+            log::warn!(
+                "a frame for {surface:?} has no cells in the pane; wanted symbol {:?} on {:?}/{:?}, found {sample:?}",
+                surface.symbol,
+                surface.fg,
+                surface.bg
+            );
             return Ok(());
         };
 
