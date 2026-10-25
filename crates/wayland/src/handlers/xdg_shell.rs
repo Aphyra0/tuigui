@@ -1,10 +1,9 @@
 //! `xdg_shell` handler: the window-tree admission and its configure.
 
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
 
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
-use smithay::reexports::wayland_server::Client;
 use smithay::utils::Serial;
 use smithay::wayland::shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler};
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -150,7 +149,7 @@ where
 {
     let server_size = state.server_size;
     let serial = state.next_serial();
-    let root = state.root_client.as_ref().and_then(Weak::upgrade).expect("root data seen");
+    let root = state.root_client.as_ref().expect("root data seen");
 
     // Whether this lands in the empty root slot decides the configured size,
     // so the tree is consulted before the window is built.

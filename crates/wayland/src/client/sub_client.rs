@@ -85,6 +85,16 @@ where
         false
     }
 
+    /// Whether the process is still running.
+    ///
+    /// A helper's process is not this session's to wait on — it is a peer that connects
+    /// and disconnects — so this reports it as running while the connection is up. The
+    /// connection closing is what says it is gone, and that is the compositor's to
+    /// observe rather than a pid's to answer.
+    fn is_running(&self) -> bool {
+        true
+    }
+
     fn with_attached(&self, f: &mut dyn FnMut(&C)) {
         f(&self.attached.read().unwrap());
     }

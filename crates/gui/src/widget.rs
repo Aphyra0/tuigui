@@ -220,6 +220,11 @@ pub struct Footer;
 
 impl Footer {
     /// Draw the buttons on `area`, marking whichever panel is open.
+    ///
+    /// The spinner on the right is a liveness light: it turns once a second, so a pane
+    /// that is drawing but not sending frames can be told apart from a loop that has
+    /// stopped. It says nothing about the session's health — only that the draw is
+    /// happening.
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, open: PopupState) {
         buf.set_style(area, Style::new().bg(Color::Rgb(0x28, 0x28, 0x28)));
         let mut x = 1u16;
@@ -231,6 +236,17 @@ impl Footer {
             };
             buf.set_string(area.x + x, area.y, format!(" {label} "), style);
             x += label.len() as u16 + 3;
+        }
+
+        // The spinner, one cell in from the right edge.
+        if let Some(cell) = area.right().checked_sub(2) {
+            let frame = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() / 1000)
+                .unwrap_or(0);
+            const SPIN: [char; 4] = ['◐', '◓', '◑', '◒'];
+            let spin = SPIN[(frame % SPIN.len() as u128) as usize];
+            buf.set_string(cell, area.y, spin.to_string(), Style::new().fg(Color::DarkGray));
         }
     }
 }

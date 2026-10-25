@@ -1,14 +1,14 @@
 //! The root client: the process the session was built around.
 
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::atomic::AtomicBool;
+use std::sync::{RwLock, Weak};
 
 use derive_getters::Getters;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::wayland::compositor::CompositorClientState;
 
-use super::{StderrTail, SubClient};
+use super::SubClient;
 use crate::state::State;
 use crate::window::Window;
 
@@ -18,8 +18,6 @@ pub struct RootClient<C = (), W = ()> {
     /// The process. Killed when the root client goes away.
     #[getter(skip)]
     pub(crate) child: Child,
-    /// The process's stderr tail, for diagnostics.
-    pub(crate) stderr: StderrTail,
     /// The root window, and the toplevels its program spawned afterwards.
     pub(crate) root_window: RwLock<Option<Window<W>>>,
     /// Helper processes that connected as their own wayland clients.
@@ -38,10 +36,9 @@ where
     C: proto::Shared + Default,
     W: proto::Shared + Default,
 {
-    pub(crate) fn new(child: Child, stderr: StderrTail) -> Self {
+    pub(crate) fn new(child: Child) -> Self {
         RootClient {
             child,
-            stderr,
             root_window: RwLock::new(None),
             sub_clients: RwLock::new(Vec::new()),
             connected: AtomicBool::new(false),
@@ -58,12 +55,7 @@ where
     /// reaped here makes the final `wait` on drop return `ECHILD`, which is
     /// ignored there.
     pub fn is_running(&self) -> bool {
-        match unsafe {
-            libc::waitpid(self.child.id() as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG)
-        } {
-            0 => true,
-            _ => false,
-        }
+        running(&self.child)
     }
 
     /// Dispatch the root's queued inputs: its own window tree, then every
@@ -114,6 +106,12 @@ where
         true
     }
 
+    /// Whether the process is still running. The session's own program is the one whose
+    /// exit ends a session, so this is the fact that does.
+    fn is_running(&self) -> bool {
+        running(&self.child)
+    }
+
     fn with_attached(&self, f: &mut dyn FnMut(&C)) {
         f(&self.attached.read().unwrap());
     }
@@ -135,5 +133,17 @@ where
         for sub in subs {
             f(&*sub);
         }
+    }
+}
+
+/// Whether `child` is still running, without blocking or reaping it.
+///
+/// `WNOHANG` asks the kernel rather than the handle, because the handle cannot be taken
+/// through a shared reference. `0` means still running; anything else means it exited
+/// (or was already reaped, which the final `wait` on drop ignores).
+fn running(child: &Child) -> bool {
+    match unsafe { libc::waitpid(child.id() as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) } {
+        0 => true,
+        _ => false,
     }
 }

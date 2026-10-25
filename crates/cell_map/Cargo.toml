@@ -1,0 +1,9 @@
+[package]
+name = "cell_map"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Parse a terminal stream and hand each cell to a callback, in place"
+
+[dependencies]
+vt100 = { workspace = true }

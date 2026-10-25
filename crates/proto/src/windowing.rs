@@ -114,6 +114,12 @@ pub trait Client<C, W>: Send + Sync {
     /// Whether this is the session's own program rather than a helper.
     fn is_root(&self) -> bool;
 
+    /// Whether the program behind this client is still running.
+    ///
+    /// The one fact that ends a session: a window whose program has exited can never
+    /// draw again, whatever it left on screen.
+    fn is_running(&self) -> bool;
+
     /// The state the holder parked on this client.
     fn with_attached(&self, f: &mut dyn FnMut(&C));
 

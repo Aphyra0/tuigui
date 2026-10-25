@@ -15,7 +15,7 @@ use smithay::wayland::shm::ShmState;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::xwm::X11Wm;
 
-use crate::client::{RootClient, StderrTail};
+use crate::client::RootClient;
 use crate::CompError;
 
 /// The Smithay-registered protocol state: what every handler impl returns.
@@ -51,9 +51,17 @@ pub struct State<C: 'static = (), W: 'static = ()> {
     /// The last serial this session handed out; bumped by [`State::next_serial`].
     serial: u64,
     /// The root client, once the caller spawned it: its process, its root
-    /// window tree, and the helpers it started. Weak because Smithay's
-    /// connection slot holds the owning `Arc`.
-    pub root_client: Option<Weak<RootClient<C, W>>>,
+    /// window tree, and the helpers it started.
+    ///
+    /// A strong `Arc`, not a `Weak`, and that is not an oversight. Smithay's connection
+    /// slot does own the record — but only from the moment `insert_client` runs, and the
+    /// record is made before the program has even connected. A `Weak` here would be dead
+    /// in the gap between the spawn and the connection, so the session would lose its
+    /// root client before the program that owns it had a chance to say anything.
+    ///
+    /// Holding it strongly costs nothing: the slot and this field share one count, and
+    /// when the connection ends the slot drops its share, leaving this one.
+    pub root_client: Option<Arc<RootClient<C, W>>>,
     /// The scale the output advertises (the session's `dpi`): what a client
     /// multiplies the size it is configured with by to get its buffer.
     pub output_scale: f64,
@@ -120,16 +128,11 @@ where
     }
 
     /// Record the spawned child: this becomes the session's root client.
-    pub(crate) fn attach_root_client(
-        &mut self,
-        child: Child,
-        stderr: StderrTail,
-    ) -> Result<(), CompError> {
+    pub(crate) fn attach_root_client(&mut self, child: Child) -> Result<(), CompError> {
         if self.root_client.is_some() {
             return Err(CompError::Spawn("the session already has a root client".into()));
         }
-        let root = Arc::new(RootClient::new(child, stderr));
-        self.root_client = Some(Arc::downgrade(&root));
+        self.root_client = Some(Arc::new(RootClient::new(child)));
         Ok(())
     }
 
@@ -140,7 +143,7 @@ where
 
     /// Take the root client out of the session, if it is still there.
     pub(crate) fn take_root_client(&mut self) -> Option<Arc<RootClient<C, W>>> {
-        self.root_client.take().and_then(|weak| weak.upgrade())
+        self.root_client.take()
     }
 }
 

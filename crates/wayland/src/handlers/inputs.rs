@@ -24,7 +24,9 @@ where
     /// stream. The walk is the client tree's own: the root dispatches its window
     /// tree, then every helper it started.
     pub(crate) fn dispatch_inputs(&mut self) {
-        let Some(root) = self.root_client.as_ref().and_then(std::sync::Weak::upgrade) else {
+        // Cloned out of the field so the borrow of `self` ends before the walk needs it
+        // mutably: the record is behind an `Arc`, so this is a share of one count.
+        let Some(root) = self.root_client.clone() else {
             return;
         };
         root.dispatch_inputs(self);

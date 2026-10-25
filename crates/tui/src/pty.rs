@@ -6,6 +6,7 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{Arc, RwLock, Weak};
 
 use tokio::process::{Child, Command};
 
@@ -14,6 +15,8 @@ use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
 use crate::bytes::Bytes;
 use crate::proxy::{Proxy, Streams};
 use crate::sink::Sink;
+use crate::DebugOptions;
+use wire::message::SurfaceId;
 
 /// A pty we own, with the wrapped command attached to its slave.
 ///
@@ -60,6 +63,9 @@ impl Pty {
         command: &[String],
         stdin: impl Read + Send + 'static,
         sink: Sink,
+        debug: std::sync::Arc<DebugOptions>,
+        screen: Arc<RwLock<vt100::Parser>>,
+        surfaces: Arc<RwLock<Vec<Weak<SurfaceId>>>>,
     ) -> io::Result<Self> {
         // The window size is a property of the terminal device, and
         // `tcgetwinsize` needs an fd, which a generic `Read` does not promise to
@@ -103,7 +109,8 @@ impl Pty {
         // subscribed rather than copied for a reader that may not be there.
         let bytes = Bytes::new();
         let published = bytes.clone();
-        let proxy = Proxy::new(source, dest).watching(move |chunk| published.publish(chunk));
+        let proxy = Proxy::new(source, dest, screen, surfaces, debug)
+            .watching(move |chunk| published.publish(chunk));
 
         Ok(Self {
             proxy,

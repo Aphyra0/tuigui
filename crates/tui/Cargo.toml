@@ -7,6 +7,12 @@ description = "Server side: run a command in a pty and paint remotely-sent frame
 
 [dependencies]
 wire = { workspace = true }
+# The stream rewrite: cells of a registered surface are blanked on their way to the
+# terminal, so the image behind them is visible.
+cell_map = { workspace = true }
+# The screen the command is drawing into. Shared between the proxy that feeds it
+# and the server that reads it, so there is one answer to "what is on screen".
+vt100 = { workspace = true }
 easytgp = { workspace = true }
 image = { workspace = true }
 rustix = { workspace = true }

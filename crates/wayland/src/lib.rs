@@ -30,9 +30,7 @@ pub use error::{CompError, Result};
 pub use inputs::{Button, Input, Key, KeyState, PointerState, ScrollDelta};
 pub use window::Window;
 
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Child;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -40,7 +38,6 @@ use smithay::reexports::wayland_server::backend::GlobalId;
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::{Display, ListeningSocket};
 
-use crate::client::StderrTail;
 use crate::state::State;
 
 /// Everything the session needs, passed once, at `WaylandServer::new`.
@@ -124,7 +121,7 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
         let state = State::new(&dh, output, options.resolution, options.dpi, options.show_cursor)?;
 
         // The loop that sources ride on; XWayland's source joins when asked.
-        let mut event_loop =
+        let event_loop =
             EventLoop::try_new().map_err(|e| CompError::Server(e.to_string()))?;
         if options.use_x11 {
             tracing::warn!("x11: XWayland is not wired up in this build; ignoring --x11");
@@ -273,21 +270,28 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
 
     /// The root client, and through it every window it has.
     ///
-    /// Weak, upgraded on use: the owning `Arc` is the connection's data slot,
-    /// so the record lives exactly as long as the client's wayland
-    /// connection.
-    pub fn root_client(&self) -> Option<Arc<RootClient<C, W>>> {
-        self.state.root_client.as_ref().and_then(Weak::upgrade)
+    /// Weak, so a caller cannot keep the session's record alive past the connection:
+    /// the owning `Arc` is the connection's data slot, and this is a share of a count,
+    /// not a keep-alive.
+    pub fn root_client(&self) -> Option<Weak<RootClient<C, W>>> {
+        self.state.root_client.as_ref().map(Arc::downgrade)
     }
 
-    /// Spawn `path` into the session and wait for its first toplevel commit.
+    /// The output's resolution in pixels.
+    pub fn size(&self) -> (u32, u32) {
+        self.state.server_size
+    }
+
+    /// Spawn `path` into the session and return at once.
     ///
     /// Native Wayland clients reach our private socket via `WAYLAND_DISPLAY`;
     /// X11-only clients are routed to the XWayland server we own via `DISPLAY`.
-    /// While waiting, this server is stepped, so the client's protocol and our
-    /// admission both progress on the same thread.
+    ///
+    /// Nothing is waited for. The client has not connected yet, so it has no
+    /// window: the caller learns about both by stepping the server and asking
+    /// `root_client` again, which is what makes the loop the caller's to own.
     #[tracing::instrument(name = "server.spawn", skip_all)]
-    pub fn spawn(&mut self, path: impl AsRef<Path>) -> Result<Arc<RootClient<C, W>>, CompError>
+    pub fn spawn(&mut self, path: impl AsRef<Path>) -> Result<Weak<RootClient<C, W>>, CompError>
     where
         C: Default,
         W: Default,
@@ -305,24 +309,36 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
             command.env_remove("DISPLAY");
         }
 
-        // The child starts piped: stdout discarded, stderr tailed.
-        let (child, stderr, stderr_reader) = Self::start(command, path.as_ref())?;
+        // A program's own diagnostics go to a file, not the pane: this process owns the
+        // terminal, and a toolkit's warnings written to stdout would land in the middle
+        // of the screen the pane is drawing on.
+        //
+        // Descriptors rather than pipes: a pipe can fill, and a program blocked writing
+        // to one is a program that never draws. A file never blocks.
+        let chatter = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::env::temp_dir().join("tuigui-client.log"))
+            .map_err(|e| CompError::Spawn(format!("opening the client log: {e}")))?;
+        let chatter_err = chatter
+            .try_clone()
+            .map_err(|e| CompError::Spawn(format!("cloning the client log: {e}")))?;
+        command.stdout(std::process::Stdio::from(chatter));
+        command.stderr(std::process::Stdio::from(chatter_err));
+        let child = command
+            .spawn()
+            .map_err(|e| CompError::Spawn(format!("{}: {e}", path.as_ref().display())))?;
 
         // The child becomes the session's root client; its connection
         // attaches at the next step.
-        self.state.attach_root_client(child, stderr.clone())?;
+        self.state.attach_root_client(child)?;
 
-        // Wait for the window's first commit, so the first capture after
-        // this is a real one rather than the empty output.
-        self.wait_for_first_commit(&stderr, stderr_reader, path.as_ref())?;
-
-        let root = self
+        Ok(self
             .state
             .root_client
             .as_ref()
-            .and_then(Weak::upgrade)
-            .expect("the root client was just attached");
-        Ok(root)
+            .map(Arc::downgrade)
+            .expect("the root client was just attached"))
     }
 
     /// The command a client is launched with: a native Wayland client
@@ -370,178 +386,10 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
             }
         }
     }
-
-    /// Start the child. Its stdout is discarded on a reader thread — a GUI
-    /// app's own terminal writes (glxgears prints FPS) would otherwise bleed
-    /// into the TUI — and its stderr is drained into a bounded tail, so the
-    /// reason a headless client refused us survives in the log.
-    ///
-    /// Returns the child, the tail, and the reader's handle. The handle is
-    /// kept, because a child that dies immediately is the case the tail
-    /// exists for and the case it races: the wait loop below can see the
-    /// process gone before the reader has read a byte. The early-exit path
-    /// joins the reader first — instant once the writer is dead, the pipe at
-    /// EOF.
-    fn start(
-        mut command: std::process::Command,
-        path: &Path,
-    ) -> Result<(Child, StderrTail, Option<std::thread::JoinHandle<()>>), CompError> {
-        command
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = command
-            .spawn()
-            .map_err(|e| CompError::Spawn(format!("{}: {e}", path.display())))?;
-
-        if let Some(mut out) = child.stdout.take() {
-            std::thread::Builder::new()
-                .name("compositor-out".into())
-                .spawn(move || {
-                    let _zone = tracing::info_span!("compositor.stdout").entered();
-                    let mut tmp = [0u8; 2048];
-                    while out.read(&mut tmp).is_ok() {}
-                })
-                .ok();
-        }
-
-        // Drained on a reader thread so we never block on the child's pipe;
-        // the tail is only read under a mutex. A thread that would not start
-        // is not a reason to fail the spawn: the child is running, and its
-        // output is only diagnostics. The `flatten` covers both the pipe
-        // being absent and the thread failing; `None` means "nothing to
-        // join, and nothing said".
-        let stderr = StderrTail::new();
-        let stderr_buf = stderr.clone();
-        let stderr_reader = child
-            .stderr
-            .take()
-            .map(|mut er| {
-                std::thread::Builder::new()
-                    .name("compositor-err".into())
-                    .spawn(move || {
-                        // Also persist the tail to a file, so a headless
-                        // client's error output survives after shutdown.
-                        let trace_path = std::path::PathBuf::from(format!(
-                            "/tmp/comp_child_stderr-{}.log",
-                            std::process::id()
-                        ));
-                        let mut tmp = [0u8; 2048];
-                        let mut file = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&trace_path)
-                            .ok();
-                        loop {
-                            match er.read(&mut tmp) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    stderr_buf.push(&tmp[..n]);
-                                    if let Some(f) = file.as_mut() {
-                                        let _ = std::io::Write::write_all(f, &tmp[..n]);
-                                        let _ = f.flush();
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    })
-                    .ok()
-            })
-            .flatten();
-        Ok((child, stderr, stderr_reader))
-    }
-
-    /// Step the session until the client's window has committed a buffer, so
-    /// the first capture after this is a real one rather than the empty
-    /// output.
-    fn wait_for_first_commit(
-        &mut self,
-        stderr: &StderrTail,
-        stderr_reader: Option<std::thread::JoinHandle<()>>,
-        path: &Path,
-    ) -> Result<(), CompError> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            self.step(STEP_TIMEOUT)?;
-            let captured = self
-                .state
-                .root_client
-                .as_ref()
-                .and_then(Weak::upgrade)
-                .and_then(|root| {
-                    root.root_window
-                        .read()
-                        .unwrap()
-                        .as_ref()
-                        .map(|w| proto::windowing::Window::capture(&*w))
-                });
-            match captured {
-                Some(Ok(_)) => return Ok(()),
-                // Transient: not committed yet. Keep stepping and polling.
-                Some(Err(proto::windowing::Error::NotReady)) | None => {
-                    // The child seems alive; give it a beat to finish starting.
-                    if !Self::child_ok(path) {
-                        // The child is gone, so its stderr pipe is at EOF and
-                        // the reader has everything it will ever have. Join it
-                        // before reading: a reader that has not run yet would
-                        // report an empty tail, which is the one thing this
-                        // path exists to avoid.
-                        let why = drain(stderr_reader, stderr);
-                        return Err(CompError::Spawn(if why.is_empty() {
-                            "client process exited early (it produced no output at all)".into()
-                        } else {
-                            format!("client process exited early: {why}")
-                        }));
-                    }
-                    if Instant::now() > deadline {
-                        // Kill via the root client: dropping the record kills
-                        // its process, and the Weak dies with the slot.
-                        let child = self.state.take_root_client();
-                        drop(child);
-                        // Killed, so the pipe is closed and the reader is at
-                        // its end.
-                        let why = drain(stderr_reader, stderr);
-                        let named = path.display();
-                        return Err(CompError::Spawn(if why.is_empty() {
-                            format!("client {named} never committed a frame within 10s (no output)")
-                        } else {
-                            format!("client {named} never committed a frame within 10s: {why}")
-                        }));
-                    }
-                }
-                Some(Err(e)) => {
-                    let child = self.state.take_root_client();
-                    drop(child);
-                    return Err(CompError::Capture(e.to_string()));
-                }
-            }
-        }
-    }
-
-    /// True while the spawned child is still alive.
-    fn child_ok(path: &Path) -> bool {
-        unimplemented!()
-    }
 }
 
 impl<C: proto::Shared, W: proto::Shared> Drop for WaylandServer<C, W> {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.runtime_dir);
     }
-}
-
-/// Finish reading a dead child's stderr, and hand back everything it said.
-///
-/// Called once the child is gone, so its end of the pipe is closed: the reader reaches EOF
-/// and the join returns rather than waiting. That join is the whole point — the reader is a
-/// thread, and a child that dies immediately is exactly the case where it has not run yet,
-/// so a tail read without it says "no output" about a process that had plenty.
-///
-/// The whole tail, not its last line: a program explaining why it refused to start usually
-/// says it over several lines, and the line a naive read keeps is often the least of them.
-fn drain(reader: Option<std::thread::JoinHandle<()>>, tail: &StderrTail) -> String {
-    if let Some(handle) = reader {
-        let _ = handle.join();
-    }
-    tail.as_string()
 }

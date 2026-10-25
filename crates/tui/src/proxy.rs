@@ -1,7 +1,11 @@
 //! Forwarding bytes between this terminal and the command's pty.
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead as _, BufReader, Read, Write};
+use std::sync::{Arc, RwLock, Weak};
 use std::thread;
+
+use cell_map::{Cell, CellMap};
+use wire::message::SurfaceId;
 
 /// One end of the proxy: the standard streams of the process at that end.
 ///
@@ -56,14 +60,39 @@ pub struct Proxy {
     /// `None` for a caller that does not scan, so a session that does not need
     /// it pays nothing.
     watch: Option<Box<dyn FnMut(&[u8]) + Send>>,
+    /// The screen the command is drawing into, shared with the server.
+    ///
+    /// The parser rather than the `Screen`, because the screen is a view of the
+    /// parser's grid: sharing the parser is what lets the server read the grid
+    /// without a copy per chunk. `screen()` is how it is read.
+    screen: Arc<RwLock<vt100::Parser>>,
+    /// The surfaces whose cells are blanked on their way to the terminal.
+    ///
+    /// Weak, so this never keeps a window alive: a closed window's entry stops
+    /// resolving, and its cells stop being blanked.
+    surfaces: Arc<RwLock<Vec<Weak<SurfaceId>>>>,
+    /// The switches this proxy was started with, shared with the server.
+    ///
+    /// Held rather than copied: the same switches decide what the server draws and
+    /// what the proxy masks, and two copies would be two answers to one question.
+    debug: std::sync::Arc<crate::DebugOptions>,
 }
 
 impl Proxy {
-    pub fn new(source: Streams, dest: Streams) -> Self {
+    pub fn new(
+        source: Streams,
+        dest: Streams,
+        screen: Arc<RwLock<vt100::Parser>>,
+        surfaces: Arc<RwLock<Vec<Weak<SurfaceId>>>>,
+        debug: std::sync::Arc<crate::DebugOptions>,
+    ) -> Self {
         Self {
             source,
             dest,
             watch: None,
+            screen,
+            surfaces,
+            debug,
         }
     }
 
@@ -82,25 +111,28 @@ impl Proxy {
     /// The output direction is the lifetime: when it ends the command is gone.
     /// The keyboard direction only makes sense while it runs, so it gets a
     /// thread, and its error is returned from here once that thread is joined.
-    pub fn run(self) -> io::Result<()> {
-        // The rewrite is stateful across reads, so the state outlives the closure
-        // that carries it: a character split between two reads has to be held.
-        let mut placeholders = crate::placeholder::Placeholders::new();
-        self.run_with(&mut |bytes| placeholders.rewrite(bytes))
-    }
-
-    /// [`Proxy::run`], rewriting the command's output on the way to the screen.
     ///
-    /// The transform is what turns a pane's fill into image placeholders, and it
-    /// lives here rather than in a second reader because the stream can only be
-    /// read once: a reader that took the fill out would be a reader the screen
-    /// never saw it from. What is forwarded is what this returns.
-    pub fn run_with(self, transform: &mut dyn FnMut(&[u8]) -> Vec<u8>) -> io::Result<()> {
+    /// Every chunk does two things on its way past: it is fed to the shared screen,
+    /// and it is rewritten so the cells of a registered surface reach the terminal
+    /// blank. Both sides read the same bytes, so the screen and the terminal can
+    /// never disagree about what the command drew.
+    ///
+    /// TODO: the split is a publisher fanning out to subscribers, which copies each
+    /// chunk once per subscriber and hands out `mpsc` receivers rather than
+    /// `Read`s. The better shape is one pump and two pipe handles: a single read,
+    /// two writes, each consumer owning a real `BufReader` and no lock on the path.
+    /// Linux could even skip the userspace copy with `tee(2)`; macOS has no
+    /// equivalent, which is why the portable version is the pump.
+    pub fn run(self) -> io::Result<()> {
         let Proxy {
             mut source,
             mut dest,
             mut watch,
+            screen,
+            surfaces,
+            debug,
         } = self;
+
         // Named, not `thread::spawn`: an unnamed thread is an unnamed track in
         // the profiler, and a track with no name is not one that can be found.
         let keyboard = thread::Builder::new()
@@ -111,11 +143,15 @@ impl Proxy {
                 copy(&mut *dest.stdout, &mut *source.stdin)
             })
             .expect("the keyboard thread starts");
-        let shown = copy_transformed(
+
+        let shown = copy_rewritten(
             &mut *source.stdout,
             &mut *dest.stdin,
             watch.take(),
-            transform,
+            &mut CellMap::new(),
+            &screen,
+            &surfaces,
+            debug.pink_placeholders,
         );
         // A panic in the keyboard thread is not a forwarding failure, so it is
         // not reported as one.
@@ -165,37 +201,85 @@ fn copy_watched<R: Read + ?Sized, W: Write + ?Sized>(
     }
 }
 
-/// [`copy_watched`], with a transform between the read and the write.
+/// [`copy_watched`], with the cell rewrite between the read and the write.
 ///
-/// The difference from the observer above is that what is written is not what was
-/// read, which is what the placeholder rewrite needs: a pane's own fill is
-/// replaced by cells that name an image, and the command never sees the result.
-/// The transform is stateful across reads because a character can straddle two of
-/// them.
+/// The original bytes are what the observer sees: the announcement scan reads what
+/// the command wrote, not what this side turned it into. What is written is the
+/// same bytes with the cells of a registered surface blanked, which is the whole
+/// point — a cell carrying a surface's signature would be drawn over the image
+/// that signature anchors.
+///
+/// The read is a `BufReader`'s own buffer, borrowed and handed back with
+/// `consume`: the chunk is never copied out and never sized by guesswork.
+///
+/// The chunk is parsed **once**, inside the rewrite: the same pass that feeds the
+/// screen is what asks it where the character landed. Parsing it here as well
+/// would advance the cursor twice per byte and leave every later cell one position
+/// wrong.
 #[tracing::instrument(name = "proxy.forward", skip_all)]
-fn copy_transformed<R: Read + ?Sized, W: Write + ?Sized>(
+fn copy_rewritten<R: Read + ?Sized, W: Write + ?Sized>(
     from: &mut R,
     to: &mut W,
     mut watch: Option<Box<dyn FnMut(&[u8]) + Send>>,
-    transform: &mut dyn FnMut(&[u8]) -> Vec<u8>,
+    cells: &mut CellMap,
+    screen: &Arc<RwLock<vt100::Parser>>,
+    surfaces: &Arc<RwLock<Vec<Weak<SurfaceId>>>>,
+    pink: bool,
 ) -> io::Result<()> {
-    let mut buf = [0u8; 16384];
+    let mut from = BufReader::new(from);
     loop {
-        match from.read(&mut buf) {
-            Ok(0) => return Ok(()),
-            Ok(n) => {
-                // The observer first, and on the *original* bytes: it is the
-                // announcement scan, and what a client announces is the text it
-                // wrote, not the placeholders this side put in its place.
-                if let Some(watch) = watch.as_mut() {
-                    watch(&buf[..n]);
-                }
-                let rewritten = transform(&buf[..n]);
-                to.write_all(&rewritten)?;
-                to.flush()?;
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+        let chunk = match from.fill_buf() {
+            Ok([]) => return Ok(()),
+            Ok(chunk) => chunk,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
+        };
+        // Taken now, because the borrow of the buffer ends with this call: the
+        // rewriter needs the length to consume, and the work below needs the slice.
+        let len = chunk.len();
+
+        if let Some(watch) = watch.as_mut() {
+            watch(chunk);
         }
+
+        // The live surfaces, upgraded once per chunk rather than per cell. A poisoned
+        // lock still holds a valid list.
+        let registered = surfaces.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let live: Vec<SurfaceId> = registered
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|surface| *surface)
+            .collect();
+        drop(registered);
+
+        let mut parser = screen.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let rewritten = cells.map(&mut parser, chunk, &mut |cell: Cell| {
+            // A cell of a registered surface is blanked, and blanked on the *default*
+            // background. Keeping the surface's own bg would paint over the picture:
+            // the image is drawn behind the cell backgrounds, so a cell with a
+            // background covers it. That is the whole reason for the mask.
+            //
+            // The pink marker is the debug view: a visible cell everywhere the mask
+            // fired, so "the mask never matched" and "the image never arrived" are
+            // different symptoms instead of the same blank pane.
+            if live.iter().any(|surface| surface.matches(&cell)) {
+                Cell {
+                    symbol: if pink { '*' } else { ' ' },
+                    fg: if pink {
+                        vt100::Color::Rgb(0xff, 0x00, 0xff)
+                    } else {
+                        cell.fg
+                    },
+                    bg: vt100::Color::Default,
+                }
+            } else {
+                cell
+            }
+        });
+        drop(parser);
+
+        from.consume(len);
+        to.write_all(&rewritten)?;
+        to.flush()?;
     }
 }

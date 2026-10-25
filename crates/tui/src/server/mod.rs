@@ -22,12 +22,12 @@ use std::io;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, Weak};
 
 use easytgp::{Controller, Format};
 use tokio::sync::mpsc::Receiver;
 
-use wire::message::Message;
+use wire::message::{Message, SurfaceId};
 use wire::transport::Transport;
 use wire::unix::UnixSocket;
 
@@ -35,6 +35,10 @@ use crate::announce::Announcement;
 use crate::session::Session;
 use crate::sink::Sink;
 use crate::DebugOptions;
+
+mod tree;
+
+pub use tree::{Client, Window};
 
 /// How long to wait between attempts when dialing a named address.
 ///
@@ -91,15 +95,8 @@ impl Announcements {
 pub struct Server<F: Format> {
     /// What the pty has produced, and where a client announces itself.
     announcements: Announcements,
-    /// The grid a client's pty was created with, in cells.
-    ///
-    /// Handed to each session, because that is the pane a client draws into and the one piece
-    /// of geometry the server has that a client does not: a pane's size is not passed down
-    /// through its environment.
-    cols: u32,
-    rows: u32,
     /// The diagnostic switches, passed to every session it attaches.
-    debug: DebugOptions,
+    debug: std::sync::Arc<DebugOptions>,
     /// The one writer to the screen, handed to each session.
     ///
     /// A session needs it for the cursor move a real placement requires, and it has to
@@ -118,27 +115,54 @@ pub struct Server<F: Format> {
     /// Owned by the loop and nowhere else: reading a link needs it, so a link in a map
     /// beside the loop reading it would be a link in two places.
     sessions: Vec<Session<F>>,
+    /// The screen the command is drawing into.
+    ///
+    /// Created here and shared with the proxy, which is the side that feeds it: one
+    /// parser, so the grid the server reads is the grid the terminal was written
+    /// from.
+    screen: Arc<RwLock<vt100::Parser>>,
+    /// The surfaces currently drawn, for the proxy to blank.
+    ///
+    /// Weak, so the registry never keeps a window alive. Created here because the
+    /// proxy needs it before any client has connected, and a window registers
+    /// itself through the session when it arrives.
+    surfaces: Arc<RwLock<Vec<Weak<SurfaceId>>>>,
 }
 
 impl<F: Format> Server<F> {
     /// Serve a pty's output, with the reply router this side's own escapes need.
+    ///
+    /// The screen and the surface registry are made by the caller and shared with the
+    /// pty's proxy, which is what keeps one answer to "what is on screen" and one
+    /// list of "which cells are an image": the server reads the first, and its
+    /// sessions add to the second.
     pub fn new(
         output: Receiver<Vec<u8>>,
-        cols: u32,
-        rows: u32,
-        debug: DebugOptions,
+        debug: std::sync::Arc<DebugOptions>,
         controller: Arc<Controller>,
         sink: Sink,
+        screen: Arc<RwLock<vt100::Parser>>,
+        surfaces: Arc<RwLock<Vec<Weak<SurfaceId>>>>,
     ) -> Self {
         Self {
             announcements: Announcements::new(output),
-            cols,
-            rows,
             debug,
             sink,
             controller,
             sessions: Vec::new(),
+            screen,
+            surfaces,
         }
+    }
+
+    /// The screen this server reads, for the pty's proxy to feed.
+    pub fn screen(&self) -> Arc<RwLock<vt100::Parser>> {
+        self.screen.clone()
+    }
+
+    /// The surfaces the proxy blanks, for the pty's proxy to read.
+    pub fn surfaces(&self) -> Arc<RwLock<Vec<Weak<SurfaceId>>>> {
+        self.surfaces.clone()
     }
 
     /// How many clients are attached.
@@ -150,12 +174,13 @@ impl<F: Format> Server<F> {
     pub async fn run(self) -> io::Result<()> {
         let Server {
             mut announcements,
-            cols,
-            rows,
             debug,
             sink,
             controller,
             mut sessions,
+            screen,
+            surfaces,
+            ..
         } = self;
 
         loop {
@@ -213,11 +238,11 @@ impl<F: Format> Server<F> {
                 Action::Announced(Some(transport)) => match transport.connect().await {
                     Ok(connection) => sessions.push(Session::new(
                         connection,
-                        cols,
-                        rows,
                         debug.clone(),
                         controller.clone(),
                         sink.clone(),
+                        surfaces.clone(),
+                        screen.clone(),
                     )),
                     Err(e) => eprintln!("tui: could not reach an announced client: {e}"),
                 },
@@ -231,11 +256,11 @@ impl<F: Format> Server<F> {
                     match socket.connect().await {
                         Ok(connection) => sessions.push(Session::new(
                             connection,
-                            cols,
-                            rows,
                             debug.clone(),
                             controller.clone(),
                             sink.clone(),
+                            surfaces.clone(),
+                            screen.clone(),
                         )),
                         Err(e) => eprintln!("tui: could not dial {}: {e}", socket.path().display()),
                     }

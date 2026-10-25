@@ -31,35 +31,6 @@ use crate::error::CompError;
 use crate::state::State;
 use crate::utils::{peer_pid, proc_parent};
 
-/// Synchronized tail of a client's stderr (most recent bytes). Populated by a
-/// dedicated reader thread so we never block on the pipe; read through
-/// [`RootClient::stderr`] for troubleshooting headless clients that refuse
-/// our minimal session (GTK/Qt print which Wayland interfaces they need).
-/// Cheap to clone: a handle to one shared tail.
-#[derive(Clone)]
-pub struct StderrTail(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl StderrTail {
-    pub(crate) fn new() -> Self {
-        StderrTail(Arc::new(std::sync::Mutex::new(Vec::new())))
-    }
-    pub(crate) fn push(&self, bytes: &[u8]) {
-        let mut buf = self.0.lock().unwrap();
-        buf.extend_from_slice(bytes);
-        if buf.len() > STDERR_TAIL_CAP {
-            let surplus = buf.len() - STDERR_TAIL_CAP;
-            buf.drain(..surplus);
-        }
-    }
-    pub fn as_string(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
-}
-
-/// How many bytes of a client's stderr to retain for diagnostics. Bounded so
-/// a chatty client can't grow memory without limit.
-const STDERR_TAIL_CAP: usize = 32 * 1024;
-
 /// The per-connection compositor state, resolved whichever kind of client the
 /// connection belongs to. XWayland's client carries `XWaylandClientData`
 /// instead, which smithay owns.
@@ -95,16 +66,21 @@ where
     pub(crate) fn accept_client(&mut self, stream: UnixStream) -> Result<(), CompError> {
         let root = self
             .root_client
-            .as_ref()
-            .and_then(Weak::upgrade)
+            .clone()
             .ok_or_else(|| {
                 CompError::Server("a connection arrived before the root was spawned".into())
             })?;
         if !root.connected.load(Ordering::SeqCst) {
-            root.connected.store(true, Ordering::SeqCst);
+            // The same `Arc` goes into the slot, so Smithay owns the record from here and
+            // the session's field is only a second share of one count.
             self.display_handle
-                .insert_client(stream, root)
+                .insert_client(stream, root.clone())
                 .map_err(|e| CompError::Server(format!("insert_client: {e}")))?;
+            // Set only once the slot took it: a flag that says "connected" while the
+            // connection was never admitted would make the next attempt look like a
+            // helper's, and its parent lookup fail for a reason that is not true.
+            root.connected.store(true, Ordering::SeqCst);
+            tracing::info!("wayland: admitted the root client, pid {}", root.pid());
             return Ok(());
         }
 
@@ -112,6 +88,23 @@ where
             .ok_or_else(|| CompError::Server("peer pid of a connection unmeasurable".into()))?;
         let parent = proc_parent(pid)
             .ok_or_else(|| CompError::Server(format!("no parent pid for {pid}")))?;
+
+        // A process we started ourselves is a child of *us*, not of the client that
+        // happens to be our root. A program that opens a second connection — a toolkit
+        // opening its display after probing, or a helper it forks directly — names this
+        // process as its parent, and there is no client record with that pid because the
+        // root record is the *program*, not us.
+        //
+        // Such a connection belongs to the session's program, so it hangs under the root.
+        if parent == std::process::id() {
+            let sub = Arc::new(SubClient::new(pid));
+            root.sub_clients.write().unwrap().push(Arc::downgrade(&sub));
+            self.display_handle
+                .insert_client(stream, sub)
+                .map_err(|e| CompError::Server(format!("insert_client: {e}")))?;
+            tracing::info!("wayland: admitted {pid}, started by this process");
+            return Ok(());
+        }
 
         // Every connected client, flat, straight from the display: the new
         // connection's parent must be one of them, and the new client attaches

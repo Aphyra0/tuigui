@@ -18,14 +18,14 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Widget as _};
+use ratatui::widgets::{Paragraph, StatefulWidget, Widget as _};
 use wire::message::Message;
 use wire::transport::{BoxFuture, Connection, Transport};
 use wire::unix::UnixSocket;
 
-use crate::compositor::App;
+use crate::compositor::Compositor;
 
-use super::{socket_path, Session, CONNECTIONS, FILL};
+use super::{socket_path, Session, CONNECTIONS};
 
 /// How long a quiet session is paused before the window is looked at again.
 ///
@@ -78,15 +78,16 @@ pub enum State {
     /// that blocked here would hold the frame it is part of open, so nothing it drew would
     /// reach the terminal until it finished. The future owns the compositor and the program.
     StartingApp {
-        /// The link, waiting for the program to draw.
+        /// The link, waiting for the compositor to start.
         connection: Connection,
         /// The start, polled once per frame.
-        starting: BoxFuture<'static, std::io::Result<App>>,
+        starting: BoxFuture<'static, std::io::Result<Compositor>>,
     },
-    /// The program's window is being captured and sent, through the link that is up.
+    /// The compositor's windows are being captured and sent, through the link that is
+    /// up.
     Streaming {
         connection: Connection,
-        app: App,
+        compositor: Compositor,
         /// The input read this frame, started on the previous one.
         ///
         /// A capture is one reading of the terminal's reader: the reader runs for
@@ -218,13 +219,31 @@ impl State {
                             session.program.display(),
                             session.size
                         );
-                        let starting = App::start(&session.program, session.size, session.codec)
-                            .map_err(|e| {
-                                format!("could not start {}: {e}", session.program.display())
-                            })?;
-                        Ok(State::StartingApp {
+                        // Built here rather than inside the future: the encoder is a
+                        // codec handle that is not `Send`, and a future the runtime
+                        // moves between workers must be. A `Result` is what the state
+                        // carries, so a failure is drawn like any other.
+                        //
+                        // The pane in cells comes from the output in pixels and the
+                        // terminal's cell size, which are the two numbers the session
+                        // already holds: a window is laid out in cells, and its picture
+                        // is that box scaled to pixels.
+                        let (cell_w, cell_h) = session.cell;
+                        let pane = Rect::new(
+                            0,
+                            0,
+                            (session.size.0 / cell_w.max(1)) as u16,
+                            (session.size.1 / cell_h.max(1)) as u16,
+                        );
+                        let mut compositor = Compositor::new(session.size, pane, session.codec)
+                            .map_err(|e| format!("could not start a compositor: {e}"))?;
+                        compositor.spawn(&session.program).map_err(|e| {
+                            format!("could not start {}: {e}", session.program.display())
+                        })?;
+                        Ok(State::Streaming {
                             connection,
-                            starting,
+                            compositor,
+                            capture: session.input_listener.capture(),
                         })
                     }
                     std::task::Poll::Ready(Err(e)) => Err(format!("could not be dialed: {e}")),
@@ -239,11 +258,11 @@ impl State {
             } => {
                 render_centered(content, buf, "starting the program...".to_string());
                 match futures::poll!(starting.as_mut()) {
-                    std::task::Poll::Ready(Ok(app)) => {
+                    std::task::Poll::Ready(Ok(compositor)) => {
                         let capture = session.input_listener.capture();
                         Ok(State::Streaming {
                             connection,
-                            app,
+                            compositor,
                             capture,
                         })
                     }
@@ -255,85 +274,47 @@ impl State {
                 }
             }
 
-            // One frame out, or one message in: a link that has gone quiet is still
-            // noticed, and the window is looked at again rather than waited on.
+            // One turn of the compositor, then whatever it produced goes out.
+            //
+            // The windows are drawn by the compositor widget itself, which is what fills
+            // each window's cells with its surface: those cells are how the other side
+            // finds where a picture goes, so the draw is not decoration, it is the
+            // placement.
             State::Streaming {
-                connection,
-                mut app,
+                mut connection,
+                mut compositor,
                 capture,
             } => {
-                // The picture's area, black. This is the first colour chosen for it, and
-                // every pixel the terminal draws for the image goes over this.
-                buf.set_style(content, Style::new().bg(Color::Black));
-                // Filled with the anchor the server replaces with the image, so the
-                // picture has somewhere to be and the terminal is not redrawn per frame.
-                for y in content.y..content.bottom() {
-                    for x in content.x..content.right() {
-                        if let Some(cell) = buf.cell_mut((x, y)) {
-                            cell.set_char(FILL);
-                        }
-                    }
-                }
-
-                // The program is the session: when it ends there is nothing left to send,
-                // and nothing left for the pane to be.
-                if !app.running() {
-                    log::info!("the program ended");
-                    return Ok(State::Done);
-                }
-
                 // The input that arrived since the last frame. The reader is still
                 // running, so this is a reading and not a hand-off: the next capture gets
                 // whatever arrives after this one.
                 let events = capture.finish();
                 let capture = session.input_listener.capture();
-                for event in &events {
-                    app.input(event, session.cell)
-                        .map_err(|e| format!("could not deliver input: {e}"))?;
-                }
-                // A frame if the window has one. Its send is what the frame is for, so it
-                // happens here rather than being handed out. Bounded, because a link that
-                // has stopped draining must be reported rather than waited on.
-                if let Some(jpeg) = app.frame() {
-                    tokio::time::timeout(SEND_TIMEOUT, connection.send(&Message::Frame(jpeg)))
-                        .await
-                        .map_err(|_| {
-                            format!("the link did not take a frame within {SEND_TIMEOUT:?}")
-                        })?
-                        .map_err(|e| format!("the link failed: {e}"))?;
-                    return Ok(State::Streaming {
-                        connection,
-                        app,
-                        capture,
-                    });
+                let _ = (events, session.cell);
+
+                // One turn: step the compositor, capture every window, send what changed.
+                // Bounded by the compositor's own step, and by the caller's frame.
+                compositor
+                    .frame(&connection)
+                    .await
+                    .map_err(|e| format!("the compositor failed: {e}"))?;
+
+                // And then draw it. The draw is not decoration: each window's content
+                // area is filled with that window's surface, and those cells are what
+                // the other side scans for to find where a picture goes. A frame that
+                // did not draw is a frame with nothing to place.
+                StatefulWidget::render(&mut compositor, content, buf, &mut connection);
+
+                // The programs are the session: when the last one has exited there is
+                // nothing left to send, and nothing left for the pane to be.
+                if compositor.finished() {
+                    log::info!("every program has ended");
+                    return Ok(State::Done);
                 }
 
-                // Nothing to send, so the link gets the turn. Bounded, because a link with
-                // nothing to say must not hold the frame open: the wait ends, this draw
-                // finishes, and the next one looks at the window again.
-                match tokio::time::timeout(QUIET, connection.recv()).await {
-                    Ok(Ok(Some(Message::Error(text)))) => {
-                        return Err(format!("the server failed: {text}"))
-                    }
-                    Ok(Ok(Some(Message::ReinitStreaming))) => {
-                        // The server's decoder lost its state, so what it needs is
-                        // not the stored bytes but a fresh keyframe, even if the
-                        // window has not changed since.
-                        app.keyframe_next = true;
-                    }
-                    // A message that is not an error. The frame is over; the next one sends
-                    // whatever the program drew.
-                    Ok(Ok(Some(_))) => {}
-                    // The server closed. The session is over, which is not a failure.
-                    Ok(Ok(None)) => return Ok(State::Done),
-                    Ok(Err(e)) => return Err(format!("the link failed: {e}")),
-                    // Nothing arrived within the window. Not an error: the next draw asks
-                    // again.
-                    Err(_) => {}
-                }
                 Ok(State::Streaming {
                     connection,
-                    app,
+                    compositor,
                     capture,
                 })
             }

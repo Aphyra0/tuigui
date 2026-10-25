@@ -12,7 +12,6 @@ mod seat;
 mod xdg_shell;
 mod xwayland;
 
-use smithay::input::{SeatHandler, SeatState};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_compositor::WlCompositor;
 use smithay::reexports::wayland_server::protocol::wl_data_device::WlDataDevice;

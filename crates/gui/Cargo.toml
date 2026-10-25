@@ -14,6 +14,9 @@ crossterm = { workspace = true }
 # The headless Wayland session an app runs inside, and the capture of the
 # window it draws there.
 wayland = { workspace = true }
+# The platform-neutral vocabulary the session is driven through: a client, its
+# windows, and the inputs they take. Nothing here names the backend.
+proto = { workspace = true }
 # The terminal's input, as events, with keys mapped to the codes the
 # session's seat takes.
 termputs = { workspace = true }

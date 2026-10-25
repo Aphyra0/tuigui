@@ -9,6 +9,7 @@ members = [
     "crates/termputs",
     "crates/codecs",
     "crates/proto",
+    "crates/cell_map",
 ]
 
 [workspace.package]
@@ -38,6 +39,12 @@ rstar = "0.13"
 rayon = "1"
 ndarray = "0.16"
 ratatui = "0.30"
+# The terminal engine: parses a child's bytes into a grid and keeps the state a
+# byte-level rewritter would have to track by hand.
+vt100 = "0.18"
+# Rewrites the cells of a terminal stream on its way to the screen. Here with the
+# other workspace members so `wire` and `tui` agree on one version.
+cell_map = { path = "crates/cell_map" }
 pollster = "0.4"
 fxhash = "0.2"
 crossterm = { version = "0.28", default-features = false, features = ["events"] }

@@ -22,7 +22,6 @@
 mod announce;
 mod bytes;
 mod error;
-mod placeholder;
 mod proxy;
 mod pty;
 mod raw;
@@ -103,6 +102,15 @@ pub struct DebugOptions {
     /// control for "the image arrived but nothing was drawn".
     #[arg(long = "dbg-no-shm")]
     pub no_shm: bool,
+    /// Mark the cells the surface mask fires on, instead of blanking them.
+    ///
+    /// The mask exists to blank the cells that carry a window's signature, so the
+    /// picture drawn behind them is visible. When nothing appears, the two possible
+    /// faults are "the mask never matched" and "the image never arrived", and both look
+    /// like an empty pane. A pink `*` on a default background is the same edit made
+    /// visible: pink cells mean the mask works and the picture is the problem.
+    #[arg(long = "dbg-pink-placeholders")]
+    pub pink_placeholders: bool,
     /// Dial a client at this path instead of waiting to be announced to.
     ///
     /// The session's normal shape is the client announcing an address that only it
@@ -169,6 +177,11 @@ impl Tui {
         let _raw = Raw::install()?;
         let sink = Sink::new(stdout);
 
+        // One set of switches, shared: the pty's proxy reads them on its forwarding
+        // thread while the server and every session read them from the loop, and a copy
+        // per reader would be several answers to one question.
+        let debug = std::sync::Arc::new(self.debug);
+
         // The keyboard, split in two on its way in. The terminal's answers to this side's
         // graphics escapes arrive on the same descriptor as the user's keystrokes, so the
         // router reads it and gives back only what was not a reply; that pipe is then the
@@ -185,34 +198,52 @@ impl Tui {
             std::sync::Arc::new(std::sync::Mutex::new(sink.clone())),
         );
 
+        // The two things the pty and the server share, made before either: the pty's
+        // proxy feeds the screen and blanks the registered surfaces, and the server
+        // reads the screen and has its sessions register surfaces into the list.
+        //
+        // Made here rather than in the server because the pty is built first, and a
+        // screen that the proxy could not see would be a screen that never updates.
+        let ws = rustix::termios::tcgetwinsize(std::io::stdin())?;
+        let screen = std::sync::Arc::new(std::sync::RwLock::new(vt100::Parser::new(
+            std::num::NonZeroU16::new(ws.ws_row).expect("a terminal needs a row"),
+            std::num::NonZeroU16::new(ws.ws_col).expect("a terminal needs a column"),
+            0,
+        )));
+        let surfaces = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
+
         // The pty next, because the server is built around what the pty produces: the pty
         // is the producer and the server reads it. There is no socket to bind and no session
         // file to write — a client names its own channel, and this side only answers.
-        let pty = Pty::new(&self.command, keyboard, sink.clone())?;
+        let pty = Pty::new(
+            &self.command,
+            keyboard,
+            sink.clone(),
+            debug.clone(),
+            screen.clone(),
+            surfaces.clone(),
+        )?;
 
         // One subscription, read by the server's own loop. Reading it there rather than on
         // the pty's forwarding thread is what lets the same loop wait on the clients too: a
         // scan on that thread would have to hand its finds over from it, and the finds would
         // be a third thing to select on.
         let output = pty.bytes().subscribe();
-        let (cols, rows) = (pty.cols(), pty.rows());
 
         // The medium is chosen here and nowhere else: a flag read at every frame is the branch
         // the type parameter exists to remove, but the flag still has to be read somewhere, and
         // this is the one place that knows what the user asked for. The two arms are different
         // types, so each is boxed to one.
-        let server: std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>>>> = if self
-            .debug
-            .no_shm
+        let server: std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>>>> = if debug.no_shm
         {
             Box::pin(
                 Server::<easytgp::Png>::new(
                     output,
-                    cols,
-                    rows,
-                    self.debug,
+                    debug.clone(),
                     controller,
                     sink.clone(),
+                    screen,
+                    surfaces,
                 )
                 .run(),
             )
@@ -220,11 +251,11 @@ impl Tui {
             Box::pin(
                 Server::<easytgp::Shm>::new(
                     output,
-                    cols,
-                    rows,
-                    self.debug,
+                    debug,
                     controller,
                     sink.clone(),
+                    screen,
+                    surfaces,
                 )
                 .run(),
             )

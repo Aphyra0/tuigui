@@ -57,7 +57,6 @@ where
             let admitted = self
                 .root_client
                 .as_ref()
-                .and_then(Weak::upgrade)
                 .and_then(|root| {
                     let tree = root.root_window.read().unwrap();
                     tree.as_ref().map(|w| w.surface.wl_surface.clone())
@@ -71,7 +70,7 @@ where
                 if !(is_win || is_kid) {
                     return;
                 }
-                if let Some(root) = self.root_client.as_ref().and_then(Weak::upgrade) {
+                if let Some(root) = self.root_client.as_ref() {
                     if let Some(win) = root.root_window.write().unwrap().as_mut() {
                         commit_into(win, out_size, surface);
                     }

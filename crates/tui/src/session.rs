@@ -13,25 +13,50 @@
 //! existing id frees that image's placements in the terminal.
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, Weak};
 
 use tracing::Instrument;
 use easytgp::{Controller, DynImage, Format, PlacementRequest};
 use codecs::CodecId;
-use wire::message::Message;
+use wire::message::{Message, SurfaceId};
 use wire::transport::Connection;
 
 use crate::error::{Error, Result};
 use crate::sink::Sink;
 use crate::DebugOptions;
 
-/// The image id the client's placeholder cells carry, as their foreground colour.
+/// The image id a window's frames are sent under.
 ///
-/// Fixed rather than negotiated: the two halves of this are one program, and the
-/// only fact they would agree on is a number neither wants to vary. The cost is
-/// that two panes on one terminal collide, which is a problem for the day a second
-/// pane exists.
-pub const IMAGE_ID: u32 = 99;
+/// Named by the window's own surface, not by a constant: two windows are two
+/// pictures, and one shared id would make the second replace the first. Derived
+/// rather than allocated so both ends agree without a negotiation, and so it is
+/// stable across frames — a replacement under the same id is what makes a frame an
+/// update rather than a new image.
+pub fn image_id(surface: &SurfaceId) -> u32 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    surface.hash(&mut hasher);
+    // Kept out of the low range: ids below a few hundred are the ones a terminal's
+    // own examples use, and a picture is not worth colliding with one over.
+    (hasher.finish() % (u32::MAX as u64 - 1024)) as u32 + 1024
+}
+
+/// The z index a window's picture is drawn at.
+///
+/// Below `INT32_MIN / 2`, which is the band the protocol draws behind cell
+/// backgrounds as well as behind text (`docs/kitty-graphics-protocol.rst`), so a
+/// window's picture cannot cover another window's content.
+///
+/// The order *within* that band comes from the gui, which is the side with a window
+/// manager: it sends a `z` per window, and this shifts the whole range into the
+/// band. A window's rank is therefore the gui's, not invented here.
+fn stacking(z: i32) -> i32 {
+    // The band's floor. `INT32_MIN / 2` is -1,073,741,824, and the band reaches up to
+    // -1, which is a billion distinct values for the gui's own ordering.
+    const FLOOR: i32 = i32::MIN / 2;
+    const CEILING: i32 = -1;
+    FLOOR.saturating_add(z).min(CEILING)
+}
 
 ///
 /// Distinct from [`IMAGE_ID`] because the two are different facts: the image is
@@ -52,22 +77,16 @@ const TRANSMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// on screen is not this, and this cannot be confused with a decoded frame.
 const BLUE: (u32, u32) = (64, 64);
 
-/// What a session knows beyond its link.
+/// What one window knows about itself.
 ///
 /// Generic over the medium, which is fixed when the session is built: a caller that
 /// knows its terminal cannot map a shared memory object picks [`easytgp::Png`], and
 /// one that knows it can picks [`easytgp::Shm`]. Neither pays for the other's
 /// branch, and the choice is a type rather than a flag.
+///
+/// One of these per window, not per session: two windows are two pictures, and a
+/// decoder that followed one stream cannot follow the other.
 pub struct State<F: Format> {
-    /// The grid the client is drawing into, in cells.
-    ///
-    /// From the pty, because that is the size the client sees: a pane does not
-    /// pass its geometry down through the environment, so the only side that knows
-    /// it is the one that made the pty.
-    pub cols: u32,
-    pub rows: u32,
-    /// The diagnostic switches this session was started with.
-    pub debug: DebugOptions,
     /// The image the frames are sent under, and the pending operations on it.
     ///
     /// Kept across frames rather than rebuilt, because it owns the unacknowledged
@@ -80,7 +99,30 @@ pub struct State<F: Format> {
     /// rebuilt after a `ReinitStreaming` — its state is the only thing the trait
     /// object owns, which is why losing it is a message rather than a guess.
     pub decoder: Option<Box<dyn codecs::Decoder>>,
-    /// The codec the client announced, which is what the decoder is built from
+}
+
+impl<F: Format> State<F> {
+    /// A window that has not been drawn into yet.
+    pub(crate) fn new() -> Self {
+        Self {
+            image: None,
+            decoder: None,
+        }
+    }
+}
+
+/// One client the server has attached.
+///
+/// Holds its link and what belongs to the link rather than to a window, and decides
+/// what to do with whatever arrives. The decision is here rather than in the
+/// server's loop so the loop stays one `select!` over several clients instead of a
+/// loop that also has to know what a frame means.
+pub struct Session<F: Format> {
+    /// The link. Every session has one, so it is not optional.
+    pub connection: Connection,
+    /// The diagnostic switches this session was started with.
+    pub debug: std::sync::Arc<DebugOptions>,
+    /// The codec the client announced, which is what a decoder is built from
     /// whenever one must be built: an announcement, a reset, a rebuild.
     pub codec: Option<CodecId>,
     /// Creates image requests, and owns the reply router behind them.
@@ -91,43 +133,58 @@ pub struct State<F: Format> {
     /// placement draws where the cursor is, and a move written by some other writer
     /// could land between the move and the command that needed it.
     pub sink: Sink,
-}
-
-/// One client the server has attached.
-///
-/// Holds its link and its state, and decides what to do with whatever arrives. The
-/// decision is here rather than in the server's loop so the loop stays one
-/// `select!` over several clients instead of a loop that also has to know what a
-/// frame means.
-pub struct Session<F: Format> {
-    /// The link. Every session has one, so it is not optional.
-    pub connection: Connection,
-    /// What has been learned about the client.
-    pub state: State<F>,
+    /// The window tree the remote compositor reported.
+    ///
+    /// The compositor owns the tree and this side mirrors it: a window is placed by
+    /// the surface its cells carry, so a window this side has not been told about
+    /// cannot be drawn. `None` until a client reports itself, which is also the
+    /// reason a frame can arrive with nowhere to go.
+    pub root: Option<crate::server::Client<F>>,
+    /// The surfaces currently drawn into this pane, for the proxy to blank.
+    ///
+    /// Weak, so the registry never keeps a window alive: a window owns its surface,
+    /// and when the window goes the entry stops resolving. That is how a closed
+    /// window stops having its cells blanked without anyone having to say so.
+    pub registered_surfaces: Arc<RwLock<Vec<Weak<SurfaceId>>>>,
+    /// The screen the command is drawing into, shared with the proxy.
+    ///
+    /// Read, never written: the proxy is the side that feeds it, and this side asks
+    /// it where a window's cells are.
+    pub screen: Arc<RwLock<vt100::Parser>>,
 }
 
 impl<F: Format> Session<F> {
     pub fn new(
         connection: Connection,
-        cols: u32,
-        rows: u32,
-        debug: DebugOptions,
+        debug: std::sync::Arc<DebugOptions>,
         controller: Arc<Controller>,
         sink: Sink,
+        registered_surfaces: Arc<RwLock<Vec<Weak<SurfaceId>>>>,
+        screen: Arc<RwLock<vt100::Parser>>,
     ) -> Self {
         Self {
             connection,
-            state: State {
-                cols,
-                rows,
-                debug,
-                image: None,
-                decoder: None,
-                codec: None,
-                controller,
-                sink,
-            },
+            debug,
+            codec: None,
+            controller,
+            sink,
+            root: None,
+            registered_surfaces,
+            screen,
         }
+    }
+
+    /// Take `surface` into the registry, and hand back the shared handle.
+    ///
+    /// Shared first, then registered weakly: the window owns the id, the registry only
+    /// points at it, and when the window goes the entry stops resolving — which is
+    /// what stops its cells being blanked.
+    fn register(&self, surface: SurfaceId) -> Arc<SurfaceId> {
+        let surface = Arc::new(surface);
+        if let Ok(mut registered) = self.registered_surfaces.write() {
+            registered.push(Arc::downgrade(&surface));
+        }
+        surface
     }
 
     /// Do what `message` means.
@@ -145,20 +202,19 @@ impl<F: Format> Session<F> {
     /// draw should do.
     pub async fn handle_msg(&mut self, message: Message) {
         if let Err(e) = match message {
-            Message::Frame(jpeg) => self.paint(&jpeg).await,
+            Message::Frame {
+                pid,
+                surface,
+                bytes,
+            } => self.paint(&bytes, pid, surface).await,
             Message::InitStreaming { codec } => {
-                // The client named its codec; the decoder for it is built now and
-                // kept, because building one per frame is the expensive part. The
-                // codec is reported rather than assumed: a client speaking a
-                // codec this server does not have is told so.
+                // The client named its codec. It is kept on the session because it is
+                // a fact about the link: every window this client's programs open
+                // streams in it. The decoders are per window, and are built when a
+                // frame first needs one.
                 eprintln!("tui: a client will stream {codec:?}");
-                match codec.to_decoder() {
-                    Ok(d) => {
-                        self.state.decoder = Some(d);
-                        Ok(())
-                    }
-                    Err(e) => Err(e.into()),
-                }
+                self.codec = Some(codec);
+                Ok(())
             }
             Message::ReinitStreaming => {
                 // Reinit is a server-to-client message: the side that owns the
@@ -178,6 +234,76 @@ impl<F: Format> Session<F> {
                 Ok(())
             }
             Message::Pong => Ok(()),
+            // A client of the compositor is ready to be drawn. The first one is the
+            // session's root: a session runs one program, and a helper is a client of
+            // its own that hangs under whichever pid started it.
+            Message::InitClient { pid, surface, z } => {
+                let surface = self.register(surface);
+                let client = crate::server::Client::new(pid, surface, z);
+                match self.root.as_mut() {
+                    Some(root) => {
+                        // A helper: a client of its own, started by the session's
+                        // program. It hangs under the root rather than under the pid
+                        // that spawned it, because a session is one program and every
+                        // other connection in it was started by that program or by
+                        // something it started — the tree's depth is a fact the
+                        // compositor has and this side does not need to rebuild.
+                        root.sub_clients.push(client);
+                        Ok(())
+                    }
+                    None => {
+                        self.root = Some(client);
+                        Ok(())
+                    }
+                }
+            }
+            // Another toplevel from a client the session already knows: a child of
+            // that client's root window, addressed under the same pid.
+            Message::NewWindow { pid, surface, z } => {
+                let surface = self.register(surface);
+                match self.root.as_mut().and_then(|root| root.find_mut(pid)) {
+                    Some(owner) => {
+                        owner
+                            .window
+                            .children
+                            .push(crate::server::Window::new(surface, z));
+                        Ok(())
+                    }
+                    None => Err(io::Error::other(format!(
+                        "a window arrived for an unknown client {pid}"
+                    ))
+                    .into()),
+                }
+            }
+            Message::DeleteWindow { surface } => {
+                let removed = self
+                    .root
+                    .as_mut()
+                    .is_some_and(|root| root.remove_window(surface));
+                if removed {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!("no window draws into {surface:?}")).into())
+                }
+            }
+            Message::Restack { surface, z } => {
+                let restacked = self
+                    .root
+                    .as_mut()
+                    .is_some_and(|root| root.restack(surface, z));
+                if restacked {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!("no window draws into {surface:?}")).into())
+                }
+            }
+            // Not handled yet. Nothing here is a failure — the client sends these in
+            // the normal course of a session — so they are reported rather than
+            // obeyed or turned into an error the client would see as the end.
+            other @ Message::CompositorRequest(_) => {
+                tracing::warn!("tui: {other:?} is not handled yet");
+                Ok(())
+            }
         } {
             eprintln!("tui: {e}");
             // Reported rather than returned: the link is the only channel a client listens
@@ -202,6 +328,11 @@ impl<F: Format> Session<F> {
     /// medium. Which medium that is is the type parameter, not a runtime choice:
     /// [`Format::request`] is what turns pixels into a request for it.
     ///
+    /// The frame is painted into the window its surface names: the surface
+    /// identifies the cells, and the frame is a stretch of *that* window's stream, so
+    /// the decoder it continues is that window's. The pid is the report's own — the
+    /// client that sent it owns the window.
+    ///
     /// One span per frame, so the profiler's timeline is divided at the same
     /// boundary the pane's is. The awaits are inside it, which is why this is
     /// `#[instrument]` rather than a held guard: `Span::enter`'s guard must not
@@ -209,8 +340,38 @@ impl<F: Format> Session<F> {
     /// The two waits it contains — the terminal's acknowledgement of the
     /// transmit, and of the placement — are the two numbers this exists to see.
     #[tracing::instrument(name = "frame", skip(self, stream))]
-    async fn paint(&mut self, stream: &[u8]) -> Result<()> {
-        let pixels = if self.state.debug.blue_pixel {
+    async fn paint(&mut self, stream: &[u8], pid: u32, surface: SurfaceId) -> Result<()> {
+        // A frame for a window this side has not been told about is not a failure: the
+        // announcement and the picture are two messages, and a window that is already
+        // drawing can be announced after the drawer's first commit has been encoded. The
+        // frame is dropped and the next one — which arrives after the announcement — is
+        // painted, so nothing is lost but one turn.
+        let Some(root) = self.root.as_mut() else {
+            tracing::debug!("a frame for {surface:?} arrived before its client was reported");
+            return Ok(());
+        };
+        let Some(window) = root.get_window_mut(pid, surface) else {
+            tracing::debug!("a frame for a window this session does not know ({pid}, {surface:?})");
+            return Ok(());
+        };
+
+        // Where the window is, read off the screen rather than sent: the cells
+        // carrying its surface are its box, so a multiplexer that moved the text
+        // moved the window without anyone having to say so.
+        //
+        // A window with no cells is not placed. It has scrolled away, or been
+        // covered entirely, or has not drawn yet, and all three mean the same thing
+        // to a placement: there is nothing on screen for it to go behind.
+        let rectangle = {
+            let screen = self.screen.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+            window.rectangle(screen.screen())
+        };
+        let Some((left, top, width, height)) = rectangle else {
+            return Ok(());
+        };
+
+        let state = &mut window.state;
+        let pixels = if self.debug.blue_pixel {
             // The frame is ignored on purpose, so nothing in the wire path, the codec
             // or the decode is exercised: what appears on screen is attributable to
             // the encode, the transmit and the placement alone.
@@ -218,14 +379,14 @@ impl<F: Format> Session<F> {
         } else {
             // The decoder is built from the codec the client announced, and kept:
             // building one per frame is the expensive part, not the decoding.
-            if self.state.decoder.is_none() {
-                let codec = self.state.codec.ok_or_else(|| {
+            if state.decoder.is_none() {
+                let codec = self.codec.ok_or_else(|| {
                     io::Error::other("a frame arrived before any codec was announced")
                 })?;
-                self.state.decoder = Some(codec.to_decoder()?);
+                state.decoder = Some(codec.to_decoder()?);
             }
             let _decode = tracing::info_span!("decode").entered();
-            let decoder = self.state.decoder.as_mut().unwrap();
+            let decoder = state.decoder.as_mut().unwrap();
             match decoder.decode(stream) {
                 Ok(Some(frame)) => image::RgbImage::from_raw(frame.width, frame.height, frame.rgb)
                     .ok_or(Error::FrameSize {
@@ -240,7 +401,7 @@ impl<F: Format> Session<F> {
                 // for a keyframe — the frame after this one rebuilds the decoder
                 // from the announced codec and starts the stream over.
                 Err(e) => {
-                    self.state.decoder = None;
+                    state.decoder = None;
                     let _ = self.connection.send(&Message::ReinitStreaming).await;
                     eprintln!("tui: the codec failed: {e}");
                     return Ok(());
@@ -248,37 +409,40 @@ impl<F: Format> Session<F> {
             }
         };
 
-        let request = F::request(&self.state.controller, pixels).map_err(Error::Stage)?;
+        let request = F::request(&self.controller, pixels).map_err(Error::Stage)?;
 
         let placement = PlacementRequest {
-            cols: Some(self.state.cols),
-            rows: Some(self.state.rows),
+            // The box the surface's own cells occupy, in cells. The image is fitted
+            // to it, so the picture lands exactly where the window said it was.
+            cols: Some(u32::from(width)),
+            rows: Some(u32::from(height)),
+            x: Some(u32::from(left)),
+            y: Some(u32::from(top)),
+            // Behind the text *and* behind the cell backgrounds, so a window's
+            // picture cannot cover another window's content. Ordered among windows by
+            // `z`, which is what `stacking` is for.
+            z: Some(stacking(window.z)),
             placement_id: Some(PLACEMENT_ID),
-            // The design's placement is virtual: a prototype with no position of its
-            // own, which the client's placeholder cells resolve against, so the picture
-            // follows text a multiplexer may move. A real placement draws where the
-            // cursor is, which is the experiment — and it is what needs the cursor put
-            // back at the origin below.
-            virtual_placement: !self.state.debug.no_vplacement,
+            // A real placement: the rectangle above is a position, so there is no
+            // prototype for cells to resolve against. Without this, drawing the
+            // surface's own signature everywhere would decide where the picture goes.
+            virtual_placement: false,
             // Without this the terminal moves the cursor by the placement's own box
             // after placing, once per frame: on a stream that is a scroll per frame.
             fix_cursor: true,
             ..Default::default()
         };
 
-        if !placement.virtual_placement {
-            // A real placement draws at the cursor, so the cursor has to be at the
-            // pane's origin before every frame — otherwise the picture lands wherever
-            // the last one left the cursor, and the stream marches down the screen.
-            //
-            // Written through the same sink as the escapes, so no other writer can
-            // land in the middle of it, and as a plain cursor move rather than a
-            // clear: a clear would take the client's cells with it.
-            self.state
-                .sink
-                .write_all(crossterm::cursor::MoveTo(0, 0).to_string().as_bytes())
-                .map_err(Error::Screen)?;
-        }
+        // A real placement draws at the cursor, so the cursor has to be at the pane's
+        // origin before every frame — otherwise the picture lands wherever the last
+        // one left the cursor, and the stream marches down the screen.
+        //
+        // Written through the same sink as the escapes, so no other writer can land
+        // in the middle of it, and as a plain cursor move rather than a clear: a
+        // clear would take the client's cells with it.
+        self.sink
+            .write_all(crossterm::cursor::MoveTo(0, 0).to_string().as_bytes())
+            .map_err(Error::Screen)?;
 
         // One command, not two. Transmitting and placing separately leaves the image
         // on screen with nothing drawing it in between — the terminal frees an image's
@@ -289,10 +453,15 @@ impl<F: Format> Session<F> {
         // hanging: the acknowledgement it waits for is a reply a terminal may not send,
         // and a session that stalls here shows an empty pane forever with no clue why.
         let transplace_span = tracing::info_span!("transplace");
+        // The image is named by the window's own surface, not by a constant: two
+        // windows are two pictures, and one id would make the second replace the
+        // first. A hash of the signature is enough — it is stable across frames, and
+        // a collision is a window drawn over another rather than a corrupted picture.
+        let image_id = image_id(&surface);
         let mut image = tokio::time::timeout(
             TRANSMIT_TIMEOUT,
             request
-                .transplace(IMAGE_ID, placement)
+                .transplace(image_id, placement)
                 .instrument(transplace_span),
         )
         .await
@@ -307,7 +476,7 @@ impl<F: Format> Session<F> {
             .instrument(ack_span)
             .await
             .map_err(Error::Graphics)?;
-        self.state.image = Some(image);
+        state.image = Some(image);
         Ok(())
     }
 }
@@ -320,6 +489,36 @@ mod tests {
 
     use wire::unix::UnixSocket;
     use wire::transport::Transport as _;
+
+    /// The window the tests paint into: a pid and a surface are its identity, and
+    /// both are what a frame names.
+    const PID: u32 = 4242;
+    const SURFACE: SurfaceId = SurfaceId {
+        symbol: '❋',
+        fg: (1, 2, 3),
+        bg: (4, 5, 6),
+    };
+
+    /// The escapes that fill a `width` x `height` block of the surface's cells at
+    /// `(left, top)`, one based.
+    ///
+    /// What a real client draws into its pane: the cells carrying the surface's
+    /// signature are the box the image is placed in, so a test that wants a placement
+    /// has to draw them.
+    fn draw_surface(left: u16, top: u16, width: u16, height: u16) -> String {
+        let (r, g, b) = SURFACE.fg;
+        let (br, bg_, bb) = SURFACE.bg;
+        let mut out = String::new();
+        for row in top..top + height {
+            out.push_str(&format!(
+                "\x1b[{};{}H\x1b[38;2;{r};{g};{b}m\x1b[48;2;{br};{bg_};{bb}m",
+                row + 1,
+                left + 1
+            ));
+            out.extend(std::iter::repeat(SURFACE.symbol).take(width as usize));
+        }
+        out
+    }
 
     /// A terminal that collects what it is sent and answers the liveness probes.
     ///
@@ -426,42 +625,87 @@ mod tests {
         );
 
         let dir = std::env::temp_dir().join(format!("tui-session-{}", std::process::id()));
+        let screen = Arc::new(RwLock::new(vt100::Parser::new(
+            std::num::NonZeroU16::new(40).expect("rows"),
+            std::num::NonZeroU16::new(120).expect("cols"),
+            0,
+        )));
         let mut session = Session::<easytgp::Shm>::new(
             connection(&dir).await,
-            120,
-            40,
-            DebugOptions::default(),
+            Arc::new(DebugOptions::default()),
             controller,
             sink,
+            Arc::new(RwLock::new(Vec::new())),
+            screen.clone(),
         );
         session
             .handle_msg(Message::InitStreaming { codec: CodecId::H264 })
             .await;
-        session.handle_msg(Message::Frame(codec_frame(8, 8))).await;
+        // The window the frames are addressed to: a frame names its pid and its
+        // surface, and a session that has not been told about that window has nowhere
+        // to paint it.
+        session
+            .handle_msg(Message::InitClient {
+                pid: PID,
+                surface: SURFACE,
+                z: 0,
+            })
+            .await;
+        // The window's cells, drawn where the picture is meant to go: the rectangle
+        // comes from the screen, so a window with no cells on it is a window that is
+        // not placed. The proxy does this in a session; here it is done by hand.
+        {
+            let mut screen = screen.write().unwrap();
+            screen.process(draw_surface(3, 5, 20, 10).as_bytes());
+        }
+        session
+            .handle_msg(Message::Frame {
+                pid: PID,
+                surface: SURFACE,
+                bytes: codec_frame(8, 8),
+            })
+            .await;
         let first = String::from_utf8(written.lock().unwrap().clone()).expect("escapes are text");
         // One command, `a=T`, that both replaces the pixels and makes the placement.
         // The two used to be separate, and the terminal frees an image's placements when
         // its data is replaced -- so between them the picture was on screen with nothing
         // drawing it, for as long as a round trip takes. That gap is the flicker.
         assert!(first.contains("a=T"), "one transplace command: {first:?}");
-        assert!(first.contains("i=99"), "{first:?}");
+        // The image is named by the window's own surface, so two windows are two
+        // pictures rather than one replacing the other.
+        let image = image_id(&SURFACE);
+        assert!(first.contains(&format!("i={image}")), "{first:?}");
         assert!(first.contains("t=s"), "{first:?}");
         // The transmitted data's size, and the cell box it is fitted into. Both travel
         // on one command and are different keys.
         assert!(first.contains("s=8"), "{first:?}");
         assert!(first.contains("v=8"), "{first:?}");
-        assert!(first.contains("c=120"), "{first:?}");
-        assert!(first.contains("r=40"), "{first:?}");
-        // The design's placement is virtual, so the client's placeholder cells are what
-        // anchor the image rather than the cursor.
-        assert!(first.contains("U=1"), "{first:?}");
+        // The box is the surface's own cells: `draw_surface` puts a 20x10 window at
+        // (3, 5), and that is what the placement is given.
+        assert!(first.contains("c=20"), "{first:?}");
+        assert!(first.contains("r=10"), "{first:?}");
+        assert!(first.contains("x=3"), "{first:?}");
+        assert!(first.contains("y=5"), "{first:?}");
+        // Behind the text and behind the backgrounds, which is the band below
+        // `INT32_MIN / 2`. The gui's rank is added to the band's floor, and rank 0
+        // is the floor itself.
+        assert!(
+            first.contains(&format!("z={}", i32::MIN / 2)),
+            "{first:?}"
+        );
         assert!(first.contains("p=98"), "{first:?}");
         // Without this the terminal moves the cursor by the placement's box once per
         // frame, which walks the picture down the screen.
         assert!(first.contains("C=1"), "{first:?}");
 
         let after_first = first.len();
-        session.handle_msg(Message::Frame(codec_frame(8, 8))).await;
+        session
+            .handle_msg(Message::Frame {
+                pid: PID,
+                surface: SURFACE,
+                bytes: codec_frame(8, 8),
+            })
+            .await;
 
         let all = written.lock().unwrap().clone();
         let second = String::from_utf8(all[after_first..].to_vec()).expect("escapes are text");
@@ -469,7 +713,10 @@ mod tests {
         // own placement, under the same placement id -- a repeat transmit replaces the
         // placement that was there.
         assert!(second.contains("a=T"), "a later frame transplaces: {second:?}");
-        assert!(second.contains("i=99"), "the same id: {second:?}");
+        assert!(
+            second.contains(&format!("i={}", image_id(&SURFACE))),
+            "the same id: {second:?}"
+        );
         assert!(
             second.contains("p=98"),
             "under the same placement id: {second:?}"

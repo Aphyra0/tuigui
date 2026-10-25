@@ -66,7 +66,7 @@ where
         let Some(surface) = window.wl_surface() else {
             return;
         };
-        let Some(root) = self.root_client.as_ref().and_then(std::sync::Weak::upgrade) else {
+        let Some(root) = self.root_client.as_ref() else {
             return;
         };
         let was_root = {
@@ -169,7 +169,6 @@ where
         if self
             .root_client
             .as_ref()
-            .and_then(std::sync::Weak::upgrade)
             .and_then(|root| {
                 root.root_window
                     .read()
@@ -183,7 +182,7 @@ where
             return;
         }
         let win: Window<W> = Window::new(surface.clone(), Some(self.server_size), W::default());
-        let Some(root) = self.root_client.as_ref().and_then(std::sync::Weak::upgrade) else {
+        let Some(root) = self.root_client.as_ref() else {
             tracing::debug!("x11: no root client to admit into");
             return;
         };

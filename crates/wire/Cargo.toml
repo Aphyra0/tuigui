@@ -6,6 +6,9 @@ license.workspace = true
 description = "Wire protocol, transport abstraction and session file shared by the tui server and the gui client"
 
 [dependencies]
+# The cell a surface is matched against: a surface's signature is compared with a
+# cell's own symbol and colours, and that cell type lives with the rewriter.
+cell_map = { workspace = true }
 # `io-util` for the socket; `net` for the unix socket itself; `sync` for the
 # mutexes a transport holds its link behind; `rt` and `macros` for what drives it.
 tokio = { version = "1", features = ["io-util", "net", "sync", "rt", "macros", "time"] }

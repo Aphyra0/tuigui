@@ -12,6 +12,12 @@
 //!   either ──▶ Error         something failed; the peer decides what to do
 //! ```
 //!
+//! Two of them are about more than one window. `InitClient` tells the server what
+//! its compositor admitted: which process, and which cells it draws into. The tree
+//! that grows from those facts is the server's own business, built by matching a
+//! helper's parent pid. `CompositorRequest` is the way back down: the server asks
+//! the compositor to act, and the client that owns it forwards the request.
+//!
 //! The pair is a handshake, not a formality. `Ping` is how the client learns its
 //! request was *accepted* — a different fact from its socket being open, since a
 //! transport can connect and the session still refuse it — and it carries the
@@ -46,8 +52,19 @@ pub enum Message {
     /// One frame, in whatever the transport carries.
     ///
     /// Opaque here on purpose: a transport that had to understand a frame's
-    /// internals could not carry one it had never heard of.
-    Frame(Vec<u8>),
+    /// internals could not carry one it had never heard of. What it does name is
+    /// the window the frame belongs to, because a session holds more than one and
+    /// a decoder is per window: without the surface there is no way to know which
+    /// stream this stretch continues. The pid names which client's tree to look in,
+    /// which is the other half of the same lookup.
+    Frame {
+        /// The process whose program draws this window, and so whose stream this is.
+        pid: u32,
+        /// The cells of the window this frame draws.
+        surface: SurfaceId,
+        /// The codec's bytes, opaque to the link.
+        bytes: Vec<u8>,
+    },
     /// Something failed.
     ///
     /// Carries a string rather than an [`io::Error`] because the peer that
@@ -72,6 +89,117 @@ pub enum Message {
     /// lost all of its state can start from, which is a keyframe encoded now,
     /// not a replay of the last frame.
     ReinitStreaming,
+    /// A request from the server to the compositor inside the client.
+    ///
+    /// The compositor is what owns the window tree, so anything that has to
+    /// reach a window — input aimed at one, a configure, a close — is asked for
+    /// here rather than decided by the server. The variant carries the request;
+    /// the client forwards it and the compositor answers.
+    CompositorRequest(CompositorAddressible),
+    /// A client connected to the client's compositor: the program itself, or a
+    /// helper it started.
+    ///
+    /// Sent when the client's first window is ready to be drawn, not when the
+    /// connection opens: a client with no window is a process the server has nothing
+    /// to say to, and reporting it earlier would only be a fact that changes a
+    /// moment later.
+    InitClient {
+        /// The process id, which is what a helper is matched to its parent by.
+        pid: u32,
+        /// The signature this client's root window draws into.
+        surface: SurfaceId,
+        /// Where that window sits in the stacking order, higher in front.
+        z: i32,
+    },
+    /// A client's program opened another toplevel, beside its root window.
+    ///
+    /// Not a sub-client: the window belongs to a connection the server already
+    /// knows, and is addressed under it.
+    NewWindow {
+        /// The process whose program opened it.
+        pid: u32,
+        /// The signature this window draws into, and the name it is placed under.
+        surface: SurfaceId,
+        /// Where it sits in the stacking order, higher in front.
+        z: i32,
+    },
+    /// A window closed. Its cells are gone, so nothing has to be said about those.
+    DeleteWindow {
+        /// The signature the window drew into.
+        surface: SurfaceId,
+    },
+    /// A window moved in the stacking order.
+    ///
+    /// Sent instead of a new placement: the pixels did not change, only which
+    /// window is in front. A terminal re-orders what it already has, so this costs
+    /// no image traffic.
+    Restack {
+        /// The signature the window draws into.
+        surface: SurfaceId,
+        /// Its new place in the stacking order, higher in front.
+        z: i32,
+    },
+}
+
+/// The signature a window's cells carry: a symbol, a foreground and a background.
+///
+/// The cell *is* the identity, which is what makes a window findable by looking at
+/// the screen rather than by being told where it is. Random in all three, so it
+/// cannot be mistaken for ordinary content and two windows cannot collide by
+/// accident.
+///
+/// `Hash` because it is a map key on both sides: the gui looks a window's layout up by
+/// it, and the server looks a decoder up by it.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub struct SurfaceId {
+    /// The character drawn in every cell of the window.
+    pub symbol: char,
+    /// The foreground those cells are drawn in.
+    pub fg: (u8, u8, u8),
+    /// The background behind them.
+    pub bg: (u8, u8, u8),
+}
+
+impl SurfaceId {
+    /// Whether `cell` is one of this surface's cells.
+    ///
+    /// Both colours must be true colour to compare: a palette index names whatever
+    /// the terminal has in that slot, which is not a fact a surface carries, so an
+    /// indexed or default colour matches nothing.
+    pub fn matches(&self, cell: &cell_map::Cell) -> bool {
+        let cell_map::Cell {
+            symbol,
+            fg: cell_map::CellColor::Rgb(fr, fg_, fb),
+            bg: cell_map::CellColor::Rgb(br, bg_, bb),
+        } = *cell
+        else {
+            return false;
+        };
+        self.symbol == symbol && self.fg == (fr, fg_, fb) && self.bg == (br, bg_, bb)
+    }
+}
+
+/// A request from the server down to the compositor.
+///
+/// The channel exists before its content does: the server is the side that
+/// knows what a user asked for, and the compositor is the side that can act on
+/// it, so the shape of the request belongs here and the handling belongs there.
+/// Nothing is handled yet — the first request is the one a window-targeted input
+/// needs, and it is added when the routing that uses it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum CompositorAddressible {
+    /// A request with nothing behind it, for the path to be built on.
+    Noop,
 }
 
 impl Message {
@@ -116,9 +244,58 @@ mod tests {
             // survive, or a client would read it as a frame.
             Message::Ping(String::new()),
             Message::Pong,
-            Message::Frame(b"raw frame bytes".to_vec()),
+            Message::Frame {
+                pid: 4242,
+                surface: SurfaceId {
+                    symbol: '❋',
+                    fg: (1, 2, 3),
+                    bg: (4, 5, 6),
+                },
+                bytes: b"raw frame bytes".to_vec(),
+            },
             // Not text, so a codec that assumed UTF-8 would show up here.
-            Message::Frame(vec![0x00, 0xff, 0x1b, 0x9b]),
+            Message::Frame {
+                pid: 1,
+                surface: SurfaceId {
+                    symbol: '\u{10eeee}',
+                    fg: (0, 0, 0),
+                    bg: (255, 255, 255),
+                },
+                bytes: vec![0x00, 0xff, 0x1b, 0x9b],
+            },
+            Message::InitClient {
+                pid: 4242,
+                surface: SurfaceId {
+                    symbol: '❋',
+                    fg: (9, 8, 7),
+                    bg: (6, 5, 4),
+                },
+                z: -1_073_741_824,
+            },
+            Message::NewWindow {
+                pid: 4242,
+                surface: SurfaceId {
+                    symbol: '✳',
+                    fg: (1, 1, 1),
+                    bg: (2, 2, 2),
+                },
+                z: 7,
+            },
+            Message::DeleteWindow {
+                surface: SurfaceId {
+                    symbol: '✳',
+                    fg: (1, 1, 1),
+                    bg: (2, 2, 2),
+                },
+            },
+            Message::Restack {
+                surface: SurfaceId {
+                    symbol: '✳',
+                    fg: (1, 1, 1),
+                    bg: (2, 2, 2),
+                },
+                z: 9,
+            },
             Message::Error("the peer refused the frame".into()),
             Message::Error(String::new()),
         ] {

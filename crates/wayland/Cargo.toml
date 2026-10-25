@@ -24,8 +24,3 @@ libc = "0.2"
 wayland-client = "0.31"
 rustix = { workspace = true }
 memmap2 = "0.9"
-
-# The example writes what it captured as a PNG, so a window can be looked at
-# rather than only measured.
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-png = { workspace = true }
