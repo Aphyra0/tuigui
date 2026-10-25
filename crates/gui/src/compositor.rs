@@ -128,6 +128,12 @@ pub struct Compositor {
     next_z: i32,
     /// The drag in progress, if any.
     drag: Option<Drag>,
+    /// The window keys go to: the last one clicked, or the one the pointer is over.
+    ///
+    /// A keystroke is not addressed at a position, so this is the one fact that decides
+    /// where it goes. `None` means nothing has been clicked, and a key goes nowhere —
+    /// better than picking a window and typing into the wrong program.
+    focus: Option<SurfaceId>,
     /// The pane, in cells, as of the last render.
     pane: Rect,
     /// When the program was started, for the "no window at all" timeout.
@@ -179,6 +185,7 @@ impl Compositor {
             next_image: 1,
             next_z: 1,
             drag: None,
+            focus: None,
             pane,
             started: None,
         })
@@ -373,11 +380,191 @@ impl Compositor {
         layout.area.x = x as u16;
         layout.area.y = y as u16;
     }
+
+    /// Deliver one terminal event to whatever it landed on.
+    ///
+    /// The pane is this side's to hit-test: it knows where every window is, so it is the
+    /// side that turns a cell into a window. What crosses to the compositor is a
+    /// window-local event, which is the only thing the trait speaks.
+    ///
+    /// The title bar and the close mark are above the client area and are handled here
+    /// rather than sent: they belong to this side's window manager, not to the program.
+    pub fn input(&mut self, event: &termputs::InputEvent, _cell: (u32, u32)) -> std::io::Result<()> {
+        match event {
+            termputs::InputEvent::Mouse(mouse) => {
+                self.mouse(mouse);
+                Ok(())
+            }
+            termputs::InputEvent::Key { key, state } => {
+                // A key goes to whichever window has focus, and nowhere if none does: a
+                // keystroke is not addressed at a position, so there is nothing to
+                // hit-test and no fallback that would not be a guess.
+                let Some(surface) = self.focus else {
+                    return Ok(());
+                };
+                let Some(key) = logical_key(key) else {
+                    return Ok(());
+                };
+                // The terminal reports presses only, with no byte for a release. A press
+                // sent on its own is therefore a key held down forever, and the client's
+                // own repeat types the character over and over: one event here has to be
+                // one whole keystroke, down and up. A release the terminal did report is
+                // passed through as itself.
+                match state {
+                    termputs::KeyState::Released => {
+                        self.deliver(
+                            surface,
+                            proto::windowing::Input::Key {
+                                key,
+                                state: proto::windowing::KeyState::Released,
+                            },
+                        );
+                    }
+                    termputs::KeyState::Pressed | termputs::KeyState::Repeated => {
+                        self.deliver(
+                            surface,
+                            proto::windowing::Input::Key {
+                                key,
+                                state: proto::windowing::KeyState::Pressed,
+                            },
+                        );
+                        self.deliver(
+                            surface,
+                            proto::windowing::Input::Key {
+                                key,
+                                state: proto::windowing::KeyState::Released,
+                            },
+                        );
+                    }
+                }
+                Ok(())
+            }
+            // A paste is text, not the keys that produce it; a resize is the pane's shape,
+            // and focus follows the pane. None is input a window can take.
+            _ => Ok(()),
+        }
+    }
+
+    /// The mouse: press closes or drags, motion drags or moves focus, the wheel scrolls.
+    fn mouse(&mut self, mouse: &termputs::MouseEvent) {
+        let at = (mouse.column, mouse.row);
+        match mouse.kind {
+            termputs::MouseKind::Down(termputs::Button::Left) => {
+                let Some((surface, layout)) = self.hit(at) else {
+                    return;
+                };
+                self.focus = Some(surface);
+                let area = layout.area;
+                // The close mark is the last cell of the top border; the rest of that row
+                // is the title bar, and the title bar is where a drag starts.
+                if at.1 == area.y && at.0 + 2 >= area.right() {
+                    self.close(surface);
+                } else if at.1 == area.y {
+                    self.drag = Some(Drag {
+                        surface,
+                        at,
+                        from: (area.x, area.y),
+                    });
+                }
+            }
+            // Any release ends a drag, whichever button it was: a drag that outlived its
+            // button would follow the pointer for the rest of the session.
+            termputs::MouseKind::Up(_) => self.drag = None,
+            // A press of another button is not this window manager's: it is the
+            // program's, and goes to the client area it landed in.
+            termputs::MouseKind::Down(button) => {
+                let Some((surface, _)) = self.hit(at) else {
+                    return;
+                };
+                let button = match button {
+                    termputs::Button::Left => proto::windowing::Button::Left,
+                    termputs::Button::Right => proto::windowing::Button::Right,
+                    termputs::Button::Middle => proto::windowing::Button::Middle,
+                };
+                self.deliver(
+                    surface,
+                    proto::windowing::Input::Button { button, down: true },
+                );
+            }
+            termputs::MouseKind::Drag(_) | termputs::MouseKind::Moved => {
+                if self.drag.is_some() {
+                    self.drag_to(at);
+                } else if let Some((surface, _)) = self.hit(at) {
+                    self.focus = Some(surface);
+                }
+            }
+            termputs::MouseKind::Scroll(direction) => {
+                let Some((surface, _)) = self.hit(at) else {
+                    return;
+                };
+                let delta = match direction {
+                    termputs::Scroll::Up => proto::windowing::ScrollDelta {
+                        vertical: -1,
+                        horizontal: 0,
+                    },
+                    termputs::Scroll::Down => proto::windowing::ScrollDelta {
+                        vertical: 1,
+                        horizontal: 0,
+                    },
+                    termputs::Scroll::Left => proto::windowing::ScrollDelta {
+                        vertical: 0,
+                        horizontal: -1,
+                    },
+                    termputs::Scroll::Right => proto::windowing::ScrollDelta {
+                        vertical: 0,
+                        horizontal: 1,
+                    },
+                };
+                self.deliver(surface, proto::windowing::Input::Scroll { delta });
+            }
+        }
+    }
+
+    /// The front-most window at `at`, with its layout.
+    ///
+    /// Front-most because that is the one a person means: the picture they can see is the
+    /// one on top.
+    fn hit(&self, at: (u16, u16)) -> Option<(SurfaceId, Layout)> {
+        self.windows
+            .iter()
+            .filter(|(_, layout)| layout.area.contains((at.0, at.1).into()))
+            .max_by_key(|(_, layout)| layout.z)
+            .map(|(surface, layout)| (*surface, layout.clone()))
+    }
+
+    /// Hand one event to the window drawn into `surface`.
+    ///
+    /// Through the trait, so the same code drives any backend: a window takes an event, it
+    /// is not handed a seat.
+    fn deliver(&mut self, surface: SurfaceId, input: proto::windowing::Input) {
+        let Some(root) = self.server.root_client().and_then(|root| root.upgrade()) else {
+            return;
+        };
+        let client: &dyn proto::windowing::Client<ClientData, WindowData> = &*root;
+        deliver_to(client, surface, input);
+    }
+
+    /// Forget a window that has been closed.
+    ///
+    /// The program keeps running: what a window closing means for a client is the client's
+    /// business, and killing a process from inside a draw would end the session on a
+    /// stray click.
+    fn close(&mut self, surface: SurfaceId) {
+        self.windows.remove(&surface);
+        self.announced.remove(&surface);
+        self.last.remove(&surface);
+        if self.focus == Some(surface) {
+            self.focus = None;
+        }
+        if self.drag.is_some_and(|drag| drag.surface == surface) {
+            self.drag = None;
+        }
+        tracing::info!("closed {surface:?}");
+    }
 }
 
 /// Whether any client in this tree is still running, set into `running`.
-fn any_running(
-    client: &dyn proto::windowing::Client<ClientData, WindowData>,
+fn any_running(    client: &dyn proto::windowing::Client<ClientData, WindowData>,
     running: &mut bool,
 ) {
     if client.is_running() {
@@ -408,6 +595,81 @@ fn each_window(
     window.with_children(&mut |child| each_window(child, pid, is_root, f));
 }
 
+/// Hand `input` to the window drawn into `surface`, wherever it sits in the tree.
+///
+/// The walk is the trait's, and the window takes the event itself: this side never names
+/// a seat or a keycode, so the same call drives any backend.
+fn deliver_to(
+    client: &dyn proto::windowing::Client<ClientData, WindowData>,
+    surface: SurfaceId,
+    input: proto::windowing::Input,
+) -> bool {
+    let mut sent = false;
+    client.with_window(&mut |window| sent = deliver_window(window, surface, input));
+    if sent {
+        return true;
+    }
+    client.with_children(&mut |child| {
+        if !sent {
+            sent = deliver_to(child, surface, input);
+        }
+    });
+    sent
+}
+
+/// Delivery for one window and, failing that, its children.
+fn deliver_window(
+    window: &dyn ProtoWindow<WindowData>,
+    surface: SurfaceId,
+    input: proto::windowing::Input,
+) -> bool {
+    let mut mine = false;
+    let mut is_mine = false;
+    window.with_attached(&mut |data| is_mine = data.surface == surface);
+    let _ = mine;
+    if is_mine {
+        // A failure here is the window's own: a closed one, or one that has not drawn.
+        // There is nowhere better to report it than a log, and nothing to retry.
+        if let Err(e) = window.input(input) {
+            tracing::debug!("an input did not reach {surface:?}: {e}");
+        }
+        return true;
+    }
+    let mut found = false;
+    window.with_children(&mut |child| {
+        if !found {
+            found = deliver_window(child, surface, input);
+        }
+    });
+    found
+}
+
+/// The logical key a terminal key stands for.
+///
+/// The vocabulary is deliberately small: a printable character, or a named key. Anything
+/// else — a media key, a keypad key — has no name here and is declined, which is honest:
+/// inventing one would type something the user did not press.
+fn logical_key(key: &termputs::Key) -> Option<proto::windowing::Key> {
+    use proto::windowing::Key as Logical;
+    use termputs::KeyCode;
+    Some(match key.code {
+        KeyCode::Char(c) => Logical::Char(c),
+        KeyCode::Enter => Logical::Return,
+        KeyCode::Esc => Logical::Escape,
+        KeyCode::Backspace => Logical::Backspace,
+        KeyCode::Tab => Logical::Tab,
+        KeyCode::Delete => Logical::Delete,
+        KeyCode::Left => Logical::Left,
+        KeyCode::Right => Logical::Right,
+        KeyCode::Up => Logical::Up,
+        KeyCode::Down => Logical::Down,
+        KeyCode::Home => Logical::Home,
+        KeyCode::End => Logical::End,
+        KeyCode::PageUp => Logical::PageUp,
+        KeyCode::PageDown => Logical::PageDown,
+        _ => return None,
+    })
+}
 /// A window's box when it is not the first: `n`th in a cascade, a fixed size.
 fn floating(pane: Rect, n: u16) -> Rect {
     const WIDTH: u16 = 40;

@@ -99,7 +99,7 @@ impl Announcement {
         self.seen.push(address.clone());
         match UnixSocket::from_magic(&name, &address) {
             Some(transport) => {
-                eprintln!("tui: a client announced itself over {}", transport.name());
+                tracing::info!("a client announced itself over {}", transport.name());
                 vec![Box::new(transport) as Box<dyn Transport>]
             }
             None => Vec::new(),

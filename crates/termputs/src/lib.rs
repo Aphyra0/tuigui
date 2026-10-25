@@ -39,7 +39,7 @@
 mod evdev;
 
 pub use evdev::{
-    Button, InputEvent, Key, KeyState, MouseEvent, MouseKind, Scroll, KEYMAP_NAME,
+    Button, InputEvent, Key, KeyCode, KeyState, MouseEvent, MouseKind, Scroll, KEYMAP_NAME,
 };
 
 use std::io::{Read, Write};

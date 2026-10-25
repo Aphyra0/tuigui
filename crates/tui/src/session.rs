@@ -212,7 +212,7 @@ impl<F: Format> Session<F> {
                 // a fact about the link: every window this client's programs open
                 // streams in it. The decoders are per window, and are built when a
                 // frame first needs one.
-                eprintln!("tui: a client will stream {codec:?}");
+                tracing::info!("a client will stream {codec:?}");
                 self.codec = Some(codec);
                 Ok(())
             }
@@ -224,13 +224,13 @@ impl<F: Format> Session<F> {
                 Err(io::Error::other("a client cannot ask its server for a keyframe; that is a server-to-client message").into())
             }
             Message::Error(text) => {
-                eprintln!("tui: a client reported: {text}");
+                tracing::warn!("a client reported: {text}");
                 Ok(())
             }
             // The handshake's own messages, which were answered when the link was
             // established and mean nothing on their own.
             Message::Ping(label) => {
-                eprintln!("tui: a client greeted us as {label}");
+                tracing::info!("a client greeted us as {label}");
                 Ok(())
             }
             Message::Pong => Ok(()),
@@ -305,7 +305,7 @@ impl<F: Format> Session<F> {
                 Ok(())
             }
         } {
-            eprintln!("tui: {e}");
+            tracing::error!("{e}");
             // Reported rather than returned: the link is the only channel a client listens
             // on, and a failure it is not told about is a pane that stops changing for no
             // stated reason. Retried because this is the last thing the peer is ever told —
@@ -403,7 +403,7 @@ impl<F: Format> Session<F> {
                 Err(e) => {
                     state.decoder = None;
                     let _ = self.connection.send(&Message::ReinitStreaming).await;
-                    eprintln!("tui: the codec failed: {e}");
+                    tracing::error!("the codec failed: {e}");
                     return Ok(());
                 }
             }
@@ -412,20 +412,22 @@ impl<F: Format> Session<F> {
         let request = F::request(&self.controller, pixels).map_err(Error::Stage)?;
 
         let placement = PlacementRequest {
-            // The box the surface's own cells occupy, in cells. The image is fitted
-            // to it, so the picture lands exactly where the window said it was.
+            // The box the surface's own cells occupy, in cells. The image is fitted to
+            // it, so the picture is scaled to exactly the window's area.
+            //
+            // Only the *size* goes here. `x`/`y` are not position: in the protocol they
+            // crop a source rectangle out of the image, and the position is wherever the
+            // cursor is. That is why the cursor is moved below.
             cols: Some(u32::from(width)),
             rows: Some(u32::from(height)),
-            x: Some(u32::from(left)),
-            y: Some(u32::from(top)),
             // Behind the text *and* behind the cell backgrounds, so a window's
             // picture cannot cover another window's content. Ordered among windows by
             // `z`, which is what `stacking` is for.
             z: Some(stacking(window.z)),
             placement_id: Some(PLACEMENT_ID),
-            // A real placement: the rectangle above is a position, so there is no
-            // prototype for cells to resolve against. Without this, drawing the
-            // surface's own signature everywhere would decide where the picture goes.
+            // A real placement draws at the cursor, and nothing here is virtual: the
+            // cells are the window's own area, so the picture goes where the cursor is
+            // put.
             virtual_placement: false,
             // Without this the terminal moves the cursor by the placement's own box
             // after placing, once per frame: on a stream that is a scroll per frame.
@@ -433,15 +435,15 @@ impl<F: Format> Session<F> {
             ..Default::default()
         };
 
-        // A real placement draws at the cursor, so the cursor has to be at the pane's
-        // origin before every frame — otherwise the picture lands wherever the last
-        // one left the cursor, and the stream marches down the screen.
+        // The picture is drawn from the cursor, so the cursor goes to the window's own
+        // top-left cell first. This is the position — the protocol has no key for it,
+        // which is why it is a cursor move and not a field on the placement.
         //
-        // Written through the same sink as the escapes, so no other writer can land
-        // in the middle of it, and as a plain cursor move rather than a clear: a
-        // clear would take the client's cells with it.
+        // Written through the same sink as the escapes, so no other writer can land in
+        // the middle of it, and as a plain cursor move rather than a clear: a clear would
+        // take the client's cells with it.
         self.sink
-            .write_all(crossterm::cursor::MoveTo(0, 0).to_string().as_bytes())
+            .write_all(crossterm::cursor::MoveTo(left, top).to_string().as_bytes())
             .map_err(Error::Screen)?;
 
         // One command, not two. Transmitting and placing separately leaves the image

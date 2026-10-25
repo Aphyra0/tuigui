@@ -290,7 +290,11 @@ impl State {
                 // whatever arrives after this one.
                 let events = capture.finish();
                 let capture = session.input_listener.capture();
-                let _ = (events, session.cell);
+                for event in &events {
+                    compositor
+                        .input(event, session.cell)
+                        .map_err(|e| format!("could not deliver input: {e}"))?;
+                }
 
                 // One turn: step the compositor, capture every window, send what changed.
                 // Bounded by the compositor's own step, and by the caller's frame.

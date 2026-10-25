@@ -23,9 +23,17 @@
 
 use kbvm::{evdev, Keycode};
 use terminput::{
-    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    Event, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     ScrollDirection,
 };
+
+/// The key a terminal reported, by name.
+///
+/// Re-exported because it is the only way to tell one non-printable key from another:
+/// [`Key::character`] answers for text and [`Key::keycode`] for positions, and neither
+/// says "this was Escape". A caller translating terminal events into another system's
+/// vocabulary needs the name itself.
+pub use terminput::KeyCode;
 
 /// The name of the keyboard layout these keycodes assume.
 ///

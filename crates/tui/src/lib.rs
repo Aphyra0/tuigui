@@ -336,10 +336,7 @@ fn install_tracing() -> io::Result<()> {
     //
     // A second call fails here too, which is right: one subscriber per process.
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(ours).with(layer))
-    .map_err(|e| {
-        eprintln!("tui: could not install the profiler: {e}");
-        io::Error::other(format!("could not install the profiler: {e}"))
-    })?;
+        .map_err(|e| io::Error::other(format!("could not install the profiler: {e}")))?;
 
     // One span, guaranteed, before anything else is instrumented. It answers "is
     // anything reaching the profiler at all", which is the first question when a

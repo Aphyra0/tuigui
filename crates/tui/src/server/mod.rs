@@ -244,7 +244,7 @@ impl<F: Format> Server<F> {
                         surfaces.clone(),
                         screen.clone(),
                     )),
-                    Err(e) => eprintln!("tui: could not reach an announced client: {e}"),
+                    Err(e) => tracing::warn!("could not reach an announced client: {e}"),
                 },
                 // The pty is gone, so the session is over and there is nothing left to serve.
                 Action::Announced(None) => return Ok(()),
@@ -262,7 +262,9 @@ impl<F: Format> Server<F> {
                             surfaces.clone(),
                             screen.clone(),
                         )),
-                        Err(e) => eprintln!("tui: could not dial {}: {e}", socket.path().display()),
+                        Err(e) => {
+                            tracing::warn!("could not dial {}: {e}", socket.path().display())
+                        }
                     }
                 }
                 Action::Said { outcome, index } => match outcome {
@@ -274,10 +276,10 @@ impl<F: Format> Server<F> {
                     // The client closed between messages, which is the normal end of one.
                     Ok(None) => {
                         sessions.remove(index);
-                        eprintln!("tui: a client disconnected");
+                        tracing::info!("a client disconnected");
                     }
                     Err(e) => {
-                        eprintln!("tui: client {index} ended: {e}");
+                        tracing::warn!("client {index} ended: {e}");
                         sessions.remove(index);
                     }
                 },

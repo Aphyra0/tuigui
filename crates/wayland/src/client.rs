@@ -137,8 +137,8 @@ where
             return Ok(());
         }
 
-        eprintln!(
-            "wayland: parent {parent} of {pid} is not a connected client; ignoring the connection"
+        tracing::warn!(
+            "parent {parent} of {pid} is not a connected client; ignoring the connection"
         );
         Ok(())
     }

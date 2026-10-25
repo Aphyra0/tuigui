@@ -187,7 +187,7 @@ impl Pty {
                 status = child.wait() => {
                     let status = status?;
                     if !status.success() {
-                        eprintln!("tui: command exited with {status}");
+                        tracing::warn!("command exited with {status}");
                     }
                     return Ok(());
                 }
@@ -208,7 +208,7 @@ impl Pty {
                     // from: that is the terminal the user actually resized.
                     if let Ok(ws) = rustix::termios::tcgetwinsize(io::stdin()) {
                         if let Err(e) = rustix::termios::tcsetwinsize(&resizable, ws) {
-                            eprintln!("tui: could not tell the command its new size: {e}");
+                            tracing::warn!("could not tell the command its new size: {e}");
                         }
                         // The size is in the kernel now, but a full-screen program only
                         // notices by being signalled — the same `SIGWINCH` the terminal sent
@@ -226,7 +226,7 @@ impl Pty {
                                     pid,
                                     rustix::process::Signal::WINCH,
                                 ) {
-                                    eprintln!("tui: could not signal the command: {e}");
+                                    tracing::warn!("could not signal the command: {e}");
                                 }
                             }
                             // Already reaped, or a pid that cannot exist: nothing to resize.
