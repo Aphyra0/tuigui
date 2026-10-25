@@ -10,12 +10,14 @@ name = "wayland-smoke"
 path = "src/bin/wayland-smoke.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+proto = { workspace = true }
 smithay = { workspace = true }
 wayland-protocols = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 derive-getters = { workspace = true }
 derive_setters = { workspace = true }
+sysinfo = { workspace = true }
 libc = "0.2"
 # Used by the smoke client in src/bin, which exercises the session
 # end-to-end (it is a real Wayland client).

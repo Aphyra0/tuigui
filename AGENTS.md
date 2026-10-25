@@ -79,6 +79,8 @@ A full rebuild of `ring` / `rustls` / the TLS stack costs minutes. Avoid it.
 
 ## Behavior
 
+- **All communication is in English.** Replies, explanations, commit messages,
+  code comments, and any text in a file: English only. No other language, ever.
 - Follow the user's explicit design. Do not "improve" or redesign what was
   asked without being asked.
 - **Do not propose an architectural rewrite when the user reports a bug.** It

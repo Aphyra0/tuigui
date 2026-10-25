@@ -1,0 +1,6 @@
+[package]
+name = "proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The platform-neutral foundation both the wayland session and the macOS backend speak"

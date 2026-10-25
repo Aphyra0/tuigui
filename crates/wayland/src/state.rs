@@ -7,7 +7,6 @@ use std::sync::{Arc, Weak};
 use smithay::input::keyboard::XkbConfig;
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::wayland_server::DisplayHandle;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Serial;
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::output::OutputManagerState;
@@ -21,7 +20,7 @@ use crate::CompError;
 
 /// The Smithay-registered protocol state: what every handler impl returns.
 /// Registration, not policy.
-pub struct Globals<C, W> {
+pub struct Globals<C: 'static, W: 'static> {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: smithay::wayland::shell::xdg::XdgShellState,
     pub shm_state: ShmState,
@@ -39,7 +38,7 @@ pub struct Globals<C, W> {
 /// The session: the window trees of the root client and its helpers, the
 /// scales, the X11 side.
 #[derive(derive_getters::Getters)]
-pub struct State<C = (), W = ()> {
+pub struct State<C: 'static = (), W: 'static = ()> {
     /// The Smithay-registered protocol objects (see [`Globals`]).
     pub globals: Globals<C, W>,
     /// The single present output. Used to send `wl_surface.enter` so committed
@@ -49,6 +48,8 @@ pub struct State<C = (), W = ()> {
     pub seat: Seat<Self>,
     pub display_handle: DisplayHandle,
     pub server_size: (u32, u32),
+    /// The last serial this session handed out; bumped by [`State::next_serial`].
+    serial: u64,
     /// The root client, once the caller spawned it: its process, its root
     /// window tree, and the helpers it started. Weak because Smithay's
     /// connection slot holds the owning `Arc`.
@@ -65,7 +66,11 @@ pub struct State<C = (), W = ()> {
     pub x11_display: Option<std::result::Result<String, String>>,
 }
 
-impl<C: Default, W> State<C, W> {
+impl<C, W> State<C, W>
+where
+    C: proto::Shared + Default,
+    W: proto::Shared + Default,
+{
     /// Build the session state: the globals, the seat with its keyboard and
     /// pointer, and the single output.
     pub(crate) fn new(
@@ -102,6 +107,7 @@ impl<C: Default, W> State<C, W> {
             seat: seat.clone(),
             display_handle: dh.clone(),
             server_size,
+            serial: 0,
             root_client: None,
             output_scale,
             show_cursor,
@@ -134,47 +140,7 @@ impl<C: Default, W> State<C, W> {
 
     /// Take the root client out of the session, if it is still there.
     pub(crate) fn take_root_client(&mut self) -> Option<Arc<RootClient<C, W>>> {
-        self.root_client.take().and_then(Weak::upgrade)
-    }
-
-    /// The surface of every admitted window: each client's root window and
-    /// its children, the root client's first, then its helpers'.
-    pub(crate) fn window_surfaces(&self) -> Vec<WlSurface> {
-        let mut out = Vec::new();
-        let mut push_tree = |lock: &std::sync::RwLock<Option<Window<W>>>| {
-            let tree = lock.read().unwrap();
-            if let Some(t) = tree.as_ref() {
-                out.push(t.surface.clone());
-                for child in &t.children {
-                    out.push(child.surface.clone());
-                }
-            }
-        };
-        if let Some(root) = self.root_client.as_ref().and_then(Weak::upgrade) {
-            push_tree(&root.root_window);
-            for sub in root.sub_clients().iter().filter_map(Weak::upgrade) {
-                push_tree(&sub.root_window);
-            }
-        }
-        out
+        self.root_client.take().and_then(|weak| weak.upgrade())
     }
 }
 
-/// Fire all pending frame callbacks on a window's surface tree.
-pub(crate) fn fire_frame_callbacks(surface: &WlSurface) {
-    smithay::wayland::compositor::with_surface_tree_downward(
-        surface,
-        (),
-        |_, _, _| smithay::wayland::compositor::TraversalAction::DoChildren(()),
-        |_, states, _| {
-            let mut attrs = states
-                .cached_state
-                .get::<smithay::wayland::compositor::SurfaceAttributes>();
-            let now = crate::server_time();
-            for cb in attrs.current().frame_callbacks.drain(..) {
-                cb.done(now);
-            }
-        },
-        |_, _, _| true,
-    );
-}

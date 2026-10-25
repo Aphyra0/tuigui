@@ -1,61 +1,50 @@
-//! Input shapes: keys, buttons, scroll, and the pointer state as seen by the
-//! session.
+//! Input shapes: the vocabulary is `proto`'s, so a caller writes the same code
+//! on every platform; only the evdev mapping below is Linux's business.
 
-/// A keyboard key. Named keys cover the common navigation and editing set;
-/// [`Key::Char`] covers printable text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Key {
-    Char(char),
-    Return,
-    Tab,
-    Backspace,
-    Delete,
-    Escape,
-    Space,
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,
-    End,
-    PageUp,
-    PageDown,
+pub use proto::windowing::{Button, Input, Key, KeyState, ScrollDelta};
+
+/// The session's current pointer position and button state.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PointerState {
+    /// Pointer position in output pixels.
+    pub x: f64,
+    pub y: f64,
+    /// True if any button is currently held.
+    pub button_down: bool,
 }
 
-impl Key {
-    /// The evdev code (linux/input-event-codes.h values).
-    pub(crate) fn evdev_code(self) -> u32 {
-        const KEY_BACKSPACE: u32 = 14;
-        const KEY_TAB: u32 = 15;
-        const KEY_ENTER: u32 = 28;
-        const KEY_ESC: u32 = 1;
-        const KEY_SPACE: u32 = 57;
-        const KEY_DELETE: u32 = 111;
-        const KEY_HOME: u32 = 102;
-        const KEY_END: u32 = 106;
-        const KEY_PAGEUP: u32 = 104;
-        const KEY_PAGEDOWN: u32 = 109;
-        const KEY_LEFT: u32 = 105;
-        const KEY_RIGHT: u32 = 106;
-        const KEY_UP: u32 = 103;
-        const KEY_DOWN: u32 = 108;
-        match self {
-            Key::Char(c) => char_evdev(c),
-            Key::Return => KEY_ENTER,
-            Key::Tab => KEY_TAB,
-            Key::Backspace => KEY_BACKSPACE,
-            Key::Delete => KEY_DELETE,
-            Key::Escape => KEY_ESC,
-            Key::Space => KEY_SPACE,
-            Key::Left => KEY_LEFT,
-            Key::Right => KEY_RIGHT,
-            Key::Up => KEY_UP,
-            Key::Down => KEY_DOWN,
-            Key::Home => KEY_HOME,
-            Key::End => KEY_END,
-            Key::PageUp => KEY_PAGEUP,
-            Key::PageDown => KEY_PAGEDOWN,
-        }
+/// The evdev code (linux/input-event-codes.h values) for a key.
+pub(crate) fn key_evdev(key: Key) -> u32 {
+    const KEY_BACKSPACE: u32 = 14;
+    const KEY_TAB: u32 = 15;
+    const KEY_ENTER: u32 = 28;
+    const KEY_ESC: u32 = 1;
+    const KEY_SPACE: u32 = 57;
+    const KEY_DELETE: u32 = 111;
+    const KEY_HOME: u32 = 102;
+    const KEY_END: u32 = 106;
+    const KEY_PAGEUP: u32 = 104;
+    const KEY_PAGEDOWN: u32 = 109;
+    const KEY_LEFT: u32 = 105;
+    const KEY_RIGHT: u32 = 106;
+    const KEY_UP: u32 = 103;
+    const KEY_DOWN: u32 = 108;
+    match key {
+        Key::Char(c) => char_evdev(c),
+        Key::Return => KEY_ENTER,
+        Key::Tab => KEY_TAB,
+        Key::Backspace => KEY_BACKSPACE,
+        Key::Delete => KEY_DELETE,
+        Key::Escape => KEY_ESC,
+        Key::Space => KEY_SPACE,
+        Key::Left => KEY_LEFT,
+        Key::Right => KEY_RIGHT,
+        Key::Up => KEY_UP,
+        Key::Down => KEY_DOWN,
+        Key::Home => KEY_HOME,
+        Key::End => KEY_END,
+        Key::PageUp => KEY_PAGEUP,
+        Key::PageDown => KEY_PAGEDOWN,
     }
 }
 
@@ -85,54 +74,13 @@ fn char_evdev(c: char) -> u32 {
     }
 }
 
-/// A mouse button.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Button {
-    Left,
-    Right,
-    Middle,
-}
-
-impl Button {
-    pub(crate) fn evdev_code(self) -> u32 {
-        match self {
-            Button::Left => 0x110,   // BTN_LEFT
-            Button::Right => 0x111,  // BTN_RIGHT
-            Button::Middle => 0x112, // BTN_MIDDLE
-        }
+/// The evdev code for a pointer button.
+pub(crate) fn button_evdev(button: Button) -> u32 {
+    match button {
+        Button::Left => 0x110,    // BTN_LEFT
+        Button::Middle => 0x112,  // BTN_MIDDLE
+        Button::Right => 0x111,   // BTN_RIGHT
+        Button::Back => 0x113,    // BTN_SIDE
+        Button::Forward => 0x114, // BTN_EXTRA
     }
-}
-
-/// Keyboard key state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyState {
-    Pressed,
-    Released,
-}
-
-/// Scroll delta in discrete wheel steps (positive = down / right).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ScrollDelta {
-    pub vertical: i32,
-    pub horizontal: i32,
-}
-
-impl ScrollDelta {
-    pub fn vertical(steps: i32) -> Self {
-        ScrollDelta {
-            vertical: steps,
-            horizontal: 0,
-        }
-    }
-}
-
-/// The session's current pointer position and button state, queried via
-/// [`crate::WaylandServer::pointer_state`].
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct PointerState {
-    /// Pointer position in output pixels.
-    pub x: f64,
-    pub y: f64,
-    /// True if any button is currently held.
-    pub button_down: bool,
 }

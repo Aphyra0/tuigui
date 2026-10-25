@@ -5,9 +5,8 @@
 //! whose drawing is redirected onto `wl_surface`s that reach us like any
 //! other Wayland surface. Smithay turns almost the entire classic reparenting
 //! XWM job over to us: we must grant window mapping, keep the window
-//! configured to fill our single output, and — because this crate has a hard
-//! one-window policy — admit the first mapped window into the same slot that
-//! an xdg toplevel would otherwise take.
+//! configured to fill our single output, and admit a mapped window into the
+//! root client's window tree like an xdg toplevel would be.
 
 use std::os::unix::io::OwnedFd;
 
@@ -17,10 +16,14 @@ use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{ResizeEdge, Reorder, X11Surface, X11Wm, XwmHandler, XwmId};
 
+use crate::state::State;
 use crate::window::Window;
-use crate::State;
 
-impl XwmHandler for State {
+impl<C, W> XwmHandler for State<C, W>
+where
+    C: proto::Shared + Default,
+    W: proto::Shared + Default,
+{
     fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
         self.globals
             .x11_wm
@@ -33,9 +36,6 @@ impl XwmHandler for State {
         if window.is_override_redirect() {
             return;
         }
-        // Remember as the candidate for the one-window slot. The slot is only
-        // filled when the window maps and its wl_surface is known.
-        self.globals.pending_x11 = Some(window);
     }
 
     fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {
@@ -59,18 +59,31 @@ impl XwmHandler for State {
     fn unmapped_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
 
     fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        // Only drop the slot if the window actually being destroyed is the one
-        // we admitted. XWayland regularly creates and destroys helper windows
-        // (tooltips, override-redirect, transient bookkeeping) that share the
-        // same client; clearing the root for those would wipe the live capture
-        // surface mid-session.
-        let Some(surface) = window.wl_surface() else { return };
-        if self.root.as_ref().is_some_and(|root| root.surface == *surface) {
-            self.root = None;
-            self.globals.pending_x11 = None;
+        // Only drop the window we admitted. XWayland regularly creates and
+        // destroys helper windows (tooltips, override-redirect, transient
+        // bookkeeping) that share the same client; clearing the tree for those
+        // would wipe the live capture surface mid-session.
+        let Some(surface) = window.wl_surface() else {
+            return;
+        };
+        let Some(root) = self.root_client.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        let was_root = {
+            let mut tree = root.root_window.write().unwrap();
+            let was_root = tree
+                .as_ref()
+                .is_some_and(|t| t.surface.wl_surface == surface);
+            if was_root {
+                *tree = None;
+            }
+            was_root
+        };
+        if was_root {
+            self.root_client = None;
             tracing::debug!("x11: admitted window destroyed; dropping the root slot");
-        } else if let Some(root) = &mut self.root {
-            root.remove_surface(surface);
+        } else if let Some(tree) = root.root_window.write().unwrap().as_mut() {
+            tree.remove_surface(&surface);
         }
     }
 
@@ -125,7 +138,11 @@ impl XwmHandler for State {
     }
 }
 
-impl XWaylandShellHandler for State {
+impl<C, W> XWaylandShellHandler for State<C, W>
+where
+    C: proto::Shared + Default,
+    W: proto::Shared + Default,
+{
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
         &mut self.globals.xwayland_shell_state
     }
@@ -137,21 +154,46 @@ impl XWaylandShellHandler for State {
     }
 }
 
-impl State {
-    /// Admit an X11 client's surface into the one-window slot, if the slot is
-    /// free and the surface has an associated wl_surface to capture.
+impl<C, W> State<C, W>
+where
+    C: proto::Shared + Default,
+    W: proto::Shared + Default,
+{
+    /// Admit an X11 client's surface into the root client's window tree, as a
+    /// child when the tree already has a root window.
     pub(crate) fn admit_x11(&mut self, window: &X11Surface) {
-        if self.root.is_some() {
-            tracing::debug!("x11: window already admitted; ignoring extra");
-            return;
-        }
         let Some(surface) = window.wl_surface() else {
             // Not yet associated; `surface_associated` will call back.
             return;
         };
-        let win = Window::new(surface.clone(), self.server_size, ());
-        self.root = Some(win);
+        if self
+            .root_client
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .and_then(|root| {
+                root.root_window
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .map(|t| t.surface.wl_surface == surface)
+            })
+            .unwrap_or(false)
+        {
+            tracing::debug!("x11: window already admitted; ignoring extra");
+            return;
+        }
+        let win: Window<W> = Window::new(surface.clone(), Some(self.server_size), W::default());
+        let Some(root) = self.root_client.as_ref().and_then(std::sync::Weak::upgrade) else {
+            tracing::debug!("x11: no root client to admit into");
+            return;
+        };
+        let mut tree = root.root_window.write().unwrap();
+        match tree.as_mut() {
+            Some(tree) => tree.children.push(win),
+            None => *tree = Some(win),
+        }
+        drop(tree);
         self.output.enter(&surface);
-        tracing::info!("x11: admitted window into the one-window slot");
+        tracing::info!("x11: admitted window into the root client's tree");
     }
 }

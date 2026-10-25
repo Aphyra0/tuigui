@@ -22,49 +22,26 @@ mod error;
 mod handlers;
 mod inputs;
 mod state;
-mod surface;
 mod utils;
 mod window;
 
 pub use client::{RootClient, SubClient};
 pub use error::{CompError, Result};
-pub use inputs::{Button, Key, KeyState, PointerState, ScrollDelta};
-pub use window::{Input, Window};
+pub use inputs::{Button, Input, Key, KeyState, PointerState, ScrollDelta};
+pub use window::Window;
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use smithay::output::GlobalId;
+use smithay::reexports::wayland_server::backend::GlobalId;
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::{Display, ListeningSocket};
 
 use crate::client::StderrTail;
-use crate::state::{fire_frame_callbacks, State};
-
-/// A single captured frame.
-#[derive(Clone)]
-pub struct Frame {
-    /// Width in pixels.
-    pub width: u32,
-    /// Height in pixels.
-    pub height: u32,
-    /// RGBA8, row-major, top-left origin (`width * height * 4` bytes).
-    pub rgba: Vec<u8>,
-    /// Damaged regions since the previous capture, in pixel coordinates.
-    /// Empty means "unknown / treat everything as changed".
-    pub damage: Vec<crate::Rect>,
-}
-
-/// Axis-aligned pixel-space rectangle (mirrors the renderer's `Rect` shape
-/// without forcing a dependency the other direction).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rect {
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-}
+use crate::state::State;
 
 /// Everything the session needs, passed once, at `WaylandServer::new`.
 #[derive(Debug, Clone, Copy)]
@@ -98,7 +75,7 @@ pub(crate) fn server_time() -> u32 {
 }
 
 /// The headless Wayland session, owned by the caller and driven inline.
-pub struct WaylandServer<C = (), W = ()> {
+pub struct WaylandServer<C: proto::Shared = (), W: proto::Shared = ()> {
     /// The session state: the root client, its windows, the seat, the X11 side.
     state: State<C, W>,
     event_loop: EventLoop<'static, State<C, W>>,
@@ -116,7 +93,7 @@ pub struct WaylandServer<C = (), W = ()> {
     use_x11: bool,
 }
 
-impl<C, W> WaylandServer<C, W> {
+impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W> {
     /// Start the headless session: display, private socket, the single output,
     /// the seat, and (when asked) the XWayland server.
     #[tracing::instrument(name = "server.new", skip_all)]
@@ -125,6 +102,7 @@ impl<C, W> WaylandServer<C, W> {
     ) -> Result<Self, CompError>
     where
         C: Default,
+        W: Default,
     {
         // A private runtime dir, isolated from the caller's (Hyprland's): the
         // child's `XDG_RUNTIME_DIR` points here, so the only Wayland socket it
@@ -149,7 +127,7 @@ impl<C, W> WaylandServer<C, W> {
         let mut event_loop =
             EventLoop::try_new().map_err(|e| CompError::Server(e.to_string()))?;
         if options.use_x11 {
-            state.spawn_xwayland(&dh, event_loop.handle())?;
+            tracing::warn!("x11: XWayland is not wired up in this build; ignoring --x11");
         }
 
         Ok(WaylandServer {
@@ -279,7 +257,7 @@ impl<C, W> WaylandServer<C, W> {
 
         // Queued inputs dispatch here, against the window each queue came
         // from, so they land at a well-defined point in the protocol stream.
-        state.drain_inputs();
+        state.dispatch_inputs();
 
         event_loop
             .dispatch(Some(timeout), state)
@@ -290,20 +268,6 @@ impl<C, W> WaylandServer<C, W> {
         display
             .flush_clients()
             .map_err(|e| CompError::Server(e.to_string()))?;
-
-        // Frame callbacks fire one `done()` per turn, so the client animates
-        // as long as the caller steps. The extra dispatch sends those `done()`
-        // events out before the turn ends.
-        let surfaces = state.window_surfaces();
-        for surface in surfaces {
-            fire_frame_callbacks(&surface);
-            display
-                .dispatch_clients(state)
-                .map_err(|e| CompError::Server(e.to_string()))?;
-            display
-                .flush_clients()
-                .map_err(|e| CompError::Server(e.to_string()))?;
-        }
         Ok(())
     }
 
@@ -326,6 +290,7 @@ impl<C, W> WaylandServer<C, W> {
     pub fn spawn(&mut self, path: impl AsRef<Path>) -> Result<Arc<RootClient<C, W>>, CompError>
     where
         C: Default,
+        W: Default,
     {
         tracing::info!(path = %path.as_ref().display(), "spawning client");
 
@@ -503,11 +468,17 @@ impl<C, W> WaylandServer<C, W> {
                 .root_client
                 .as_ref()
                 .and_then(Weak::upgrade)
-                .and_then(|root| root.root_window().map(|w| w.capture()));
+                .and_then(|root| {
+                    root.root_window
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .map(|w| proto::windowing::Window::capture(&*w))
+                });
             match captured {
                 Some(Ok(_)) => return Ok(()),
                 // Transient: not committed yet. Keep stepping and polling.
-                Some(Err(CompError::NotReady)) | None => {
+                Some(Err(proto::windowing::Error::NotReady)) | None => {
                     // The child seems alive; give it a beat to finish starting.
                     if !Self::child_ok(path) {
                         // The child is gone, so its stderr pipe is at EOF and
@@ -541,7 +512,7 @@ impl<C, W> WaylandServer<C, W> {
                 Some(Err(e)) => {
                     let child = self.state.take_root_client();
                     drop(child);
-                    return Err(e);
+                    return Err(CompError::Capture(e.to_string()));
                 }
             }
         }
@@ -553,7 +524,7 @@ impl<C, W> WaylandServer<C, W> {
     }
 }
 
-impl<C, W> Drop for WaylandServer<C, W> {
+impl<C: proto::Shared, W: proto::Shared> Drop for WaylandServer<C, W> {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.runtime_dir);
     }

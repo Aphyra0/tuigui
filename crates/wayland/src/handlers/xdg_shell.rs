@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Weak};
 
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::Client;
 use smithay::utils::Serial;
@@ -14,8 +15,8 @@ use crate::window::Window;
 
 impl<C, W> XdgShellHandler for State<C, W>
 where
-    C: Send + Sync + 'static + Default,
-    W: Send + Sync + 'static + Default,
+    C: proto::Shared + Default,
+    W: proto::Shared + Default,
 {
     fn xdg_shell_state(&mut self) -> &mut smithay::wayland::shell::xdg::XdgShellState {
         &mut self.globals.xdg_shell_state
@@ -52,7 +53,7 @@ where
         if let Some(root) = client.get_data::<RootClient<C, W>>() {
             let was_root = {
                 let mut tree = root.root_window.write().unwrap();
-                let was_root = tree.as_ref().is_some_and(|t| t.surface == *surface.wl_surface());
+                let was_root = tree.as_ref().is_some_and(|t| t.surface.wl_surface == *surface.wl_surface());
                 if was_root {
                     *tree = None;
                 }
@@ -70,7 +71,7 @@ where
         } else if let Some(sub) = client.get_data::<SubClient<C, W>>() {
             let was_root = {
                 let mut tree = sub.root_window.write().unwrap();
-                let was_root = tree.as_ref().is_some_and(|t| t.surface == *surface.wl_surface());
+                let was_root = tree.as_ref().is_some_and(|t| t.surface.wl_surface == *surface.wl_surface());
                 if was_root {
                     *tree = None;
                 }
@@ -103,12 +104,34 @@ where
     }
 }
 
-/// The admission common to both client kinds: configure, activate, enter the
-/// output, and slot the window into the client's tree.
-fn admit<W: Default>(surface: &ToplevelSurface, size: (u32, u32), serial: Serial) -> Window<W> {
-    let win = Window::new(surface.wl_surface().clone(), size, W::default());
+/// The admission common to both client kinds: configure, activate, and build
+/// the window that will hold the surface.
+///
+/// `size` is the size to configure with. `None` proposes nothing: the client
+/// keeps whatever size it asked for, clamped to `server_size`, which is the
+/// most this session can ever show.
+fn admit<W: Default>(
+    surface: &ToplevelSurface,
+    size: Option<(u32, u32)>,
+    server_size: (u32, u32),
+    serial: Serial,
+) -> Window<W> {
+    let wanted = size.unwrap_or_else(|| {
+        // The client's own request, bounded by what we can display.
+        let req = surface.current_state().size;
+        match req {
+            Some(s) => (
+                (s.w.max(1) as u32).min(server_size.0),
+                (s.h.max(1) as u32).min(server_size.1),
+            ),
+            None => server_size,
+        }
+    });
+    let win = Window::new(surface.wl_surface().clone(), Some(wanted), W::default());
     surface.with_pending_state(|pending| {
-        pending.size = Some((size.0 as i32, size.1 as i32).into());
+        if size.is_some() {
+            pending.size = Some((wanted.0 as i32, wanted.1 as i32).into());
+        }
         pending.states.set(xdg_toplevel::State::Activated);
     });
     surface.send_configure();
@@ -117,14 +140,29 @@ fn admit<W: Default>(surface: &ToplevelSurface, size: (u32, u32), serial: Serial
 }
 
 /// Admit a toplevel into the root client's window tree.
-fn admit_into_root_client<C, W>(state: &mut State<C, W>, surface: ToplevelSurface) {
-    let size = state.server_size;
+///
+/// The first toplevel is the client's root window and fills the output; later
+/// ones are children and keep their own size.
+fn admit_into_root_client<C, W>(state: &mut State<C, W>, surface: ToplevelSurface)
+where
+    C: proto::Shared + Default,
+    W: proto::Shared + Default,
+{
+    let server_size = state.server_size;
     let serial = state.next_serial();
-    let win = admit(&surface, size, serial);
-
-    // The root client's first toplevel is its root window; later ones are
-    // the window tree's children.
     let root = state.root_client.as_ref().and_then(Weak::upgrade).expect("root data seen");
+
+    // Whether this lands in the empty root slot decides the configured size,
+    // so the tree is consulted before the window is built.
+    let has_root = root
+        .root_window
+        .read()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|t| t.surface.committed || t.surface.size.is_some());
+    let size = if has_root { None } else { Some(server_size) };
+    let win = admit(&surface, size, server_size, serial);
+
     let mut tree = root.root_window.write().unwrap();
     match tree.as_mut() {
         Some(tree) => tree.children.push(win),
@@ -132,21 +170,32 @@ fn admit_into_root_client<C, W>(state: &mut State<C, W>, surface: ToplevelSurfac
     }
     drop(tree);
 
-    // The window now "fills" the single output. Send `wl_surface.enter` so
-    // the client knows an output is attached and can start presenting.
-    // Clients like Firefox's WebRender withhold content until they see this.
+    // The window "fills" the output. Send `wl_surface.enter` so the client
+    // knows an output is attached and can start presenting. Clients like
+    // Firefox's WebRender withhold content until they see this.
     state.output.enter(surface.wl_surface());
     tracing::info!("compositor: admitted a window into the root client's tree");
 }
 
 /// Admit a toplevel into a sub-client's window tree.
-fn admit_into_sub<C, W>(state: &mut State<C, W>, surface: ToplevelSurface) {
-    let size = state.server_size;
+fn admit_into_sub<C, W>(state: &mut State<C, W>, surface: ToplevelSurface)
+where
+    C: proto::Shared + Default,
+    W: proto::Shared + Default,
+{
+    let server_size = state.server_size;
     let serial = state.next_serial();
-    let win = admit(&surface, size, serial);
-
     let client = surface.wl_surface().client().expect("seen above");
     let sub = client.get_data::<SubClient<C, W>>().expect("seen above");
+    let has_root = sub
+        .root_window
+        .read()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|t| t.surface.committed || t.surface.size.is_some());
+    let size = if has_root { None } else { Some(server_size) };
+    let win = admit(&surface, size, server_size, serial);
+
     let mut tree = sub.root_window.write().unwrap();
     match tree.as_mut() {
         Some(tree) => tree.children.push(win),

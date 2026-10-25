@@ -21,6 +21,7 @@ use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::reexports::wayland_server::protocol::wl_keyboard::WlKeyboard;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_pointer::WlPointer;
+use smithay::reexports::wayland_server::protocol::wl_region::WlRegion;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_shm::WlShm;
 use smithay::reexports::wayland_server::protocol::wl_shm_pool::WlShmPool;
@@ -30,8 +31,10 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::protocol::wl_touch::WlTouch;
 use smithay::reexports::wayland_protocols::xwayland::shell::v1::server::xwayland_shell_v1::XwaylandShellV1;
 use smithay::reexports::wayland_protocols::xwayland::shell::v1::server::xwayland_surface_v1::XwaylandSurfaceV1;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_popup::XdgPopup;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::XdgPositioner;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_surface::XdgSurface;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use smithay::reexports::wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use smithay::reexports::wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_v1::ZxdgOutputV1;
@@ -46,16 +49,18 @@ use smithay::wayland::selection::data_device::{
 };
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::seat::{
-    KeyboardUserData, PointerUserData, SeatGlobalData, SeatState as SeatHelperState,
-    SeatUserData, TouchUserData,
+    KeyboardUserData, PointerUserData, SeatGlobalData, SeatUserData, TouchUserData,
 };
 use smithay::wayland::shell::xdg::{
-    XdgPositionerUserData, XdgShellState, XdgSurfaceUserData, XdgWmBaseUserData,
+    XdgPositionerUserData, XdgShellState, XdgShellSurfaceUserData, XdgSurfaceUserData,
+    XdgWmBaseUserData,
 };
-use smithay::wayland::shm::{ShmBufferUserData, ShmHandler, ShmPoolUserData};
+use smithay::wayland::shm::{ShmBufferUserData, ShmHandler, ShmPoolUserData, ShmState};
 use smithay::wayland::xwayland_shell::{XWaylandShellState, XWaylandSurfaceUserData};
 
 use crate::state::State;
+use crate::utils::{forward, forward_global};
+use proto::Shared;
 
 // wl_compositor and its surfaces.
 forward_global!(WlCompositor: () => CompositorState);
@@ -71,6 +76,8 @@ forward!(smithay::reexports::wayland_server::protocol::wl_callback::WlCallback: 
 forward_global!(XdgWmBase: () => XdgShellState);
 forward!(XdgWmBase: XdgWmBaseUserData => XdgShellState);
 forward!(XdgSurface: XdgSurfaceUserData => XdgShellState);
+forward!(XdgToplevel: XdgShellSurfaceUserData => XdgShellState);
+forward!(XdgPopup: XdgShellSurfaceUserData => XdgShellState);
 forward!(XdgPositioner: XdgPositionerUserData => XdgShellState);
 
 // wl_shm: the only buffer path the MVP admits.
@@ -79,12 +86,14 @@ forward!(WlShm: () => ShmState);
 forward!(WlShmPool: ShmPoolUserData => ShmState);
 forward!(WlBuffer: ShmBufferUserData => ShmState);
 
-// The seat and its input resources.
-forward!(WlSeat: SeatUserData<Self> => SeatHelperState);
-forward_global!(WlSeat: SeatGlobalData<Self> => SeatHelperState);
-forward!(WlKeyboard: KeyboardUserData<Self> => SeatHelperState);
-forward!(WlPointer: PointerUserData<Self> => SeatHelperState);
-forward!(WlTouch: TouchUserData<Self> => SeatHelperState);
+// The seat and its input resources. `SeatState` is smithay's input-side
+// holder, which is what implements these dispatches (the `wayland::seat` one
+// is private).
+forward!(WlSeat: SeatUserData<Self> => smithay::input::SeatState<State<C, W>>);
+forward_global!(WlSeat: SeatGlobalData<Self> => smithay::input::SeatState<State<C, W>>);
+forward!(WlKeyboard: KeyboardUserData<Self> => smithay::input::SeatState<State<C, W>>);
+forward!(WlPointer: PointerUserData<Self> => smithay::input::SeatState<State<C, W>>);
+forward!(WlTouch: TouchUserData<Self> => smithay::input::SeatState<State<C, W>>);
 
 // Clipboard / drag-and-drop.
 forward_global!(WlDataDeviceManager: () => DataDeviceState);
@@ -105,13 +114,13 @@ forward!(XwaylandShellV1: () => XWaylandShellState);
 forward!(XwaylandSurfaceV1: XWaylandSurfaceUserData => XWaylandShellState);
 
 // The trivial handler hooks: registration, not policy.
-impl<C: Send + Sync + 'static + Default, W: Send + Sync + 'static + Default> BufferHandler
+impl<C: Shared + Default, W: Shared + Default> BufferHandler
     for State<C, W>
 {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
 
-impl<C: Send + Sync + 'static + Default, W: Send + Sync + 'static + Default> ShmHandler
+impl<C: Shared + Default, W: Shared + Default> ShmHandler
     for State<C, W>
 {
     fn shm_state(&self) -> &ShmState {
@@ -119,7 +128,7 @@ impl<C: Send + Sync + 'static + Default, W: Send + Sync + 'static + Default> Shm
     }
 }
 
-impl<C: Send + Sync + 'static + Default, W: Send + Sync + 'static + Default> OutputHandler
+impl<C: Shared + Default, W: Shared + Default> OutputHandler
     for State<C, W>
 {
 }
@@ -128,20 +137,20 @@ impl<C: Send + Sync + 'static + Default, W: Send + Sync + 'static + Default> Out
 // makes GTK apps (nautilus, etc.) actually open our Wayland display: GTK's
 // `_gdk_wayland_display_open` bails with "not using Wayland display" unless a
 // data device manager global (plus an xdg/zxdg shell) is present.
-impl<C: Send + Sync + 'static + Default, W: Send + Sync + 'static + Default> SelectionHandler
+impl<C: Shared + Default, W: Shared + Default> SelectionHandler
     for State<C, W>
 {
     type SelectionUserData = ();
 }
-impl<C: Send + Sync + 'static + Default, W: Send + Sync + 'static + Default> ClientDndGrabHandler
+impl<C: Shared + Default, W: Shared + Default> ClientDndGrabHandler
     for State<C, W>
 {
 }
-impl<C: Send + Sync + 'static + Default, W: Send + Sync + 'static + Default> ServerDndGrabHandler
+impl<C: Shared + Default, W: Shared + Default> ServerDndGrabHandler
     for State<C, W>
 {
 }
-impl<C: Send + Sync + 'static + Default, W: Send + Sync + 'static + Default> DataDeviceHandler
+impl<C: Shared + Default, W: Shared + Default> DataDeviceHandler
     for State<C, W>
 {
     fn data_device_state(&self) -> &DataDeviceState {

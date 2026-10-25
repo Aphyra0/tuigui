@@ -1,5 +1,4 @@
-//! Per-window bookkeeping: the window tree, committed buffers, damage, and
-//! the input mailbox.
+//! Per-window bookkeeping: the window tree and the toplevels it holds.
 //!
 //! The session keeps a **tree**: each client has a root window, and the
 //! toplevels its program spawns afterwards are that window's children.
@@ -11,117 +10,96 @@
 //! One struct, one owner: the session's state. Fields are `pub(crate)`; the
 //! derived getters and setters mark what is exposed beyond the crate.
 
-use std::sync::mpsc;
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use derive_getters::Getters;
 use derive_setters::Setters;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Rectangle};
 
-use crate::{Button, CompError, Frame, KeyState, Rect, ScrollDelta};
+use crate::inputs::Input;
+use crate::state::State;
+use crate::CompError;
 
-/// One queued input event, in compositor shapes: keycodes are evdev codes,
-/// positions are output pixels. What happens to a drained queue is decided
-/// later; today the window is only the mailbox.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Input {
-    Key { evdev: u32, state: KeyState },
-    MouseMove { x: f64, y: f64 },
-    Button { button: Button, down: bool },
-    Scroll { delta: ScrollDelta },
-}
-
-/// One admitted window: its surface, its latest committed contents, its
-/// damage, its input mailbox, and the toplevels its program spawned.
+/// One admitted window: its surface, its input mailbox, and the toplevels its
+/// program spawned.
 #[derive(Getters, Setters)]
 #[setters(generate = false)]
 pub struct Window<W = ()> {
-    /// The admitted surface (an xdg toplevel's, or an X11 window's wl_surface).
-    pub(crate) surface: WlSurface,
-    /// The client-facing window size (the session's resolution).
-    pub(crate) size: (u32, u32),
-    /// Set once this window committed a readable buffer at least once.
-    pub(crate) committed: bool,
-    /// The surface's own coordinate space == output space (scale 1, offset 0).
-    /// Set by the holder when compositing.
-    #[setters(generate, borrow_self)]
-    pub(crate) geometry: Rectangle<i32, Logical>,
-    /// Latest committed contents, owned by us, written on commit.
-    pub(crate) pixels: Mutex<Vec<u8>>,
-    /// Damage since the last capture (output pixel space).
-    pub(crate) damage: Mutex<Vec<Rect>>,
+    /// The admitted surface: buffer bookkeeping and the committed contents.
+    pub(crate) surface: Surface,
     /// Serial of the last configure sent (spawn waits for the first commit).
     pub(crate) last_configure_serial: Mutex<Option<u64>>,
     /// Toplevels this window's program spawned after being admitted. Detaching
     /// this window detaches its subtree with it.
     pub(crate) children: Vec<Window<W>>,
-    /// The input mailbox's push side, and the only deliberately cloneable
-    /// field: a handle pushes here without touching the window.
-    pub(crate) inputs: mpsc::Sender<Input>,
-    /// The mailbox's receiving side, drained by the session at the next step.
-    pub(crate) pending_inputs: mpsc::Receiver<Input>,
+    /// Input queued by the holder, drained by the session at the next step.
+    /// A plain queue behind a mutex rather than a channel: nothing waits on a
+    /// receiver, so a channel's single-consumer machinery only buys the type
+    /// `!Sync`.
+    pub(crate) inputs: Mutex<VecDeque<Input>>,
     /// Whatever the holder attaches: compositing metadata and the like.
     pub attached: W,
 }
 
+/// The admitted surface of a window: its `wl_surface`, the client-facing size,
+/// the commit state, and the contents its client last committed.
+#[derive(Getters)]
+pub(crate) struct Surface {
+    /// The admitted surface (an xdg toplevel's, or an X11 window's wl_surface).
+    pub(crate) wl_surface: WlSurface,
+    /// The client-facing window size (the session's resolution). `None` for a
+    /// root surface, which is configured rather than sized here.
+    pub(crate) size: Option<(u32, u32)>,
+    /// Set once this window committed a readable buffer at least once.
+    pub(crate) committed: bool,
+    /// Latest committed contents, owned by us, written on commit.
+    pub(crate) pixels: Mutex<Vec<u8>>,
+}
+
 impl<W> Window<W> {
-    pub fn new(surface: WlSurface, size: (u32, u32), attached: W) -> Self {
-        let (inputs, pending_inputs) = mpsc::channel();
+    pub fn new(surface: WlSurface, size: Option<(u32, u32)>, attached: W) -> Self {
         Window {
-            surface,
-            size,
-            committed: false,
-            geometry: Rectangle::from_size(smithay::utils::Size::from((
-                size.0 as i32,
-                size.1 as i32,
-            ))),
-            pixels: Mutex::new(Vec::new()),
-            damage: Mutex::new(Vec::new()),
+            surface: Surface {
+                wl_surface: surface,
+                size,
+                committed: false,
+                pixels: Mutex::new(Vec::new()),
+            },
             last_configure_serial: Mutex::new(None),
             children: Vec::new(),
-            inputs,
-            pending_inputs,
+            inputs: Mutex::new(VecDeque::new()),
             attached,
         }
     }
 
-    /// Push one input event onto this window's mailbox. Fails only when the
-    /// window is gone.
-    pub fn input(&self, input: Input) -> Result<(), CompError> {
-        self.inputs.send(input).map_err(|_| CompError::WindowGone)
-    }
-
-    /// The window's contents as RGBA8 + the damage since the last capture.
-    /// The session overlays the cursor before handing the frame out; this
-    /// method is the raw read.
-    #[tracing::instrument(name = "window.capture", skip(self))]
-    pub fn capture(&self) -> Result<Frame, CompError> {
-        let pixels = self.pixels.lock().unwrap().clone();
-        if pixels.is_empty() || !self.committed {
-            return Err(CompError::NotReady);
+    /// Dispatch this window's queued inputs, then its children's.
+    ///
+    /// The tree is walked shallow-to-deep; each window dispatches its own
+    /// mailbox against itself, so an input reaches the window it was queued for.
+    pub(crate) fn dispatch_inputs<C>(&self, state: &mut State<C, W>)
+    where
+        C: proto::Shared + Default,
+        W: proto::Shared + Default,
+    {
+        let inputs: Vec<Input> = self.inputs.lock().unwrap().drain(..).collect();
+        for input in inputs {
+            if let Err(e) = state.dispatch_input(self.surface.wl_surface(), input) {
+                tracing::debug!("a queued input did not dispatch: {e}");
+            }
         }
-        let damage = std::mem::take(&mut *self.damage.lock().unwrap());
-        Ok(Frame {
-            width: self.size.0,
-            height: self.size.1,
-            rgba: pixels,
-            damage,
-        })
-    }
-
-    /// Drain this window's input mailbox.
-    pub(crate) fn take_inputs(&self) -> Vec<Input> {
-        self.pending_inputs.try_iter().collect()
+        for child in &self.children {
+            child.dispatch_inputs(state);
+        }
     }
 
     /// The window whose surface is `surface`, or whose surface is the parent
     /// of it (a subsurface commit lands on the toplevel that owns the tree).
     pub(crate) fn commit_target(&mut self, surface: &WlSurface) -> Option<&mut Window<W>> {
-        let is_win = self.surface == *surface;
+        let is_win = self.surface.wl_surface == *surface;
         let is_kid = !is_win
             && smithay::wayland::compositor::get_parent(surface)
-                .map(|p| p == self.surface)
+                .map(|p| p == self.surface.wl_surface)
                 .unwrap_or(false);
         if is_win || is_kid {
             return Some(self);
@@ -138,19 +116,53 @@ impl<W> Window<W> {
     /// child). Returns whether something was removed.
     pub(crate) fn remove_surface(&mut self, surface: &WlSurface) -> bool {
         let before = self.children.len();
-        self.children.retain(|c| c.surface != *surface);
+        self.children
+            .retain(|c| c.surface.wl_surface != *surface);
         if self.children.len() != before {
             return true;
         }
         self.children.iter_mut().any(|c| c.remove_surface(surface))
     }
+}
 
-    /// Whether the pointer is inside `self.geometry` at `point`.
-    pub fn contains(&self, point: Point<f64, Logical>) -> bool {
-        let g = &self.geometry;
-        point.x >= g.loc.x as f64
-            && point.x < (g.loc.x + g.size.w) as f64
-            && point.y >= g.loc.y as f64
-            && point.y < (g.loc.y + g.size.h) as f64
+impl<W: proto::Shared> proto::windowing::Window<W> for Window<W> {
+    fn input(&self, input: Input) -> Result<(), proto::windowing::Error> {
+        // Cannot fail: appending never errors, unlike a channel with no
+        // receiver. The queue is drained by the session's next step.
+        self.inputs.lock().unwrap().push_back(input);
+        Ok(())
+    }
+
+    fn capture(&self) -> Result<Vec<u8>, proto::windowing::Error> {
+        if !self.surface.committed {
+            return Err(proto::windowing::Error::NotReady);
+        }
+        let pixels = self.surface.pixels.lock().unwrap().clone();
+        if pixels.is_empty() {
+            return Err(proto::windowing::Error::NotReady);
+        }
+        // The frame callbacks fire here, with the read: taking the pixels is
+        // the point where this window's frame is consumed, so it is the point
+        // where the client may draw the next one. `done` is back-pressure, not
+        // a presentation promise, and the serial caller loop is what throttles
+        // it (nothing else can read until this call returns).
+        //
+        // NOTE: if the caller ever overlaps encoding with reading, this fires a
+        // frame too early and the client runs one encode period ahead. Move it
+        // to the presentation point (or gate it on the encode queue being
+        // empty) at that point.
+        crate::utils::fire_frame_callbacks(&self.surface.wl_surface);
+        Ok(pixels)
+    }
+
+    fn with_attached(&self, f: &mut dyn FnMut(&W)) {
+        f(&self.attached);
+    }
+
+    fn with_children(&self, f: &mut dyn FnMut(&dyn proto::windowing::Window<W>)) {
+        for child in &self.children {
+            f(child);
+        }
     }
 }
+

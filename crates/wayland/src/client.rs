@@ -10,29 +10,33 @@
 //! the `Arc`; the session and the holder keep `Weak`s. `attached` is where
 //! the holder parks its own data.
 //!
-//! The unsafe `Sync` impls are honest for this crate: the session drives
-//! everything from one thread, so the `Arc`'s other holders never touch the
-//! record concurrently.
+//! No `unsafe` is involved in the sharing smithay requires: every field behind
+//! the generics is natively `Send + Sync` (locks, not channels), so `ClientData`
+//! is satisfied by the compiler's own analysis rather than by a promise.
+
+mod root_client;
+mod sub_client;
+
+pub use root_client::RootClient;
+pub use sub_client::SubClient;
 
 use std::os::unix::net::UnixStream;
-use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 
-use derive_getters::Getters;
-use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
-use smithay::reexports::wayland_server::DisplayHandle;
+use proto::windowing::Client as _;
 use smithay::wayland::compositor::CompositorClientState;
 
 use crate::error::CompError;
 use crate::state::State;
-use crate::utils::peer_pid;
-use crate::window::Window;
+use crate::utils::{peer_pid, proc_parent};
 
 /// Synchronized tail of a client's stderr (most recent bytes). Populated by a
 /// dedicated reader thread so we never block on the pipe; read through
 /// [`RootClient::stderr`] for troubleshooting headless clients that refuse
 /// our minimal session (GTK/Qt print which Wayland interfaces they need).
+/// Cheap to clone: a handle to one shared tail.
+#[derive(Clone)]
 pub struct StderrTail(Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl StderrTail {
@@ -56,118 +60,16 @@ impl StderrTail {
 /// a chatty client can't grow memory without limit.
 const STDERR_TAIL_CAP: usize = 32 * 1024;
 
-/// The root client: the process the session was built around.
-#[derive(Getters)]
-pub struct RootClient<C = (), W = ()> {
-    /// The process. Killed when the root client goes away.
-    #[getter(skip)]
-    child: Child,
-    /// The process's stderr tail, for diagnostics.
-    stderr: StderrTail,
-    /// The root window, and the toplevels its program spawned afterwards.
-    root_window: RwLock<Option<Window<W>>>,
-    /// Helper processes that connected as their own wayland clients.
-    sub_clients: RwLock<Vec<Weak<SubClient<C, W>>>>,
-    /// Set when this client's connection was attached to it.
-    connected: AtomicBool,
-    /// The per-connection compositor state smithay reads back.
-    #[getter(skip)]
-    compositor_state: CompositorClientState,
-    /// The holder's own data.
-    attached: RwLock<C>,
-}
-
-impl<C: Default, W> RootClient<C, W> {
-    pub(crate) fn new(child: Child, stderr: StderrTail) -> Self {        RootClient {
-            child,
-            stderr,
-            root_window: RwLock::new(None),
-            sub_clients: RwLock::new(Vec::new()),
-            connected: AtomicBool::new(false),
-            compositor_state: CompositorClientState::default(),
-            attached: RwLock::new(C::default()),
-        }
-    }
-
-    /// Whether the client process is still running.
-    ///
-    /// The child handle cannot be taken through a shared reference, so the
-    /// process is checked by PID: `WNOHANG` does not block, `0` means still
-    /// running, anything else means exited (or already reaped). A child
-    /// reaped here makes the final `wait` on drop return `ECHILD`, which is
-    /// ignored there.
-    pub fn is_running(&self) -> bool {
-        match unsafe {
-            libc::waitpid(self.child.id() as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG)
-        } {
-            0 => true,
-            _ => false,
-        }
-    }
-}
-
-impl<C, W> Drop for RootClient<C, W> {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-// SAFETY: the session drives everything from one thread; the Arc's other
-// holders (smithay's connection slot) never touch the record concurrently,
-// and the holder's access goes through the session.
-unsafe impl<C, W> Sync for RootClient<C, W> {}
-
-impl<C, W> ClientData for RootClient<C, W> {
-    fn initialized(&self, _id: ClientId) {}
-    fn disconnected(&self, _id: ClientId, _reason: DisconnectReason) {}
-}
-
-/// A helper process the root spawned, which connected as its own wayland
-/// client. Observe-only: the session does not own its process, so it can only
-/// be waited on and disconnected at the protocol level.
-#[derive(Getters)]
-pub struct SubClient<C = (), W = ()> {
-    /// The wayland peer's process id. The root client's pid lives in its
-    /// child handle instead.
-    pid: u32,
-    /// The sub-client's root window, and the toplevels its program spawned.
-    root_window: RwLock<Option<Window<W>>>,
-    /// Helper processes this sub-client itself spawned, as their own clients.
-    sub_clients: RwLock<Vec<Weak<SubClient<C, W>>>>,
-    /// The per-connection compositor state smithay reads back.
-    #[getter(skip)]
-    compositor_state: CompositorClientState,
-    /// The holder's own data.
-    attached: RwLock<C>,
-}
-
-impl<C: Default, W> SubClient<C, W> {
-    pub(crate) fn new(pid: u32) -> Self {
-        SubClient {
-            pid,
-            root_window: RwLock::new(None),
-            sub_clients: RwLock::new(Vec::new()),
-            compositor_state: CompositorClientState::default(),
-            attached: RwLock::new(C::default()),
-        }
-    }
-}
-
-// Same justification as `RootClient`'s.
-unsafe impl<C, W> Sync for SubClient<C, W> {}
-
-impl<C, W> ClientData for SubClient<C, W> {
-    fn initialized(&self, _id: ClientId) {}
-    fn disconnected(&self, _id: ClientId, _reason: DisconnectReason) {}
-}
-
 /// The per-connection compositor state, resolved whichever kind of client the
 /// connection belongs to. XWayland's client carries `XWaylandClientData`
 /// instead, which smithay owns.
 pub(crate) fn compositor_client_state<C, W>(
     client: &smithay::reexports::wayland_server::Client,
-) -> Option<&CompositorClientState> {
+) -> Option<&CompositorClientState>
+where
+    C: proto::Shared,
+    W: proto::Shared,
+{
     if let Some(root) = client.get_data::<RootClient<C, W>>() {
         return Some(&root.compositor_state);
     }
@@ -177,7 +79,11 @@ pub(crate) fn compositor_client_state<C, W>(
     None
 }
 
-impl<C: Default, W> State<C, W> {
+impl<C, W> State<C, W>
+where
+    C: proto::Shared + Default,
+    W: proto::Shared + Default,
+{
     /// Admit a newly connected wayland client.
     ///
     /// The runtime dir is private, so a connection can only come from a process
@@ -214,35 +120,28 @@ impl<C: Default, W> State<C, W> {
         let mut ids = Vec::new();
         handle.with_all_clients(|id| ids.push(id));
         for id in ids {
-            let data = match handle.get_client_data(id) {
-                Ok(data) => data,
-                Err(_) => continue,
+            let data = handle
+                .get_client_data(id)
+                .map_err(|e| CompError::Server(e.to_string()))?;
+            // Helpers connect most often, so test them first. Each arm yields
+            // the record's pid and its children list; the pid check happens
+            // once, right here.
+            let (found, children) = if let Some(sub_c) = data.downcast_ref::<SubClient<C, W>>() {
+                (sub_c.pid, &sub_c.sub_clients)
+            } else if let Some(root_c) = data.downcast_ref::<RootClient<C, W>>() {
+                (root_c.pid(), &root_c.sub_clients)
+            } else {
+                continue;
             };
-            if let Some(root_c) = data.downcast_ref::<RootClient<C, W>>() {
-                if root_c.child.id() != parent {
-                    continue;
-                }
-                let sub = Arc::new(SubClient::new(pid));
-                root_c.sub_clients
-                    .write()
-                    .unwrap()
-                    .push(Arc::downgrade(&sub));
-                self.attach_sub_client(stream, sub)?;
-                return Ok(());
+            if found != parent {
+                continue;
             }
-            if let Some(parent_sub) = data.downcast_ref::<SubClient<C, W>>() {
-                if parent_sub.pid != parent {
-                    continue;
-                }
-                let sub = Arc::new(SubClient::new(pid));
-                parent_sub
-                    .sub_clients
-                    .write()
-                    .unwrap()
-                    .push(Arc::downgrade(&sub));
-                self.attach_sub_client(stream, sub)?;
-                return Ok(());
-            }
+            let sub = Arc::new(SubClient::new(pid));
+            children.write().unwrap().push(Arc::downgrade(&sub));
+            self.display_handle
+                .insert_client(stream, sub)
+                .map_err(|e| CompError::Server(format!("insert_client: {e}")))?;
+            return Ok(());
         }
 
         eprintln!(
@@ -250,25 +149,4 @@ impl<C: Default, W> State<C, W> {
         );
         Ok(())
     }
-
-    fn attach_sub_client(
-        &self,
-        stream: UnixStream,
-        sub: Arc<SubClient<C, W>>,
-    ) -> Result<(), CompError> {
-        self.display_handle
-            .insert_client(stream, sub)
-            .map_err(|e| CompError::Server(format!("insert_client: {e}")))
-    }
-}
-
-/// The parent of a pid, read from `/proc`. Linux-only by the crate gate.
-fn proc_parent(pid: u32) -> Option<u32> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    let line = status.lines().find(|l| l.starts_with("PPid:"))?;
-    let raw = match line["PPid:".len()..].trim().parse::<u32>() {
-        Ok(raw) => raw,
-        Err(_) => return None,
-    };
-    Some(raw)
 }

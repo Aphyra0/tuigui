@@ -8,6 +8,7 @@ members = [
     "crates/wayland",
     "crates/termputs",
     "crates/codecs",
+    "crates/proto",
 ]
 
 [workspace.package]
@@ -43,6 +44,7 @@ crossterm = { version = "0.28", default-features = false, features = ["events"] 
 derive_deref = "1.1"
 derive-getters = "0.5"
 derive_setters = "0.1"
+sysinfo = "0.37"
 smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend", "renderer_pixman", "desktop", "xwayland"] }
 wayland-protocols = { version = "0.32", features = ["client"] }
 tracing = "0.1"
@@ -93,6 +95,7 @@ tui = { path = "crates/tui" }
 gui = { path = "crates/gui" }
 wayland = { path = "crates/wayland" }
 termputs = { path = "crates/termputs" }
+proto = { path = "crates/proto" }
 
 [package]
 name = "tuigui"
