@@ -13,10 +13,7 @@ use crate::inputs::{Button, Input, KeyState, ScrollDelta, button_evdev};
 use crate::state::State;
 use crate::CompError;
 
-impl<C, W> State<C, W>
-where
-    C: proto::Shared + Default,
-    W: proto::Shared + Default,
+impl State
 {
     /// Dispatch every queued input onto the seat.
     ///
@@ -197,7 +194,7 @@ where
         let client = focus
             .client()
             .ok_or_else(|| CompError::Server("an input target has no client".into()))?;
-        let compositor = crate::client::compositor_client_state::<C, W>(&client)
+        let compositor = crate::client::compositor_client_state(&client)
             .ok_or_else(|| CompError::Server("an input target has no compositor state".into()))?;
         let scale = compositor.client_scale() * self.output_scale;
         if scale.is_finite() && scale > 0.0 {

@@ -10,7 +10,6 @@ name = "wayland-smoke"
 path = "src/bin/wayland-smoke.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-proto = { workspace = true }
 wire = { workspace = true }
 smithay = { workspace = true }
 ratatui = { workspace = true }

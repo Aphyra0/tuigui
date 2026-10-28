@@ -8,7 +8,6 @@ members = [
     "crates/wayland",
     "crates/termputs",
     "crates/codecs",
-    "crates/proto",
     "crates/cell_map",
 ]
 
@@ -111,7 +110,6 @@ tui = { path = "crates/tui" }
 gui = { path = "crates/gui" }
 wayland = { path = "crates/wayland" }
 termputs = { path = "crates/termputs" }
-proto = { path = "crates/proto" }
 
 [package]
 name = "tuigui"

@@ -1,287 +1,211 @@
 //! Input: what an event delivered to the pane becomes for a window.
 //!
-//! The mouse is the compositor's first: it tracks the pointer, and a press on
-//! a window's bar — the gray line under it — becomes a drag of that window,
-//! an offset the drawing applies. Everything else is forwarded to the root
-//! window, the way a seat forwards to the focused surface.
+//! The compositor owns the mouse: it walks the stack from the front, finds the
+//! window a cell belongs to, and either moves or resizes it (the bar, a
+//! border) or forwards the event to it, window-local. A key belongs to the
+//! focused window and nothing else.
 
-use proto::windowing::{self, WindowingServer};
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::Rect;
 
-use super::{ClientData, Compositor, WindowState};
+use super::windowing::{Button, Input, Key, KeyState, ScrollDelta, StatefulWindow, WindowingServer};
+use super::{area_of, Compositor};
 
 /// The pointer, as the compositor sees it between frames.
-///
-/// Pure compositor work: where the pointer is, what it holds, and what it
-/// drags. Dragging a window's bar moves the window on the pane as an offset
-/// of the drawing; the window itself is never touched.
 #[derive(Default)]
 pub struct Pointer {
     /// Where the pointer is, in pane cells.
     pub(crate) position: (u16, u16),
     /// The button held, if one is.
-    pub(crate) held: Option<termina::event::MouseButton>,
-    /// The drag under way: the grabbed window's place, where the pointer was
-    /// when the bar was pressed, and what the window had already been pulled
-    /// before this grab.
-    pub(crate) drag: Option<(WindowState, (u16, u16), (i16, i16))>,
-    /// The pulls that ended: each window's place, and how far it now sits
-    /// from it.
-    pub(crate) pulled: Vec<(WindowState, (i16, i16))>,
+    pub(crate) held: Option<Button>,
+    /// The grab: what the press started, and where the pointer was then.
+    pub(crate) grab: Option<Grab>,
 }
 
-impl Pointer {
-    /// How far the drag has pulled its window: what the window had been
-    /// pulled before this grab, plus where the pointer has moved since.
-    pub(crate) fn offset(&self) -> (i16, i16) {
-        match self.drag {
-            Some(drag) => self.offset_of(drag),
-            None => (0, 0),
-        }
-    }
-
-    /// The same, for one drag tuple: its parked pull, plus where the pointer
-    /// has moved since its grab.
-    pub(crate) fn offset_of(&self, drag: (WindowState, (u16, u16), (i16, i16))) -> (i16, i16) {
-        let (_, origin, base) = drag;
-        (
-            (base.0 as i32 + self.position.0 as i32 - origin.0 as i32) as i16,
-            (base.1 as i32 + self.position.1 as i32 - origin.1 as i32) as i16,
-        )
-    }
-
-    /// The pull parked on a place, removed: the start of a new drag of it.
-    pub(crate) fn take_pulled(&mut self, place: &WindowState) -> (i16, i16) {
-        match self.pulled.iter().position(|(pulled, _)| pulled == place) {
-            Some(index) => self.pulled.remove(index).1,
-            None => (0, 0),
-        }
-    }
+/// What a press on a window started.
+pub(crate) struct Grab {
+    /// The window it was pressed on.
+    pub(crate) window: std::sync::Arc<dyn StatefulWindow>,
+    /// The window's state when the press happened.
+    pub(crate) state: super::WindowState,
+    /// Where the pointer was when the press happened.
+    pub(crate) origin: (u16, u16),
+    /// Whether the press was on the window's edge rather than its bar.
+    pub(crate) edge: bool,
 }
 
 /// Hand one terminal event to the pane.
-pub fn input<T: WindowingServer<ClientData, WindowState>>(
+pub fn input<T: WindowingServer>(
     compositor: &mut Compositor<T>,
     event: &termina::Event,
 ) -> std::io::Result<()> {
-    if let termina::Event::Mouse(mouse) = event {
-        // The pointer first: where it is, what it holds.
-        let pointer = &mut compositor.pointer;
-        pointer.position = (mouse.column, mouse.row);
-        pointer.held = match mouse.kind {
-            termina::event::MouseEventKind::Down(button)
-            | termina::event::MouseEventKind::Drag(button) => Some(button),
-            _ => None,
-        };
+    match event {
+        termina::Event::Mouse(mouse) => mouse_input(compositor, mouse),
+        termina::Event::Key(key) => key_input(compositor, key),
+        _ => Ok(()),
+    }
+}
 
-        // A press on a window's bar starts a drag of that window: compositor
-        // work, so the press is not forwarded.
-        if matches!(mouse.kind, termina::event::MouseEventKind::Down(_)) {
-            let mut found = None;
-            if let Some(client) = compositor.windowing.root_client() {
-                let mut outcome = Ok(());
-                visit_bar(
-                    client,
-                    Rect::default(),
-                    true,
-                    Position::new(mouse.column, mouse.row),
-                    &pointer.pulled,
-                    &mut found,
-                    &mut outcome,
-                );
-                outcome?;
-            }
-            if let Some(place) = found {
-                let base = pointer.take_pulled(&place);
-                pointer.drag = Some((place, (mouse.column, mouse.row), base));
+/// The mouse: what the pointer is doing, and the window it is doing it to.
+fn mouse_input<T: WindowingServer>(
+    compositor: &mut Compositor<T>,
+    mouse: &termina::event::MouseEvent,
+) -> std::io::Result<()> {
+    use termina::event::MouseEventKind;
+
+    compositor.pointer.position = (mouse.column, mouse.row);
+    let pane = compositor.last_pane();
+
+    match mouse.kind {
+        // A press grabs: the front-most window under the pointer, if any.
+        MouseEventKind::Down(button) => {
+            compositor.pointer.held = Some(from_button(button));
+            let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+            if let Some((index, window)) = compositor.front_window_at(position, pane) {
+                let area = area_of(window.as_ref(), pane);
+                let inner = inner_of(area);
+                let edge = area.contains(position) && !inner.contains(position);
+                compositor.pointer.grab = Some(super::inputs::Grab {
+                    window: window.clone(),
+                    state: window.state(),
+                    origin: (mouse.column, mouse.row),
+                    edge,
+                });
+                compositor.raise(index);
+                compositor.focused = Some(std::sync::Arc::downgrade(&window));
                 return Ok(());
             }
         }
-
-        // Motion while dragging is the drag: the drawing applies the offset,
-        // and nothing is forwarded.
-        if matches!(
-            mouse.kind,
-            termina::event::MouseEventKind::Drag(_) | termina::event::MouseEventKind::Moved
-        ) && pointer.drag.is_some()
-        {
+        // A drag is the grab: the window moves by its bar, or resizes by its
+        // edge. Nothing is forwarded while it happens.
+        MouseEventKind::Drag(_) | MouseEventKind::Moved => {
+            if compositor.pointer.grab.is_some() {
+                return Ok(());
+            }
+            if let Some(window) = compositor.focused_window() {
+                let area = area_of(window.as_ref(), pane);
+                let local = local_of(mouse, area);
+                window
+                    .input(Input::MouseMove {
+                        x: local.0,
+                        y: local.1,
+                        held: compositor.pointer.held,
+                    })
+                    .map_err(std::io::Error::other)?;
+            }
             return Ok(());
         }
-
-        // A release ends the drag, unforwarded — and the pull stays: the
-        // window keeps where it was dragged to.
-        if matches!(mouse.kind, termina::event::MouseEventKind::Up(_)) {
-            if let Some((place, origin, base)) = pointer.drag.take() {
-                let pull = pointer.offset_of((place, origin, base));
-                pointer.pulled.push((place, pull));
+        MouseEventKind::Up(_) => {
+            compositor.pointer.held = None;
+            if compositor.pointer.grab.take().is_some() {
                 return Ok(());
             }
+            if let Some(window) = compositor.focused_window() {
+                window
+                    .input(Input::Button {
+                        button: from_button(match mouse.kind {
+                            MouseEventKind::Up(button) => button,
+                            _ => unreachable!("matched above"),
+                        }),
+                        down: false,
+                    })
+                    .map_err(std::io::Error::other)?;
+            }
+            return Ok(());
+        }
+        MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollDown
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => {
+            let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+            if let Some((_, window)) = compositor.front_window_at(position, pane) {
+                let area = area_of(window.as_ref(), pane);
+                let delta = match mouse.kind {
+                    MouseEventKind::ScrollUp => ScrollDelta { vertical: -1, horizontal: 0 },
+                    MouseEventKind::ScrollDown => ScrollDelta { vertical: 1, horizontal: 0 },
+                    MouseEventKind::ScrollLeft => ScrollDelta { vertical: 0, horizontal: -1 },
+                    _ => ScrollDelta { vertical: 0, horizontal: 1 },
+                };
+                window
+                    .input(Input::Scroll { delta })
+                    .map_err(std::io::Error::other)?;
+                let _ = area;
+            }
+            return Ok(());
         }
     }
 
-    let Some(client) = compositor.windowing.root_client() else {
+    // A press that landed on no window is the pane's own: nothing to do.
+    Ok(())
+}
+
+/// A key belongs to the focused window, or to the root until something is
+/// focused: the pane is the program, and a key reaches the program first.
+fn key_input<T: WindowingServer>(
+    compositor: &mut Compositor<T>,
+    key: &termina::event::KeyEvent,
+) -> std::io::Result<()> {
+    let Some(code) = from_key(key.code) else {
         return Ok(());
     };
-    let Some(input) = proto_input(event) else {
+    let Some(window) = compositor
+        .focused_window()
+        .or_else(|| compositor.root_window())
+    else {
         return Ok(());
     };
-    let mut delivered = Ok(());
-    client.with_window(&mut |window| {
-        if delivered.is_ok() {
-            delivered = window.input(input).map_err(std::io::Error::other);
-        }
-    });
-    delivered.map(|_| ())
-}
-
-/// The window whose bar the pointer is on, the front one when they overlap,
-/// then its helper clients' — each at the same place, the way the drawing
-/// walks them.
-fn visit_bar(
-    client: &dyn windowing::Client<ClientData, WindowState>,
-    base: Rect,
-    root: bool,
-    pointer: Position,
-    pulled: &[(WindowState, (i16, i16))],
-    found: &mut Option<WindowState>,
-    outcome: &mut std::io::Result<()>,
-) {
-    client.with_window(&mut |window| {
-        if outcome.is_ok() && found.is_none() {
-            *outcome = walk_bar(window, base, root, pointer, pulled, found).map(|_| ());
-        }
-    });
-    client.with_children(&mut |child| {
-        if outcome.is_ok() && found.is_none() {
-            visit_bar(child, base, false, pointer, pulled, found, outcome);
-        }
-    });
-}
-
-/// One window: its bar is the row under it, when there is room for one.
-/// Children first, so a child's bar wins over the parent's.
-fn walk_bar(
-    window: &dyn windowing::Window<WindowState>,
-    base: Rect,
-    root: bool,
-    pointer: Position,
-    pulled: &[(WindowState, (i16, i16))],
-    found: &mut Option<WindowState>,
-) -> std::io::Result<bool> {
-    let mut place = WindowState::default();
-    window.with_attached(&mut |state| place = *state);
-    // The window sits where its parked pull has left it, if one has.
-    let pull = match pulled.iter().find(|(grabbed, _)| *grabbed == place) {
-        Some((_, pull)) => *pull,
-        None => (0, 0),
-    };
-    let area = Rect {
-        x: (base.x as i32 + place.position.0 as i32 + pull.0 as i32).max(0) as u16,
-        y: (base.y as i32 + place.position.1 as i32 + pull.1 as i32).max(0) as u16,
-        width: place.size.0.max(1),
-        height: place.size.1.max(1),
-    };
-    let mut child_hit = false;
-    let mut failure = Ok(());
-    window.with_children(&mut |child| {
-        match walk_bar(child, area, false, pointer, pulled, found) {
-            Ok(hit) => child_hit |= hit,
-            Err(e) => failure = Err(e),
-        }
-    });
-    failure?;
-    if child_hit {
-        return Ok(true);
-    }
-    let hit = !root
-        && area.bottom() < base.bottom()
-        && pointer.y == area.bottom()
-        && pointer.x >= area.x
-        && pointer.x < area.right();
-    if hit {
-        *found = Some(place);
-    }
-    Ok(hit)
-}
-
-/// One terminal event, as the seat names it. What is not a key, a button, a
-/// move or a wheel step — protocol responses, focus, paste — is not input a
-/// window takes, and is dropped.
-fn proto_input(event: &termina::Event) -> Option<windowing::Input> {
-    match event {
-        termina::Event::Key(key) => Some(windowing::Input::Key {
-            key: proto_key(key.code)?,
+    window
+        .input(Input::Key {
+            key: code,
             state: match key.kind {
-                termina::event::KeyEventKind::Release => windowing::KeyState::Released,
-                _ => windowing::KeyState::Pressed,
+                termina::event::KeyEventKind::Release => KeyState::Released,
+                _ => KeyState::Pressed,
             },
-        }),
-        termina::Event::Mouse(mouse) => Some(
-            match mouse.kind {
-                termina::event::MouseEventKind::Down(button) => windowing::Input::Button {
-                    button: proto_button(button),
-                    down: true,
-                },
-                termina::event::MouseEventKind::Up(button) => windowing::Input::Button {
-                    button: proto_button(button),
-                    down: false,
-                },
-                termina::event::MouseEventKind::Moved | termina::event::MouseEventKind::Drag(_) => {
-                    windowing::Input::MouseMove {
-                        x: mouse.column as f64,
-                        y: mouse.row as f64,
-                        held: None,
-                    }
-                }
-                termina::event::MouseEventKind::ScrollDown => wheel(0, 1),
-                termina::event::MouseEventKind::ScrollUp => wheel(0, -1),
-                termina::event::MouseEventKind::ScrollLeft => wheel(-1, 0),
-                termina::event::MouseEventKind::ScrollRight => wheel(1, 0),
-            },
-        ),
-        _ => None,
-    }
+        })
+        .map_err(std::io::Error::other)
 }
 
-/// A termina button, as the seat names it.
-fn proto_button(button: termina::event::MouseButton) -> windowing::Button {
+/// A window's content area: what the frame leaves.
+pub fn inner_of(area: Rect) -> Rect {
+    ratatui::widgets::Block::bordered().inner(area)
+}
+
+/// Where a pointer position is inside a window, in its own cells.
+fn local_of(mouse: &termina::event::MouseEvent, area: Rect) -> (f64, f64) {
+    (
+        mouse.column as f64 - area.x as f64,
+        mouse.row as f64 - area.y as f64,
+    )
+}
+
+/// A termina button, as the session names it.
+fn from_button(button: termina::event::MouseButton) -> Button {
     use termina::event::MouseButton;
     match button {
-        MouseButton::Left => windowing::Button::Left,
-        MouseButton::Middle => windowing::Button::Middle,
-        MouseButton::Right => windowing::Button::Right,
+        MouseButton::Left => Button::Left,
+        MouseButton::Middle => Button::Middle,
+        MouseButton::Right => Button::Right,
     }
 }
 
-/// One wheel step.
-fn wheel(horizontal: i32, vertical: i32) -> windowing::Input {
-    windowing::Input::Scroll {
-        delta: windowing::ScrollDelta {
-            vertical,
-            horizontal,
-        },
-    }
-}
-
-/// A termina key, as the session's seat names it. Unnamed keys are skipped.
-fn proto_key(code: termina::event::KeyCode) -> Option<windowing::Key> {
+/// A termina key, as the session names it. Unnamed keys are skipped.
+fn from_key(code: termina::event::KeyCode) -> Option<Key> {
     use termina::event::KeyCode;
     Some(match code {
-        KeyCode::Char(' ') => windowing::Key::Space,
-        KeyCode::Char(c) => windowing::Key::Char(c),
-        KeyCode::Enter => windowing::Key::Return,
-        KeyCode::Tab => windowing::Key::Tab,
-        KeyCode::Backspace => windowing::Key::Backspace,
-        KeyCode::Delete => windowing::Key::Delete,
-        KeyCode::Escape => windowing::Key::Escape,
-        KeyCode::Left => windowing::Key::Left,
-        KeyCode::Right => windowing::Key::Right,
-        KeyCode::Up => windowing::Key::Up,
-        KeyCode::Down => windowing::Key::Down,
-        KeyCode::Home => windowing::Key::Home,
-        KeyCode::End => windowing::Key::End,
-        KeyCode::PageUp => windowing::Key::PageUp,
-        KeyCode::PageDown => windowing::Key::PageDown,
+        KeyCode::Char(' ') => Key::Space,
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Enter => Key::Return,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Escape => Key::Escape,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
         _ => return None,
     })
 }

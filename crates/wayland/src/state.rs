@@ -20,7 +20,7 @@ use crate::CompError;
 
 /// The Smithay-registered protocol state: what every handler impl returns.
 /// Registration, not policy.
-pub struct Globals<C: 'static, W: 'static> {
+pub struct Globals {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: smithay::wayland::shell::xdg::XdgShellState,
     pub shm_state: ShmState,
@@ -29,18 +29,18 @@ pub struct Globals<C: 'static, W: 'static> {
     pub data_device_state: DataDeviceState,
     /// X11 surface association (the `xwayland_shell` global).
     pub xwayland_shell_state: XWaylandShellState,
-    pub seat_state: SeatState<crate::State<C, W>>,
+    pub seat_state: SeatState<crate::State>,
     pub output_state: OutputManagerState,
     /// The running X11 window manager, once XWayland is ready.
     pub x11_wm: Option<X11Wm>,
 }
 
-/// The session: the window trees of the root client and its helpers, the
-/// scales, the X11 side.
+/// The session: the root client's window tree, the helpers, the scales, the
+/// X11 side.
 #[derive(derive_getters::Getters)]
-pub struct State<C: 'static = (), W: 'static = ()> {
+pub struct State {
     /// The Smithay-registered protocol objects (see [`Globals`]).
-    pub globals: Globals<C, W>,
+    pub globals: Globals,
     /// The single present output. Used to send `wl_surface.enter` so committed
     /// surfaces know an output is attached (Firefox waits for this before the
     /// WebRender presents content).
@@ -61,7 +61,7 @@ pub struct State<C: 'static = (), W: 'static = ()> {
     ///
     /// Holding it strongly costs nothing: the slot and this field share one count, and
     /// when the connection ends the slot drops its share, leaving this one.
-    pub root_client: Option<Arc<RootClient<C, W>>>,
+    pub root_client: Option<Arc<RootClient>>,
     /// The scale the output advertises (the session's `dpi`): what a client
     /// multiplies the size it is configured with by to get its buffer.
     pub output_scale: f64,
@@ -86,11 +86,7 @@ pub struct State<C: 'static = (), W: 'static = ()> {
     pub pending_commits: std::collections::HashMap<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface, (Vec<u8>, (u32, u32))>,
 }
 
-impl<C, W> State<C, W>
-where
-    C: proto::Shared + Default,
-    W: proto::Shared + Default,
-{
+impl State {
     /// Build the session state: the globals, the seat with its keyboard and
     /// pointer, and the single output.
     pub(crate) fn new(
@@ -153,10 +149,4 @@ where
         self.serial = self.serial.wrapping_add(1);
         Serial::from(self.serial as u32)
     }
-
-    /// Take the root client out of the session, if it is still there.
-    pub(crate) fn take_root_client(&mut self) -> Option<Arc<RootClient<C, W>>> {
-        self.root_client.take()
-    }
 }
-

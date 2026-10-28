@@ -23,12 +23,11 @@ use std::io::{BufReader, Read, Write};
 use std::sync::Arc;
 
 use codecs::CodecId;
-use proto::windowing::WindowingServer;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use widget::{GuiWidget, Session};
 
-use compositor::{ClientData, WindowState};
+use compositor::WindowingServer;
 
 mod compositor;
 mod inputs;
@@ -181,20 +180,16 @@ impl Gui {
         // `--dbg-dummy-windowing`, which draws windows nobody is running, the
         // wayland server otherwise. Boxed once here, so the session does not
         // care which one it was.
-        let server: Box<dyn WindowingServer<ClientData, WindowState>> =
-            if self.debug.dummy_windowing {
-                Box::new(crate::compositor::DummyServer::default())
-            } else {
-                Box::new(
-                    wayland::WaylandServer::new(wayland::Options {
-                        resolution: output,
-                        dpi: 1.0,
-                        show_cursor: true,
-                        use_x11: false,
-                    })
-                    .map_err(|e| std::io::Error::other(e.to_string()))?,
-                )
-            };
+        let server: Box<dyn WindowingServer> = if self.debug.dummy_windowing {
+            Box::new(compositor::windowing::dummy::DummyServer::default())
+        } else {
+            Box::new(compositor::windowing::wayland::Server::new(wayland::Options {
+                resolution: output,
+                dpi: 1.0,
+                show_cursor: true,
+                use_x11: false,
+            })?)
+        };
         let mut session = Session::new(
             self.program,
             output,

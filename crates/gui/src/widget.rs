@@ -18,11 +18,10 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, StatefulWidget, Widget as _};
 use codecs::CodecId;
-use proto::windowing::WindowingServer;
+use crate::compositor::WindowingServer;
 
 use std::sync::Arc;
 
-use crate::compositor::{ClientData, WindowState};
 use crate::DebugOptions;
 
 /// What the session holds while a step is running.
@@ -74,7 +73,7 @@ pub type Input = Box<dyn std::io::Read + Send>;
 ///
 /// `T` is the window session this one composites; it is chosen once, where the
 /// session is created, from the debug options.
-pub struct Session<T: WindowingServer<ClientData, WindowState>> {
+pub struct Session<T: WindowingServer> {
     /// Where the session is, or what went wrong getting there.
     ///
     /// A `Result` and not a state, because a step consumes the state it is given: there
@@ -115,7 +114,7 @@ pub struct Session<T: WindowingServer<ClientData, WindowState>> {
     pub cell: (u32, u32),
 }
 
-impl<T: WindowingServer<ClientData, WindowState>> Session<T> {
+impl<T: WindowingServer> Session<T> {
     /// Start a session over a terminal's input.
     ///
     /// The receive end is taken here, not later, so nothing typed while the
@@ -155,21 +154,21 @@ impl<T: WindowingServer<ClientData, WindowState>> Session<T> {
 }
 
 /// The client itself: a widget over [`Session`].
-pub struct GuiWidget<T: WindowingServer<ClientData, WindowState>>(std::marker::PhantomData<T>);
+pub struct GuiWidget<T: WindowingServer>(std::marker::PhantomData<T>);
 
-impl<T: WindowingServer<ClientData, WindowState>> GuiWidget<T> {
+impl<T: WindowingServer> GuiWidget<T> {
     pub fn new() -> Self {
         GuiWidget(std::marker::PhantomData)
     }
 }
 
-impl<T: WindowingServer<ClientData, WindowState>> Default for GuiWidget<T> {
+impl<T: WindowingServer> Default for GuiWidget<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: WindowingServer<ClientData, WindowState>> StatefulWidget for GuiWidget<T> {
+impl<T: WindowingServer> StatefulWidget for GuiWidget<T> {
     type State = Session<T>;
 
     /// One frame.

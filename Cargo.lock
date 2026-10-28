@@ -1326,7 +1326,6 @@ dependencies = [
  "futures",
  "halftone",
  "log",
- "proto",
  "ratatui",
  "rustix 1.1.5",
  "termina 0.4.0",
@@ -2409,13 +2408,6 @@ checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
 dependencies = [
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "proto"
-version = "0.1.0"
-dependencies = [
- "ratatui",
 ]
 
 [[package]]
@@ -3951,7 +3943,6 @@ dependencies = [
  "libc",
  "log",
  "memmap2",
- "proto",
  "ratatui",
  "rustix 1.1.5",
  "smithay",

@@ -59,7 +59,6 @@ use smithay::wayland::xwayland_shell::{XWaylandShellState, XWaylandSurfaceUserDa
 
 use crate::state::State;
 use crate::utils::{forward, forward_global};
-use proto::Shared;
 
 // wl_compositor and its surfaces.
 forward_global!(WlCompositor: () => CompositorState);
@@ -88,11 +87,11 @@ forward!(WlBuffer: ShmBufferUserData => ShmState);
 // The seat and its input resources. `SeatState` is smithay's input-side
 // holder, which is what implements these dispatches (the `wayland::seat` one
 // is private).
-forward!(WlSeat: SeatUserData<Self> => smithay::input::SeatState<State<C, W>>);
-forward_global!(WlSeat: SeatGlobalData<Self> => smithay::input::SeatState<State<C, W>>);
-forward!(WlKeyboard: KeyboardUserData<Self> => smithay::input::SeatState<State<C, W>>);
-forward!(WlPointer: PointerUserData<Self> => smithay::input::SeatState<State<C, W>>);
-forward!(WlTouch: TouchUserData<Self> => smithay::input::SeatState<State<C, W>>);
+forward!(WlSeat: SeatUserData<Self> => smithay::input::SeatState<State>);
+forward_global!(WlSeat: SeatGlobalData<Self> => smithay::input::SeatState<State>);
+forward!(WlKeyboard: KeyboardUserData<Self> => smithay::input::SeatState<State>);
+forward!(WlPointer: PointerUserData<Self> => smithay::input::SeatState<State>);
+forward!(WlTouch: TouchUserData<Self> => smithay::input::SeatState<State>);
 
 // Clipboard / drag-and-drop.
 forward_global!(WlDataDeviceManager: () => DataDeviceState);
@@ -113,22 +112,19 @@ forward!(XwaylandShellV1: () => XWaylandShellState);
 forward!(XwaylandSurfaceV1: XWaylandSurfaceUserData => XWaylandShellState);
 
 // The trivial handler hooks: registration, not policy.
-impl<C: Shared + Default, W: Shared + Default> BufferHandler
-    for State<C, W>
+impl BufferHandler for State
 {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
 
-impl<C: Shared + Default, W: Shared + Default> ShmHandler
-    for State<C, W>
+impl ShmHandler for State
 {
     fn shm_state(&self) -> &ShmState {
         &self.globals.shm_state
     }
 }
 
-impl<C: Shared + Default, W: Shared + Default> OutputHandler
-    for State<C, W>
+impl OutputHandler for State
 {
 }
 
@@ -136,21 +132,17 @@ impl<C: Shared + Default, W: Shared + Default> OutputHandler
 // makes GTK apps (nautilus, etc.) actually open our Wayland display: GTK's
 // `_gdk_wayland_display_open` bails with "not using Wayland display" unless a
 // data device manager global (plus an xdg/zxdg shell) is present.
-impl<C: Shared + Default, W: Shared + Default> SelectionHandler
-    for State<C, W>
+impl SelectionHandler for State
 {
     type SelectionUserData = ();
 }
-impl<C: Shared + Default, W: Shared + Default> ClientDndGrabHandler
-    for State<C, W>
+impl ClientDndGrabHandler for State
 {
 }
-impl<C: Shared + Default, W: Shared + Default> ServerDndGrabHandler
-    for State<C, W>
+impl ServerDndGrabHandler for State
 {
 }
-impl<C: Shared + Default, W: Shared + Default> DataDeviceHandler
-    for State<C, W>
+impl DataDeviceHandler for State
 {
     fn data_device_state(&self) -> &DataDeviceState {
         &self.globals.data_device_state

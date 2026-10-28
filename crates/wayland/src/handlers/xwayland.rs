@@ -18,10 +18,7 @@ use smithay::xwayland::xwm::{ResizeEdge, Reorder, X11Surface, X11Wm, XwmHandler,
 
 use crate::state::State;
 
-impl<C, W> XwmHandler for State<C, W>
-where
-    C: proto::Shared + Default,
-    W: proto::Shared + Default,
+impl XwmHandler for State
 {
     fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
         self.globals
@@ -69,19 +66,14 @@ where
             return;
         };
         let was_root = {
-            let mut tree = root.root_window.write().unwrap();
-            let was_root = tree
-                .as_ref()
-                .is_some_and(|t| t.surface.wl_surface == surface);
-            if was_root {
-                *tree = None;
-            }
-            was_root
+            let tree = root.root_window.read().unwrap();
+            tree.as_ref().is_some_and(|tree| tree.surface.wl_surface == surface)
         };
         if was_root {
+            *root.root_window.write().unwrap() = None;
             self.root_client = None;
             tracing::debug!("x11: admitted window destroyed; dropping the root slot");
-        } else if let Some(tree) = root.root_window.write().unwrap().as_mut() {
+        } else if let Some(tree) = root.root_window.read().unwrap().as_ref() {
             tree.remove_surface(&surface);
         }
     }
@@ -137,10 +129,7 @@ where
     }
 }
 
-impl<C, W> XWaylandShellHandler for State<C, W>
-where
-    C: proto::Shared + Default,
-    W: proto::Shared + Default,
+impl XWaylandShellHandler for State
 {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
         &mut self.globals.xwayland_shell_state
@@ -153,10 +142,7 @@ where
     }
 }
 
-impl<C, W> State<C, W>
-where
-    C: proto::Shared + Default,
-    W: proto::Shared + Default,
+impl State
 {
     /// Admit an X11 client's surface into the root client's window tree.
     ///

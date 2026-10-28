@@ -1,23 +1,20 @@
 //! Per-window bookkeeping: the window tree and the toplevels it holds.
 //!
-//! The session keeps a **tree**: each client has a root window, and the
-//! toplevels its program spawns afterwards are that window's children.
-//! Detaching a window detaches its subtree with it. The holder (the
-//! compositor side of the gui) attaches its own per-window data — compositing
-//! metadata, layout, whatever it needs — through the generic `W`;
-//! the session itself uses `Window<()>`.
+//! The session keeps a **tree**: the root client's window, and the toplevels
+//! its program spawned afterwards branching under it. Detaching a window
+//! detaches its subtree with it.
 //!
-//! One struct, one owner: the session's state. Fields are `pub(crate)`; the
-//! derived getters and setters mark what is exposed beyond the crate.
+//! Windows are shared, not owned by their parent: a child lives in an `Arc`,
+//! and weak handles to it are what reach past the session. What the session
+//! mutates on a window sits behind locks (the children, the committed
+//! pixels), so a borrow of a window is as good as a mutable one.
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use derive_getters::Getters;
 use derive_setters::Setters;
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
@@ -28,7 +25,7 @@ use crate::state::State;
 /// program spawned.
 #[derive(Getters, Setters)]
 #[setters(generate = false)]
-pub struct Window<W = ()> {
+pub struct Window {
     /// The admitted surface: buffer bookkeeping and the committed contents.
     pub(crate) surface: Surface,
     /// The surface id this window draws itself as: its identity on the pane
@@ -40,16 +37,15 @@ pub struct Window<W = ()> {
     pub(crate) toplevel: ToplevelSurface,
     /// Serial of the last configure sent (spawn waits for the first commit).
     pub(crate) last_configure_serial: Mutex<Option<u64>>,
-    /// Toplevels this window's program spawned after being admitted. Detaching
+    /// Toplevels this window's program spawned after being admitted, shared
+    /// so weak handles can reach them from the session's holder. Detaching
     /// this window detaches its subtree with it.
-    pub(crate) children: Vec<Window<W>>,
+    pub(crate) children: RwLock<Vec<Arc<Window>>>,
     /// Input queued by the holder, drained by the session at the next step.
     /// A plain queue behind a mutex rather than a channel: nothing waits on a
     /// receiver, so a channel's single-consumer machinery only buys the type
     /// `!Sync`.
     pub(crate) inputs: Mutex<VecDeque<Input>>,
-    /// Whatever the holder attaches: compositing metadata and the like.
-    pub attached: W,
 }
 
 /// The admitted surface of a window: its `wl_surface`, the client-facing size,
@@ -65,63 +61,136 @@ pub(crate) struct Surface {
     /// (the same `Arc` the holder reads capture from), so the size a client
     /// was last configured at has to change behind a lock.
     pub(crate) size: RwLock<(u32, u32)>,
-    /// Set once this window committed a readable buffer at least once.
-    pub(crate) committed: bool,
+    /// Set once this window committed a readable buffer at least once. A
+    /// write arrives through `&self`, so it is a flag behind an atomic.
+    pub(crate) committed: AtomicBool,
     /// Latest committed contents, owned by us, written on commit.
     pub(crate) pixels: Mutex<Vec<u8>>,
 }
 
-impl<W> Window<W> {
-    pub fn new(surface: WlSurface, toplevel: ToplevelSurface, size: (u32, u32), attached: W) -> Self {
+impl Window {
+    pub fn new(surface: WlSurface, toplevel: ToplevelSurface, size: (u32, u32)) -> Self {
         Window {
             surface: Surface {
                 wl_surface: surface,
                 size: RwLock::new(size),
-                committed: false,
+                committed: AtomicBool::new(false),
                 pixels: Mutex::new(Vec::new()),
             },
             id: wire::message::SurfaceId::random(),
             toplevel,
             last_configure_serial: Mutex::new(None),
-            children: Vec::new(),
+            children: RwLock::new(Vec::new()),
             inputs: Mutex::new(VecDeque::new()),
-            attached,
         }
+    }
+
+    /// Queue one input event; drained by the session's next step.
+    pub fn queue_input(&self, input: Input) {
+        self.inputs.lock().unwrap().push_back(input);
+    }
+
+    /// What the window last drew: RGBA8, row-major, `width * height * 4` bytes.
+    /// `None` until it has drawn at least once.
+    ///
+    /// Reading fires the window's frame callbacks: taking the pixels is the
+    /// point where this window's frame is consumed, so it is the point where
+    /// the client may draw the next one. `done` is back-pressure, not a
+    /// presentation promise, and the serial caller loop is what throttles it.
+    ///
+    /// NOTE: if the caller ever overlaps encoding with reading, this fires a
+    /// frame too early and the client runs one encode period ahead. Move it
+    /// to the presentation point (or gate it on the encode queue being empty)
+    /// at that point.
+    pub fn capture(&self) -> Option<Vec<u8>> {
+        if !self.surface.committed.load(Ordering::Acquire) {
+            return None;
+        }
+        let pixels = self.surface.pixels.lock().unwrap().clone();
+        if pixels.is_empty() {
+            return None;
+        }
+        crate::utils::fire_frame_callbacks(&self.surface.wl_surface);
+        Some(pixels)
+    }
+
+    /// Ask this window to draw at `size` pixels instead of its current one.
+    /// The client answers by committing a buffer at whatever size it chose.
+    pub fn set_size(&self, size: (u32, u32)) {
+        // The size proposal travels on the toplevel, not the surface.
+        self.toplevel.with_pending_state(|pending| {
+            pending.size = Some((size.0 as i32, size.1 as i32).into());
+        });
+        self.toplevel.send_configure();
+        *self.surface.size.write().unwrap() = size;
+    }
+
+    /// Everything under this window: the windows its program opened after it,
+    /// then the root windows of the helper clients that program started.
+    ///
+    /// A helper's window lives beside this one rather than inside it, but it
+    /// is drawn as a window of the session all the same, so it is read here.
+    pub fn descendants(&self) -> Vec<Arc<Window>> {
+        let mut all = self.children.read().unwrap().clone();
+        for sub in self.sub_clients() {
+            if let Some(tree) = sub.root_window.read().unwrap().clone() {
+                all.push(tree);
+            }
+        }
+        all
+    }
+
+    /// The helper clients this window's program started, found through the
+    /// connection that owns this window.
+    fn sub_clients(&self) -> Vec<Arc<crate::client::SubClient>> {
+        use smithay::reexports::wayland_server::Resource as _;
+        let Some(client) = self.surface.wl_surface.client() else {
+            return Vec::new();
+        };
+        // Copied out: the guard `get_data` hands back borrows a handle that
+        // lives only until the end of this statement.
+        let Some(root) = client.get_data::<crate::client::RootClient>() else {
+            return Vec::new();
+        };
+        let subs: Vec<_> = root
+            .sub_clients
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        subs
     }
 
     /// Dispatch this window's queued inputs, then its children's.
     ///
     /// The tree is walked shallow-to-deep; each window dispatches its own
     /// mailbox against itself, so an input reaches the window it was queued for.
-    pub(crate) fn dispatch_inputs<C>(&self, state: &mut State<C, W>)
-    where
-        C: proto::Shared + Default,
-        W: proto::Shared + Default,
-    {
+    pub(crate) fn dispatch_inputs(&self, state: &mut State) {
         let inputs: Vec<Input> = self.inputs.lock().unwrap().drain(..).collect();
         for input in inputs {
             if let Err(e) = state.dispatch_input(self.surface.wl_surface(), input) {
                 tracing::debug!("a queued input did not dispatch: {e}");
             }
         }
-        for child in &self.children {
+        for child in &*self.children.read().unwrap() {
             child.dispatch_inputs(state);
         }
     }
 
     /// The window whose surface is `surface`, or whose surface is the parent
     /// of it (a subsurface commit lands on the toplevel that owns the tree).
-    pub(crate) fn commit_target(&mut self, surface: &WlSurface) -> Option<&mut Window<W>> {
-        let is_win = self.surface.wl_surface == *surface;
+    pub(crate) fn commit_target(this: &Arc<Self>, surface: &WlSurface) -> Option<Arc<Self>> {
+        let is_win = this.surface.wl_surface == *surface;
         let is_kid = !is_win
             && smithay::wayland::compositor::get_parent(surface)
-                .map(|p| p == self.surface.wl_surface)
+                .map(|p| p == this.surface.wl_surface)
                 .unwrap_or(false);
         if is_win || is_kid {
-            return Some(self);
+            return Some(this.clone());
         }
-        for child in &mut self.children {
-            if let Some(found) = child.commit_target(surface) {
+        for child in &*this.children.read().unwrap() {
+            if let Some(found) = Self::commit_target(child, surface) {
                 return Some(found);
             }
         }
@@ -130,84 +199,15 @@ impl<W> Window<W> {
 
     /// Remove the window whose surface is `surface` (a child, or a child's
     /// child). Returns whether something was removed.
-    pub(crate) fn remove_surface(&mut self, surface: &WlSurface) -> bool {
-        let before = self.children.len();
-        self.children
-            .retain(|c| c.surface.wl_surface != *surface);
-        if self.children.len() != before {
-            return true;
+    pub(crate) fn remove_surface(&self, surface: &WlSurface) -> bool {
+        let mut children = self.children.write().unwrap();
+        let before = children.len();
+        children.retain(|child| child.surface.wl_surface != *surface);
+        let mut removed = children.len() != before;
+        for child in &*children {
+            removed |= child.remove_surface(surface);
         }
-        self.children.iter_mut().any(|c| c.remove_surface(surface))
+        drop(children);
+        removed
     }
 }
-
-impl<W: proto::Shared> proto::windowing::Window<W> for Window<W> {
-    fn input(&self, input: Input) -> Result<(), proto::windowing::Error> {
-        // Cannot fail: appending never errors, unlike a channel with no
-        // receiver. The queue is drained by the session's next step.
-        self.inputs.lock().unwrap().push_back(input);
-        Ok(())
-    }
-
-    fn capture(&self) -> Result<Vec<u8>, proto::windowing::Error> {
-        if !self.surface.committed {
-            return Err(proto::windowing::Error::NotReady);
-        }
-        let pixels = self.surface.pixels.lock().unwrap().clone();
-        if pixels.is_empty() {
-            return Err(proto::windowing::Error::NotReady);
-        }
-        // The frame callbacks fire here, with the read: taking the pixels is
-        // the point where this window's frame is consumed, so it is the point
-        // where the client may draw the next one. `done` is back-pressure, not
-        // a presentation promise, and the serial caller loop is what throttles
-        // it (nothing else can read until this call returns).
-        //
-        // NOTE: if the caller ever overlaps encoding with reading, this fires a
-        // frame too early and the client runs one encode period ahead. Move it
-        // to the presentation point (or gate it on the encode queue being
-        // empty) at that point.
-        crate::utils::fire_frame_callbacks(&self.surface.wl_surface);
-        Ok(pixels)
-    }
-
-    fn with_attached(&self, f: &mut dyn FnMut(&W)) {
-        f(&self.attached);
-    }
-
-    fn set_size(&self, size: (u32, u32)) {
-        // The size proposal travels on the toplevel, not the surface; the
-        // client answers by committing a buffer at whatever size it chose.
-        self.toplevel.with_pending_state(|pending| {
-            pending.size = Some((size.0 as i32, size.1 as i32).into());
-        });
-        self.toplevel.send_configure();
-        *self.surface.size.write().unwrap() = size;
-    }
-
-    fn with_children(&self, f: &mut dyn FnMut(&dyn proto::windowing::Window<W>)) {
-        for child in &self.children {
-            f(child);
-        }
-    }
-}
-
-/// A wayland window, the way the pane draws it: every cell filled with the
-/// window's own surface, which is the anchor the other side scans for.
-impl<W> ratatui::widgets::WidgetRef for Window<W> {
-    fn render_ref(&self, area: Rect, buf: &mut Buffer) {
-        let id = self.id;
-        let style = Style::new()
-            .fg(Color::Rgb(id.fg.0, id.fg.1, id.fg.2))
-            .bg(Color::Rgb(id.bg.0, id.bg.1, id.bg.2));
-        buf.set_style(area, style);
-        for row in area.y..area.bottom() {
-            for column in area.x..area.right() {
-                if let Some(cell) = buf.cell_mut((column, row)) {
-                    cell.set_char(id.symbol);
-                }
-            }
-        }
-    }
-}
-

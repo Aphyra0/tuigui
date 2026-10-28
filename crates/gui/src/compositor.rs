@@ -1,21 +1,19 @@
 //! The programs running in a compositor of ours, drawn into the pane as windows.
 //!
-//! The video path decodes a file; this one runs programs. Each program gets a Wayland
-//! session of its own — a compositor in this process, one output — and the pixels it
-//! commits are read straight out of that compositor's buffer.
+//! The video path decodes a file; this one runs programs. Each program gets a
+//! Wayland session of its own — a compositor in this process, one output — and
+//! the pixels it commits are read straight out of that compositor's buffer.
 //!
 //! # What is whose
 //!
-//! The compositor holds the **session** ([`WindowingServer`]): the program, its clients
-//! and its windows. It also holds the root window's place on the pane, so a resize of
-//! the pane is a resize of the session. The layout of every other window lives on the
-//! window itself, in its [`WindowState`], and the drawing walks the tree.
+//! The compositor holds the **session** ([`WindowingServer`]): the program and
+//! its windows. It also holds the windows it has seen, in stacking order — the
+//! further along the list, the closer to the user — and the one with focus.
+//! Root is not in that list: it is the pane itself, always at the bottom.
 
-use std::sync::Arc;
+use std::collections::LinkedList;
+use std::sync::{Arc, Weak};
 
-use proto::windowing::{
-    Client as ProtoClient, Window as ProtoWindow, WindowingServer,
-};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -23,71 +21,57 @@ use ratatui::widgets::{StatefulWidget, Widget, WidgetRef};
 
 use crate::DebugOptions;
 
-mod dummy;
 mod inputs;
+pub mod windowing;
 
-pub use dummy::DummyServer;
-
-/// What this side parks on a client of the compositor.
-///
-/// Nothing: a client is a process, and the only fact this side needs about it — its pid
-/// — the trait already carries.
-pub type ClientData = ();
-
-/// A window's place on the pane, in cells: its size and its position inside its
-/// parent. This is what a window is drawn from, and what a drag moves.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct WindowState {
-    /// The window's size, in cells, border included.
-    pub size: (u16, u16),
-    /// The window's position inside its parent, in cells.
-    pub position: (u16, u16),
-}
+pub use windowing::{StatefulWindow, WindowState, WindowingServer};
 
 /// A program, or several, running in a compositor of ours.
 ///
-/// `T` is the window session: a real one (wayland, later macOS) or the dummy one
-/// (`--dbg-dummy-windowing`), which draws windows nobody is running.
-pub struct Compositor<T: WindowingServer<ClientData, WindowState>> {
+/// `T` is the window session: a real one (wayland, later macOS) or the dummy
+/// one (`--dbg-dummy-windowing`), which draws windows nobody is running.
+pub struct Compositor<T: WindowingServer> {
     /// The session the windows live in. Dropping it ends them.
     windowing: T,
-    /// The windows on the pane, in stacking order: the front is first.
-    windows: std::collections::LinkedList<Box<dyn ProtoWindow<WindowState>>>,
+    /// The pane's own window: the program's, at the bottom of everything.
+    root: Option<Weak<dyn StatefulWindow>>,
+    /// The windows over it, in stacking order: the further along, the closer
+    /// to the user.
+    windows: LinkedList<Arc<dyn StatefulWindow>>,
+    /// The window a key belongs to.
+    focused: Option<Weak<dyn StatefulWindow>>,
     /// The switches this pane runs with (`--dbg-*`).
     debug: Arc<DebugOptions>,
     /// The pointer, as the compositor sees it between frames.
     pointer: inputs::Pointer,
-    /// The pane's size as of the last render, in cells — what a change of
-    /// pane is noticed against.
-    last_pane: (u16, u16),
+    /// The pane's size as of the last render, in cells: where the window
+    /// geometry was last worked out from.
+    pane: (u16, u16),
 }
 
-impl<T: WindowingServer<ClientData, WindowState>> Compositor<T> {
+impl<T: WindowingServer> Compositor<T> {
     /// Take a session and the switches, and start compositing.
     pub fn new(windowing: T, debug: Arc<DebugOptions>) -> Self {
         Self {
             windowing,
-            windows: std::collections::LinkedList::new(),
+            root: None,
+            windows: LinkedList::new(),
+            focused: None,
             debug,
             pointer: inputs::Pointer::default(),
-            last_pane: (0, 0),
+            pane: (0, 0),
         }
     }
 
     /// Whether the session's program has ended.
     ///
-    /// A root client that has not connected yet is a program that has not
-    /// started, not one that has ended: the session is still waiting.
+    /// A program that has not connected yet has not ended: the session is
+    /// still waiting, which is what `is_running` answers.
     pub fn finished(&self) -> bool {
-        self.windowing
-            .root_client()
-            .is_some_and(|client| !client.is_running())
+        !self.windowing.is_running()
     }
 
     /// Hand one event to the pane, which hands it to whatever it landed on.
-    ///
-    /// The pane is this side's to hit-test: it walks the window tree, finds the
-    /// window a cell belongs to, and delivers a window-local event.
     pub fn input(&mut self, event: &termina::Event) -> std::io::Result<()> {
         inputs::input(self, event)
     }
@@ -97,73 +81,80 @@ impl<T: WindowingServer<ClientData, WindowState>> Compositor<T> {
     pub fn advance(&mut self, timeout: std::time::Duration) {
         self.windowing.advance(timeout);
     }
-}
 
-/// A client, drawn: its window at its place, the windows its program opened
-/// after it inside it, and its helpers beside it.
-pub struct TuiClient<'a> {
-    client: &'a dyn ProtoClient<ClientData, WindowState>,
-    /// The pulls: each window's place, and how far it now sits from it — the
-    /// ended drags, plus the one under way.
-    drags: Vec<(WindowState, (i16, i16))>,
-}
+    /// The pane, in cells, as of the last render.
+    pub(crate) fn last_pane(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: self.pane.0,
+            height: self.pane.1,
+        }
+    }
 
-impl<'a> TuiClient<'a> {
-    pub fn new(
-        client: &'a dyn ProtoClient<ClientData, WindowState>,
-        drags: Vec<(WindowState, (i16, i16))>,
-    ) -> Self {
-        Self { client, drags }
+    /// The front-most window under a pointer position, and where it sits in
+    /// the stack. The root is never a hit: it is the pane.
+    pub(crate) fn front_window_at(
+        &self,
+        position: ratatui::layout::Position,
+        pane: Rect,
+    ) -> Option<(usize, Arc<dyn StatefulWindow>)> {
+        self.windows
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, window)| area_of(window.as_ref(), pane).contains(position))
+            .map(|(index, window)| (index, window.clone()))
+    }
+
+    /// Move a window to the front of the stack.
+    pub(crate) fn raise(&mut self, index: usize) {
+        let mut rest = self.windows.split_off(index);
+        if let Some(window) = rest.pop_front() {
+            // What followed it keeps its place under it, and the pulled
+            // window goes on top of the lot.
+            self.windows.append(&mut rest);
+            self.windows.push_back(window);
+        }
+    }
+
+    /// The window a key belongs to when nothing is focused: the root, which is
+    /// the program itself.
+    pub(crate) fn root_window(&self) -> Option<Arc<dyn StatefulWindow>> {
+        self.root.as_ref().and_then(|root| root.upgrade())
+    }
+
+    /// The window a key belongs to, if it is still alive.
+    pub(crate) fn focused_window(&self) -> Option<Arc<dyn StatefulWindow>> {
+        self.focused.as_ref().and_then(|focused| focused.upgrade())
     }
 }
 
-impl Widget for TuiClient<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        // The client's window, then the windows its program opened after it,
-        // each inside the one before.
-        self.client.with_window(&mut |window| {
-            render_window(window, area, true, &self.drags, buf)
-        });
-        // The helpers, beside it.
-        self.client.with_children(&mut |child| {
-            TuiClient::new(child, self.drags.clone()).render(area, buf);
-        });
+/// Where a window sits on the pane, from its state and its base.
+pub fn area_of(window: &dyn StatefulWindow, base: Rect) -> Rect {
+    let state = window.state();
+    Rect {
+        x: base.x.saturating_add(state.position.0),
+        y: base.y.saturating_add(state.position.1),
+        width: state.size.0.max(1),
+        height: state.size.1.max(1),
     }
 }
 
-/// One window: its own draw, a gray row under it (every window that is not
-/// the root's), and its children inside it.
-fn render_window(
-    window: &dyn ProtoWindow<WindowState>,
-    base: Rect,
-    root: bool,
-    drags: &[(WindowState, (i16, i16))],
-    buf: &mut Buffer,
-) {
-    let mut place = WindowState::default();
-    window.with_attached(&mut |state| place = *state);
-    // A pull rides over its window's place: the ended drags, and the drag
-    // under way, each belong to the one window they were grabbed on.
-    let offset = match drags.iter().find(|(grabbed, _)| *grabbed == place) {
-        Some((_, offset)) => *offset,
-        None => (0, 0),
-    };
-    let area = Rect {
-        x: (base.x as i32 + place.position.0 as i32 + offset.0 as i32).max(0) as u16,
-        y: (base.y as i32 + place.position.1 as i32 + offset.1 as i32).max(0) as u16,
-        width: place.size.0.max(1),
-        height: place.size.1.max(1),
-    };
-    // The shadow, drawn first: a medium shade one column and one row over,
-    // so the window reads as raised off the pane. The window's own draw
-    // covers all but the strip that peeks out to the right and below.
+/// One window: the shadow it casts, its own draw, the bar under it, and the
+/// thin frame around it — then the windows it opened after it, inside it.
+fn render_window(window: &Arc<dyn StatefulWindow>, base: Rect, root: bool, buf: &mut Buffer) {
+    let area = area_of(window.as_ref(), base);
+    // The shadow, drawn first: a light shade one column right and one row
+    // down, so the window reads as raised. The window's own draw covers all
+    // but the strip that peeks out to the right and below.
     if !root {
-        // One row taller, for the gray line the window leaves under it.
+        // One row taller, for the bar the window leaves under it.
         let shadow = Rect {
-        x: area.x + 1,
-        y: area.y + 1,
-        width: area.width.min(base.right().saturating_sub(area.x + 1)),
-        height: (area.height + 1).min(base.bottom().saturating_sub(area.y + 1)),
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.min(base.right().saturating_sub(area.x + 1)),
+            height: (area.height + 1).min(base.bottom().saturating_sub(area.y + 1)),
         };
         for y in shadow.y..shadow.bottom() {
             for x in shadow.x..shadow.right() {
@@ -178,28 +169,22 @@ fn render_window(
     // picture, an earlier frame — must not leak into this one's cells.
     ratatui::widgets::Clear.render(area, buf);
     // The window's own content, on its whole area.
-    WidgetRef::render_ref(window, area, buf);
-    // The bar, under the window: one row, its full width, where there is
-    // room left for it. Cleaned first, so what is behind it does not show
-    // through the gray.
-    if !root && area.bottom() < base.bottom() {
-        let row = Rect {
-            x: area.x,
-            y: area.bottom(),
-            width: area.width,
-            height: 1,
-        };
-        ratatui::widgets::Clear.render(row, buf);
-        buf.set_style(row, Style::new().bg(Color::DarkGray));
-    }
-    // The thin frame, just outside the window: a bar against each edge, in
-    // the color of the bar. The top one sits above the window, the bottom
-    // one below the bar, and the sides run from the one to the other.
+    WidgetRef::render_ref(window.as_ref(), area, buf);
     if !root {
+        // The bar, under the window: one row, its full width.
+        if area.bottom() < base.bottom() {
+            let row = Rect {
+                x: area.x,
+                y: area.bottom(),
+                width: area.width,
+                height: 1,
+            };
+            ratatui::widgets::Clear.render(row, buf);
+            buf.set_style(row, Style::new().bg(Color::DarkGray));
+        }
+        // The thin frame, just outside the window: a bar against each edge the
+        // pane has room for.
         for y in area.y.saturating_sub(1)..area.bottom() {
-            if y < base.y || y >= base.bottom() {
-                continue;
-            }
             if let Some(cell) = buf.cell_mut((area.x, y)) {
                 cell.set_char('▏');
                 cell.set_fg(Color::DarkGray);
@@ -218,31 +203,89 @@ fn render_window(
             }
         }
     }
-    window.with_children(&mut |child| render_window(child, area, false, drags, buf));
 }
 
-/// The compositor as the pane draws it: the session's clients, each as a
-/// window tree.
-impl<T: WindowingServer<ClientData, WindowState>> StatefulWidget for &mut Compositor<T> {
+/// The compositor as the pane draws it: the root window, then every window
+/// over it in stacking order.
+impl<T: WindowingServer> StatefulWidget for &mut Compositor<T> {
     type State = ();
 
     fn render(self, area: Rect, buf: &mut Buffer, _state: &mut Self::State) {
-        // A change of pane is a change of session size: the server is asked
-        // to resize, and it is the server that places its root window.
-        let size = (area.width, area.height);
-        let changed = self.last_pane != size;
-        self.last_pane = size;
-        if changed {
-            self.windowing.set_size((area.width as u32, area.height as u32));
-        }
-        if let Some(client) = self.windowing.root_client() {
-            let mut drags = self.pointer.pulled.clone();
-            if let Some((place, _, _)) = self.pointer.drag {
-                drags.push((place, self.pointer.offset()));
+        self.pane = (area.width, area.height);
+
+        // The grab under way is applied here, once per frame: a press on a
+        // window's bar moves it, a press on its edge resizes it. The window's
+        // own state is where it ends up, so a release keeps it.
+        if let Some(grab) = &self.pointer.grab {
+            let dx = self.pointer.position.0 as i32 - grab.origin.0 as i32;
+            let dy = self.pointer.position.1 as i32 - grab.origin.1 as i32;
+            let mut state = grab.state;
+            if grab.edge {
+                state.size = (
+                    (grab.state.size.0 as i32 + dx).max(1) as u16,
+                    (grab.state.size.1 as i32 + dy).max(1) as u16,
+                );
+            } else {
+                state.position = (
+                    (grab.state.position.0 as i32 + dx).max(0) as u16,
+                    (grab.state.position.1 as i32 + dy).max(0) as u16,
+                );
             }
-            TuiClient::new(client, drags).render(area, buf);
+            grab.window.set_state(state);
+        }
+        // The session's root is the pane, so a change of pane is a change of
+        // the root window's size: the server is asked to resize, and it is the
+        // server that measures what lives in it.
+        self.root = self.windowing.root_window();
+        let root = self.root.as_ref().and_then(|root| root.upgrade());
+        if let Some(root) = root.as_ref() {
+            let wanted = (area.width, area.height);
+            if root.state().size != wanted {
+                self.windowing
+                    .set_size((area.width as u32, area.height as u32));
+            }
+        }
+
+        // Everything the session offers under the root, walked once.
+        let mut offered: Vec<Arc<dyn StatefulWindow>> = Vec::new();
+        if let Some(root) = root.as_ref() {
+            collect(root, &mut offered);
+        }
+
+        // What died leaves the stack; what is new joins it above what was
+        // there. A weak handle's only identity is the pointer, so that is how
+        // two reads of the same window are told apart.
+        let alive: Vec<Arc<dyn StatefulWindow>> = self
+            .windows
+            .iter()
+            .filter(|known| offered.iter().any(|new| Arc::ptr_eq(known, new)))
+            .cloned()
+            .collect();
+        self.windows = alive.into_iter().collect();
+        for window in offered {
+            if !self.windows.iter().any(|known| Arc::ptr_eq(known, &window)) {
+                self.windows.push_back(window);
+            }
+        }
+
+        if let Some(root) = root.as_ref() {
+            render_window(root, area, true, buf);
+        }
+        for window in &self.windows {
+            render_window(window, area, false, buf);
         }
     }
 }
 
-
+/// Walk a window's children into `out`, each before its own: a window is
+/// drawn under the windows it opened.
+fn collect(window: &Arc<dyn StatefulWindow>, out: &mut Vec<Arc<dyn StatefulWindow>>) {
+    for child in window.get_children() {
+        if let Some(child) = child.upgrade() {
+            if !out.iter().any(|known| Arc::ptr_eq(known, &child)) {
+                collect(&child, out);
+                out.push(child);
+            }
+        }
+    }
+}

@@ -7,12 +7,11 @@
 //!
 //! Clients implement Smithay's `ClientData` directly: the connection's data
 //! *is* the client record, and the type says which one it is. Smithay holds
-//! the `Arc`; the session and the holder keep `Weak`s. `attached` is where
-//! the holder parks its own data.
+//! the `Arc`; the session and the holder keep `Weak`s.
 //!
-//! No `unsafe` is involved in the sharing smithay requires: every field behind
-//! the generics is natively `Send + Sync` (locks, not channels), so `ClientData`
-//! is satisfied by the compiler's own analysis rather than by a promise.
+//! No `unsafe` is involved in the sharing smithay requires: every field is
+//! natively `Send + Sync` (locks, not channels), so `ClientData` is satisfied
+//! by the compiler's own analysis rather than by a promise.
 
 mod root_client;
 mod sub_client;
@@ -24,7 +23,6 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use proto::windowing::Client as _;
 use smithay::wayland::compositor::CompositorClientState;
 
 use crate::error::CompError;
@@ -34,27 +32,19 @@ use crate::utils::{peer_pid, proc_parent};
 /// The per-connection compositor state, resolved whichever kind of client the
 /// connection belongs to. XWayland's client carries `XWaylandClientData`
 /// instead, which smithay owns.
-pub(crate) fn compositor_client_state<C, W>(
+pub(crate) fn compositor_client_state(
     client: &smithay::reexports::wayland_server::Client,
-) -> Option<&CompositorClientState>
-where
-    C: proto::Shared,
-    W: proto::Shared,
-{
-    if let Some(root) = client.get_data::<RootClient<C, W>>() {
+) -> Option<&CompositorClientState> {
+    if let Some(root) = client.get_data::<RootClient>() {
         return Some(&root.compositor_state);
     }
-    if let Some(sub) = client.get_data::<SubClient<C, W>>() {
+    if let Some(sub) = client.get_data::<SubClient>() {
         return Some(&sub.compositor_state);
     }
     None
 }
 
-impl<C, W> State<C, W>
-where
-    C: proto::Shared + Default,
-    W: proto::Shared + Default,
-{
+impl State {
     /// Admit a newly connected wayland client.
     ///
     /// The runtime dir is private, so a connection can only come from a process
@@ -80,7 +70,7 @@ where
             // connection was never admitted would make the next attempt look like a
             // helper's, and its parent lookup fail for a reason that is not true.
             root.connected.store(true, Ordering::SeqCst);
-            log::info!("admitted the root client, pid {}", root.pid());
+            log::info!("admitted the root client, pid {}", root.child.id());
             return Ok(());
         }
 
@@ -99,7 +89,7 @@ where
         let me = std::process::id();
         let mut parent = proc_parent(pid);
         let mut depth = 0;
-        let root_pid = root.pid();
+        let root_pid = root.child.id();
 
         // Every connected client, read once: the walk compares against these, so the
         // set does not have to be re-read per step.
@@ -111,9 +101,9 @@ where
             let data = handle
                 .get_client_data(id)
                 .map_err(|e| CompError::Server(e.to_string()))?;
-            if let Some(sub) = data.downcast_ref::<SubClient<C, W>>() {
+            if let Some(sub) = data.downcast_ref::<SubClient>() {
                 connected.push(sub.pid);
-            } else if data.downcast_ref::<RootClient<C, W>>().is_some() {
+            } else if data.downcast_ref::<RootClient>().is_some() {
                 connected.push(root_pid);
             }
         }

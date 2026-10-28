@@ -26,8 +26,7 @@ use wire::unix::UnixSocket;
 use crate::compositor::Compositor;
 
 use super::{socket_path, Session, CONNECTIONS};
-use crate::compositor::{ClientData, WindowState};
-use proto::windowing::WindowingServer;
+use crate::compositor::WindowingServer;
 
 /// How long a quiet session is paused before the window is looked at again.
 ///
@@ -54,7 +53,7 @@ const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 ///
 /// `T` is the window session this machine composites; it is plugged in once, at the
 /// session's start, from the debug options.
-pub enum State<T: WindowingServer<ClientData, WindowState>> {
+pub enum State<T: WindowingServer> {
     /// Nothing chosen yet: pick a socket.
     ///
     /// Carries nothing, not even a highlight: a click moves straight on, so there is no
@@ -101,7 +100,7 @@ pub enum State<T: WindowingServer<ClientData, WindowState>> {
     Done,
 }
 
-impl<T: WindowingServer<ClientData, WindowState>> State<T> {
+impl<T: WindowingServer> State<T> {
     /// One frame: advance the session, and draw where it got to.
     ///
     /// Consumes `self` and returns the state it moved to, so a step that awaits owns what it

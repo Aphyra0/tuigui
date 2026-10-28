@@ -8,10 +8,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::state::State;
 
-impl<C, W> SeatHandler for State<C, W>
-where
-    C: 'static,
-    W: 'static,
+impl SeatHandler for State
 {
     type KeyboardFocus = WlSurface;
     type PointerFocus = WlSurface;

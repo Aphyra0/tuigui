@@ -1,5 +1,8 @@
 //! `xdg_shell` handler: the window-tree admission and its configure.
 
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::utils::Serial;
@@ -10,10 +13,7 @@ use crate::client::{RootClient, SubClient};
 use crate::state::State;
 use crate::window::Window;
 
-impl<C, W> XdgShellHandler for State<C, W>
-where
-    C: proto::Shared + Default,
-    W: proto::Shared + Default,
+impl XdgShellHandler for State
 {
     fn xdg_shell_state(&mut self) -> &mut smithay::wayland::shell::xdg::XdgShellState {
         &mut self.globals.xdg_shell_state
@@ -29,11 +29,11 @@ where
         // Whose connection produced this toplevel: the root's or a sub's.
         // The first toplevel of a client is its root window; the toplevels
         // its program spawns afterwards are that window's children.
-        if client.get_data::<RootClient<C, W>>().is_some() {
+        if client.get_data::<RootClient>().is_some() {
             admit_into_root_client(self, surface);
             return;
         }
-        if client.get_data::<SubClient<C, W>>().is_some() {
+        if client.get_data::<SubClient>().is_some() {
             admit_into_sub(self, surface);
             return;
         }
@@ -47,37 +47,36 @@ where
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let Some(client) = surface.wl_surface().client() else { return };
-        if let Some(root) = client.get_data::<RootClient<C, W>>() {
+        if let Some(root) = client.get_data::<RootClient>() {
             let was_root = {
-                let mut tree = root.root_window.write().unwrap();
-                let was_root = tree.as_ref().is_some_and(|t| t.surface.wl_surface == *surface.wl_surface());
-                if was_root {
-                    *tree = None;
-                }
-                was_root
+                let tree = root.root_window.read().unwrap();
+                tree.as_ref().is_some_and(|tree| {
+                    tree.surface.wl_surface == *surface.wl_surface()
+                })
             };
             if was_root {
                 // The root window is gone: the program is over. The Weak
                 // dies with the slot; the record drops (and kills the
                 // child) when the connection does.
+                *root.root_window.write().unwrap() = None;
                 self.root_client = None;
                 tracing::info!("compositor: the root window is gone; the root client is out");
-            } else if let Some(tree) = root.root_window.write().unwrap().as_mut() {
+            } else if let Some(tree) = root.root_window.read().unwrap().as_ref() {
                 tree.remove_surface(surface.wl_surface());
             }
-        } else if let Some(sub) = client.get_data::<SubClient<C, W>>() {
+        } else if let Some(sub) = client.get_data::<SubClient>() {
             let was_root = {
-                let mut tree = sub.root_window.write().unwrap();
-                let was_root = tree.as_ref().is_some_and(|t| t.surface.wl_surface == *surface.wl_surface());
-                if was_root {
-                    *tree = None;
-                }
-                was_root
+                let tree = sub.root_window.read().unwrap();
+                tree.as_ref().is_some_and(|tree| {
+                    tree.surface.wl_surface == *surface.wl_surface()
+                })
             };
             if !was_root {
-                if let Some(tree) = sub.root_window.write().unwrap().as_mut() {
+                if let Some(tree) = sub.root_window.read().unwrap().as_ref() {
                     tree.remove_surface(surface.wl_surface());
                 }
+            } else {
+                *sub.root_window.write().unwrap() = None;
             }
         }
     }
@@ -109,12 +108,12 @@ where
 /// asked for, clamped to `server_size`, which is the most this session can
 /// ever show. Either way the window's recorded size is the size it was
 /// configured at.
-fn admit<W: Default>(
+fn admit(
     surface: &ToplevelSurface,
     size: Option<(u32, u32)>,
     server_size: (u32, u32),
     serial: Serial,
-) -> Window<W> {
+) -> Window {
     let wanted = size.unwrap_or_else(|| {
         // The client's own request, bounded by what we can display.
         let req = surface.current_state().size;
@@ -130,7 +129,6 @@ fn admit<W: Default>(
         surface.wl_surface().clone(),
         surface.clone(),
         wanted,
-        W::default(),
     );
     surface.with_pending_state(|pending| {
         if size.is_some() {
@@ -147,10 +145,7 @@ fn admit<W: Default>(
 ///
 /// The first toplevel is the client's root window and fills the output; later
 /// ones are children and keep their own size.
-fn admit_into_root_client<C, W>(state: &mut State<C, W>, surface: ToplevelSurface)
-where
-    C: proto::Shared + Default,
-    W: proto::Shared + Default,
+fn admit_into_root_client(state: &mut State, surface: ToplevelSurface)
 {
     let server_size = state.server_size;
     let serial = state.next_serial();
@@ -163,18 +158,24 @@ where
     let win = admit(&surface, size, server_size, serial);
 
     let mut tree = root.root_window.write().unwrap();
-    match tree.as_mut() {
-        Some(tree) => tree.children.push(win),
-        None => *tree = Some(win),
-    }
+    let target = match tree.as_ref() {
+        Some(tree) => {
+            tree.children.write().unwrap().push(Arc::new(win));
+            tree.clone()
+        }
+        None => {
+            let admitted = Arc::new(win);
+            *tree = Some(admitted.clone());
+            admitted
+        }
+    };
+    drop(tree);
+
     // A commit that arrived before this window existed was held for it: that picture is
     // the only one the client will draw until something asks it again, so it goes in
     // now. See `hold` in `handlers/compositor.rs`.
     let held = state.pending_commits.remove(&surface.wl_surface().clone());
-    if let Some(tree) = tree.as_mut() {
-        apply_pending(held, tree);
-    }
-    drop(tree);
+    apply_pending(held, &target);
 
     // The window "fills" the output. Send `wl_surface.enter` so the client
     // knows an output is attached and can start presenting. Clients like
@@ -184,44 +185,42 @@ where
 }
 
 /// Apply a commit held for a window that has just been admitted.
-fn apply_pending<W>(
-    held: Option<(Vec<u8>, (u32, u32))>,
-    tree: &mut crate::window::Window<W>,
-) {
+fn apply_pending(held: Option<(Vec<u8>, (u32, u32))>, tree: &Arc<Window>) {
     let Some((pixels, _size)) = held else {
         return;
     };
     *tree.surface.pixels.lock().unwrap() = pixels;
-    tree.surface.committed = true;
+    tree.surface.committed.store(true, Ordering::Release);
     log::info!("applied a held commit to the window it belongs to");
 }
 
 /// Admit a toplevel into a sub-client's window tree.
-fn admit_into_sub<C, W>(state: &mut State<C, W>, surface: ToplevelSurface)
-where
-    C: proto::Shared + Default,
-    W: proto::Shared + Default,
+fn admit_into_sub(state: &mut State, surface: ToplevelSurface)
 {
     // A sub-client's windows never fill the output: one window does, and it
     // is the root client's. The configure proposes nothing, so the window
     // keeps the size its own program asked for.
     let serial = state.next_serial();
     let client = surface.wl_surface().client().expect("seen above");
-    let sub = client.get_data::<SubClient<C, W>>().expect("seen above");
-    let win = admit(&surface, None, state.server_size, serial);
+    let sub = client.get_data::<SubClient>().expect("seen above");
+    let win = Arc::new(admit(&surface, None, state.server_size, serial));
 
     let mut tree = sub.root_window.write().unwrap();
-    match tree.as_mut() {
-        Some(tree) => tree.children.push(win),
-        None => *tree = Some(win),
-    }
+    let target = match tree.as_ref() {
+        Some(tree) => {
+            tree.children.write().unwrap().push(win.clone());
+            tree.clone()
+        }
+        None => {
+            *tree = Some(win.clone());
+            win
+        }
+    };
+    drop(tree);
     // The commit that raced this admission goes in now: it is the picture the client
     // drew when it was configured, and nothing else will ask it to draw.
     let held = state.pending_commits.remove(&surface.wl_surface().clone());
-    if let Some(tree) = tree.as_mut() {
-        apply_pending(held, tree);
-    }
-    drop(tree);
+    apply_pending(held, &target);
 
     state.output.enter(surface.wl_surface());
     log::info!("admitted a window into a sub-client's tree");

@@ -1,5 +1,7 @@
 //! `wl_compositor` handler: buffer commits become owned pixels.
 
+use std::sync::atomic::Ordering;
+
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::compositor::{
@@ -9,10 +11,7 @@ use smithay::wayland::compositor::{
 use crate::state::State;
 use crate::utils::map_rgba;
 
-impl<C, W> CompositorHandler for State<C, W>
-where
-    C: proto::Shared + Default,
-    W: proto::Shared + Default,
+impl CompositorHandler for State
 {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.globals.compositor_state
@@ -22,7 +21,7 @@ where
         &self,
         client: &'a smithay::reexports::wayland_server::Client,
     ) -> &'a smithay::wayland::compositor::CompositorClientState {
-        crate::client::compositor_client_state::<C, W>(client)
+        crate::client::compositor_client_state(client)
             .expect("client has neither RootClient, SubClient nor XWaylandClientData")
     }
 
@@ -39,16 +38,16 @@ where
             Some(client) => client,
             None => return,
         };
-        if let Some(root) = client.get_data::<crate::client::RootClient<C, W>>() {
-            let mut tree = root.root_window.write().unwrap();
-            match tree.as_mut().and_then(|t| t.commit_target(surface)) {
-                Some(win) => commit_into(win, out_size, surface),
+        if let Some(root) = client.get_data::<crate::client::RootClient>() {
+            let tree = root.root_window.read().unwrap().clone();
+            match tree.and_then(|tree| crate::window::Window::commit_target(&tree, surface)) {
+                Some(win) => commit_into(&win, out_size, surface),
                 None => hold(self, surface, out_size),
             }
-        } else if let Some(sub) = client.get_data::<crate::client::SubClient<C, W>>() {
-            let mut tree = sub.root_window.write().unwrap();
-            match tree.as_mut().and_then(|t| t.commit_target(surface)) {
-                Some(win) => commit_into(win, out_size, surface),
+        } else if let Some(sub) = client.get_data::<crate::client::SubClient>() {
+            let tree = sub.root_window.read().unwrap().clone();
+            match tree.and_then(|tree| crate::window::Window::commit_target(&tree, surface)) {
+                Some(win) => commit_into(&win, out_size, surface),
                 // A client may commit between being configured and being admitted:
                 // `xdg-shell` sends the configure while the window is still being built,
                 // and this commit arrives before the window exists. Holding it is what
@@ -63,10 +62,8 @@ where
             let admitted = self
                 .root_client
                 .as_ref()
-                .and_then(|root| {
-                    let tree = root.root_window.read().unwrap();
-                    tree.as_ref().map(|w| w.surface.wl_surface.clone())
-                });
+                .and_then(|root| root.root_window.read().unwrap().clone())
+                .map(|tree| tree.surface.wl_surface.clone());
             if let Some(admitted) = admitted {
                 let is_win = admitted == *surface;
                 let is_kid = !is_win
@@ -76,10 +73,12 @@ where
                 if !(is_win || is_kid) {
                     return;
                 }
-                if let Some(root) = self.root_client.as_ref() {
-                    if let Some(win) = root.root_window.write().unwrap().as_mut() {
-                        commit_into(win, out_size, surface);
-                    }
+                if let Some(win) = self
+                    .root_client
+                    .as_ref()
+                    .and_then(|root| root.root_window.read().unwrap().clone())
+                {
+                    commit_into(&win, out_size, surface);
                 }
             }
         }
@@ -95,10 +94,7 @@ where
 /// The buffer is still released here for the same reason — a client waiting on
 /// `wl_buffer.release` would otherwise never draw again, and the window would be waiting
 /// for a picture from a client that is waiting for its buffer.
-fn hold<C, W>(state: &mut State<C, W>, surface: &WlSurface, out_size: (u32, u32))
-where
-    C: proto::Shared + Default,
-    W: proto::Shared + Default,
+fn hold(state: &mut State, surface: &WlSurface, out_size: (u32, u32))
 {
     let mut pixels = Vec::new();
     let mut release: Option<smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer> =
@@ -126,11 +122,7 @@ where
 }
 
 /// Read the committed buffer into `win`'s pixel store.
-fn commit_into<W>(
-    win: &mut crate::window::Window<W>,
-    out_size: (u32, u32),
-    surface: &WlSurface,
-) {
+fn commit_into(win: &crate::window::Window, out_size: (u32, u32), surface: &WlSurface) {
     let mut any_pixels = false;
     // Buffer consumed this commit; we `memcpy` its contents in `map_rgba`,
     // so it can be released back to the client as soon as we're done.
@@ -155,6 +147,6 @@ fn commit_into<W>(
     }
 
     if any_pixels {
-        win.surface.committed = true;
+        win.surface.committed.store(true, Ordering::Release);
     }
 }

@@ -1,16 +1,70 @@
-//! Input shapes: the vocabulary is `proto`'s, so a caller writes the same code
-//! on every platform; only the evdev mapping below is Linux's business.
+//! Input shapes: the vocabulary is logical — a key, a button, a wheel step —
+//! and only the evdev mapping below is Linux's business.
 
-pub use proto::windowing::{Button, Input, Key, KeyState, ScrollDelta};
+/// One queued input event. Positions are window-local pixels, top-left origin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Input {
+    /// A key, by the character or the named key it is.
+    Key { key: Key, state: KeyState },
+    /// The pointer moved to a position inside the window.
+    ///
+    /// `held` is the button carried down while the move happened: a drag. A
+    /// plain motion carries none.
+    MouseMove {
+        x: f64,
+        y: f64,
+        held: Option<Button>,
+    },
+    /// A pointer button went down or up.
+    Button { button: Button, down: bool },
+    /// A wheel or trackpad scroll.
+    Scroll { delta: ScrollDelta },
+}
 
-/// The session's current pointer position and button state.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct PointerState {
-    /// Pointer position in output pixels.
-    pub x: f64,
-    pub y: f64,
-    /// True if any button is currently held.
-    pub button_down: bool,
+/// A key, logically: printable text as a character, everything else by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Char(char),
+    Return,
+    Tab,
+    Backspace,
+    Delete,
+    Escape,
+    Space,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+}
+
+/// Whether a key or button went down or up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyState {
+    Pressed,
+    Released,
+}
+
+/// A pointer button, by role rather than by code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Button {
+    Left,
+    Middle,
+    Right,
+    Back,
+    Forward,
+}
+
+/// How far a wheel or trackpad scrolled, in steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScrollDelta {
+    /// Vertical steps: positive is down.
+    pub vertical: i32,
+    /// Horizontal steps: positive is right.
+    pub horizontal: i32,
 }
 
 /// The evdev code (linux/input-event-codes.h values) for a key.
@@ -28,7 +82,8 @@ pub(crate) fn key_evdev(key: Key) -> u32 {
     const KEY_LEFT: u32 = 105;
     const KEY_RIGHT: u32 = 106;
     const KEY_UP: u32 = 103;
-    const KEY_DOWN: u32 = 108;    match key {
+    const KEY_DOWN: u32 = 108;
+    match key {
         Key::Char(c) => char_evdev(c),
         Key::Return => KEY_ENTER,
         Key::Tab => KEY_TAB,
@@ -110,3 +165,4 @@ pub(crate) fn button_evdev(button: Button) -> u32 {
         Button::Forward => 0x114, // BTN_EXTRA
     }
 }
+

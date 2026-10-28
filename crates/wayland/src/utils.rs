@@ -222,9 +222,9 @@ fn wl_bpp(f: smithay::reexports::wayland_server::protocol::wl_shm::Format) -> us
 /// at the definition site, not where it is invoked.
 macro_rules! forward_global {
     ($interface:ty: $udata:ty => $helper:ty) => {
-        impl<C: proto::Shared + Default, W: proto::Shared + Default>
+        impl
             smithay::reexports::wayland_server::GlobalDispatch<$interface, $udata>
-            for crate::state::State<C, W>
+            for crate::state::State
         {
             fn bind(
                 state: &mut Self,
@@ -248,9 +248,9 @@ macro_rules! forward_global {
 /// bookkeeping. Same rule: every name is fully qualified.
 macro_rules! forward {
     ($interface:ty: $udata:ty => $helper:ty) => {
-        impl<C: proto::Shared + Default, W: proto::Shared + Default>
+        impl
             smithay::reexports::wayland_server::Dispatch<$interface, $udata>
-            for crate::state::State<C, W>
+            for crate::state::State
         {
             fn request(
                 state: &mut Self,

@@ -27,10 +27,11 @@ mod window;
 
 pub use client::{RootClient, SubClient};
 pub use error::{CompError, Result};
-pub use inputs::{Button, Input, Key, KeyState, PointerState, ScrollDelta};
+pub use inputs::{Button, Input, Key, KeyState, ScrollDelta};
 pub use window::Window;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use smithay::reexports::wayland_server::backend::GlobalId;
@@ -71,11 +72,11 @@ pub(crate) fn server_time() -> u32 {
 }
 
 /// The headless Wayland session, owned by the caller and driven inline.
-pub struct WaylandServer<C: proto::Shared = (), W: proto::Shared = ()> {
+pub struct WaylandServer {
     /// The session state: the root client, its windows, the seat, the X11 side.
-    state: State<C, W>,
-    event_loop: EventLoop<'static, State<C, W>>,
-    display: Display<State<C, W>>,
+    state: State,
+    event_loop: EventLoop<'static, State>,
+    display: Display<State>,
     socket: ListeningSocket,
     /// Absolute path of the listening socket, for `WAYLAND_DISPLAY`.
     socket_name: PathBuf,
@@ -89,17 +90,11 @@ pub struct WaylandServer<C: proto::Shared = (), W: proto::Shared = ()> {
     use_x11: bool,
 }
 
-impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W> {
+impl WaylandServer {
     /// Start the headless session: display, private socket, the single output,
     /// the seat, and (when asked) the XWayland server.
     #[tracing::instrument(name = "server.new", skip_all)]
-    pub fn new(
-        options: Options,
-    ) -> Result<Self, CompError>
-    where
-        C: Default,
-        W: Default,
-    {
+    pub fn new(options: Options) -> Result<Self, CompError> {
         // A private runtime dir, isolated from the caller's (Hyprland's): the
         // child's `XDG_RUNTIME_DIR` points here, so the only Wayland socket it
         // can auto-discover is ours.
@@ -114,7 +109,7 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
         // The one output, at the resolution the session is asked for; the
         // window fills it.
         let output = Self::new_output(options.resolution, options.dpi)?;
-        let output_global = output.create_global::<State<C, W>>(&dh);
+        let output_global = output.create_global::<State>(&dh);
 
         // The globals, the seat with its keyboard and pointer, and the output.
         let state = State::new(&dh, output, options.resolution, options.dpi, options.show_cursor)?;
@@ -139,8 +134,8 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
     }
 
     /// A private runtime dir, isolated from the caller's (Hyprland's). The
-    /// child gets this as `XDG_RUNTIME_DIR` so the only Wayland socket it can
-    /// auto-discover is ours; the host compositor simply isn't there.
+    /// child gets this as `XDG_RUNTIME_DIR` so the only Wayland socket it
+    /// can auto-discover is ours; the host compositor simply isn't there.
     fn new_runtime_dir() -> Result<PathBuf, CompError> {
         // `/tmp` and not `temp_dir()`: `TMPDIR` is whatever launched us, and under a
         // shell that is a per-shell directory that a grandchild does not inherit. The
@@ -238,6 +233,20 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
         self.state.server_size
     }
 
+    /// The root window's tree, shared by the `Arc` the tree keeps it under:
+    /// the strong share from which weak handles are minted.
+    pub fn root_tree(&self) -> Option<Arc<Window>> {
+        self.state.root_client.as_ref()?.root_window.read().unwrap().clone()
+    }
+
+    /// Whether the session's program is still running.
+    pub fn is_running(&self) -> bool {
+        self.state
+            .root_client
+            .as_ref()
+            .is_some_and(|root| root.is_running())
+    }
+
     /// The command a client is launched with: a native Wayland client
     /// connects to us via `WAYLAND_DISPLAY`; an X11-only one falls back to
     /// our XWayland via `DISPLAY` (routed separately, in `route_display`).
@@ -277,22 +286,10 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
                     return Ok(());
                 }
                 None => {
-                    proto::windowing::WindowingServer::advance(self, Duration::from_millis(10));
+                    self.step(Duration::from_millis(10));
                 }
             }
         }
-    }
-}
-
-impl<C, W> proto::windowing::WindowingServer<C, W> for WaylandServer<C, W>
-where
-    C: proto::Shared + Default,
-    W: proto::Shared + Default,
-{
-    /// The root client, as a trait object. The borrow is of the session's own
-    /// field, so it lives as long as the `&self`.
-    fn root_client(&self) -> Option<&dyn proto::windowing::Client<C, W>> {
-        Some(self.state.root_client.as_ref()?.as_ref())
     }
 
     /// Spawn `path` into the session and return at once.
@@ -300,11 +297,11 @@ where
     /// Native Wayland clients reach our private socket via `WAYLAND_DISPLAY`;
     /// X11-only clients are routed to the XWayland server we own via `DISPLAY`.
     ///
-    /// Nothing is waited for. The client has not connected yet, so it has no
+    /// Nothing is waited for. The child has not connected yet, so it has no
     /// window: the caller learns about both by advancing the server and asking
-    /// `root_client` again, which is what makes the loop the caller's to own.
+    /// `root_tree` again, which is what makes the loop the caller's to own.
     #[tracing::instrument(name = "server.spawn", skip_all)]
-    fn spawn(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+    pub fn spawn(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         tracing::info!(path = %path.display(), "spawning client");
 
         // The command that can reach both display stacks, scrubbed of
@@ -368,7 +365,7 @@ where
     /// The server only moves forward when this is called, so the caller's loop
     /// is the session's heartbeat.
     #[tracing::instrument(name = "server.step", skip(self))]
-    fn advance(&mut self, timeout: Duration) {
+    pub fn step(&mut self, timeout: Duration) {
         let WaylandServer {
             state,
             event_loop,
@@ -378,7 +375,7 @@ where
         } = self;
 
         // New clients on our private socket. The socket is polled here rather
-        // than as a loop source, so `advance` owns every part of the turn.
+        // than as a loop source, so `step` owns every part of the turn.
         while let Ok(Some(stream)) = socket.accept() {
             if let Err(e) = state.accept_client(stream) {
                 log::warn!("a connection was not admitted: {e}");
@@ -400,15 +397,11 @@ where
         }
     }
 
-    fn is_ready(&self) -> bool {
-        self.state.root_client.is_some()
-    }
-
     /// Resize the session: the output's mode, and the resolution future
     /// windows are configured and captured at. Windows are not re-configured
     /// here; whoever wants one resized asks the window itself, through
-    /// `proto::windowing::Window::set_size`.
-    fn set_size(&mut self, size: (u32, u32)) {
+    /// `wayland::Window::set_size`.
+    pub fn set_size(&mut self, size: (u32, u32)) {
         let mode = smithay::output::Mode {
             size: (size.0 as i32, size.1 as i32).into(),
             refresh: 60_000,
@@ -420,7 +413,7 @@ where
     }
 }
 
-impl<C: proto::Shared, W: proto::Shared> Drop for WaylandServer<C, W> {
+impl Drop for WaylandServer {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.runtime_dir);
     }

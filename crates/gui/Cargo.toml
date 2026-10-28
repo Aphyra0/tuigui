@@ -8,15 +8,14 @@ description = "Client side: draw a runnable's output into the pane the tui serve
 [dependencies]
 wire = { workspace = true }
 easytgp = { workspace = true }
-ratatui = { workspace = true }
+# `unstable-widget-ref`: a window draws itself through a shared reference, so
+# a window is a `WidgetRef` rather than a `Widget` consumed by the draw.
+ratatui = { workspace = true, features = ["unstable-widget-ref"] }
 # Reading this terminal's size in pixels, for the session's output.
 crossterm = { workspace = true }
 # The headless Wayland session an app runs inside, and the capture of the
 # window it draws there.
 wayland = { workspace = true }
-# The platform-neutral vocabulary the session is driven through: a client, its
-# windows, and the inputs they take. Nothing here names the backend.
-proto = { workspace = true }
 # The terminal's input parser: raw bytes from the pane go in, typed events
 # (keys, mouse, protocol responses) come out.
 termina = { workspace = true }
