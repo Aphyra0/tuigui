@@ -40,7 +40,7 @@ where
     ) -> Result<(), CompError> {
         match input {
             Input::Key { key, state } => self.handle_keycode(focus, crate::inputs::key_evdev(key), state),
-            Input::MouseMove { x, y } => self.handle_mouse_move(focus, x, y),
+            Input::MouseMove { x, y, held: _ } => self.handle_mouse_move(focus, x, y),
             Input::Button { button, down } => self.handle_button(focus, button, down),
             Input::Scroll { delta } => self.handle_scroll(focus, delta),
         }

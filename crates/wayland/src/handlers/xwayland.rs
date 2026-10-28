@@ -17,7 +17,6 @@ use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState}
 use smithay::xwayland::xwm::{ResizeEdge, Reorder, X11Surface, X11Wm, XwmHandler, XwmId};
 
 use crate::state::State;
-use crate::window::Window;
 
 impl<C, W> XwmHandler for State<C, W>
 where
@@ -159,40 +158,12 @@ where
     C: proto::Shared + Default,
     W: proto::Shared + Default,
 {
-    /// Admit an X11 client's surface into the root client's window tree, as a
-    /// child when the tree already has a root window.
-    pub(crate) fn admit_x11(&mut self, window: &X11Surface) {
-        let Some(surface) = window.wl_surface() else {
-            // Not yet associated; `surface_associated` will call back.
-            return;
-        };
-        if self
-            .root_client
-            .as_ref()
-            .and_then(|root| {
-                root.root_window
-                    .read()
-                    .unwrap()
-                    .as_ref()
-                    .map(|t| t.surface.wl_surface == surface)
-            })
-            .unwrap_or(false)
-        {
-            tracing::debug!("x11: window already admitted; ignoring extra");
-            return;
-        }
-        let win: Window<W> = Window::new(surface.clone(), Some(self.server_size), W::default());
-        let Some(root) = self.root_client.as_ref() else {
-            tracing::debug!("x11: no root client to admit into");
-            return;
-        };
-        let mut tree = root.root_window.write().unwrap();
-        match tree.as_mut() {
-            Some(tree) => tree.children.push(win),
-            None => *tree = Some(win),
-        }
-        drop(tree);
-        self.output.enter(&surface);
-        tracing::info!("x11: admitted window into the root client's tree");
+    /// Admit an X11 client's surface into the root client's window tree.
+    ///
+    /// Dead in this build: XWayland is never spawned (`WaylandServer::new`
+    /// ignores `use_x11`), so no XWM ever runs and nothing calls this. It
+    /// exists only because the `XwmHandler` trait demands the method.
+    pub(crate) fn admit_x11(&mut self, _window: &X11Surface) {
+        tracing::warn!("x11: admission is not wired up in this build; ignoring a window");
     }
 }

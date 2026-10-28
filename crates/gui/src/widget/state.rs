@@ -26,6 +26,8 @@ use wire::unix::UnixSocket;
 use crate::compositor::Compositor;
 
 use super::{socket_path, Session, CONNECTIONS};
+use crate::compositor::{ClientData, WindowState};
+use proto::windowing::WindowingServer;
 
 /// How long a quiet session is paused before the window is looked at again.
 ///
@@ -49,7 +51,10 @@ const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// link it has not established: `StartingApp` has the [`Connection`] because dialing is
 /// what produced it, and `Connecting` has the transport because it has not produced one
 /// yet.
-pub enum State {
+///
+/// `T` is the window session this machine composites; it is plugged in once, at the
+/// session's start, from the debug options.
+pub enum State<T: WindowingServer<ClientData, WindowState>> {
     /// Nothing chosen yet: pick a socket.
     ///
     /// Carries nothing, not even a highlight: a click moves straight on, so there is no
@@ -81,20 +86,13 @@ pub enum State {
         /// The link, waiting for the compositor to start.
         connection: Connection,
         /// The start, polled once per frame.
-        starting: BoxFuture<'static, std::io::Result<Compositor>>,
+        starting: BoxFuture<'static, std::io::Result<Compositor<T>>>,
     },
-    /// The compositor's windows are being captured and sent, through the link that is
-    /// up.
+    /// The compositor's windows are being advanced and drawn, through the link
+    /// that is up.
     Streaming {
         connection: Connection,
-        compositor: Compositor,
-        /// The input read this frame, started on the previous one.
-        ///
-        /// A capture is one reading of the terminal's reader: the reader runs for
-        /// the whole session, and finishing a capture returns what it collected
-        /// since the last one. Keeping it across a frame is what lets the reading
-        /// happen while the window is being encoded.
-        capture: termputs::Capture,
+        compositor: Compositor<T>,
     },
     /// The session is over. Not a failure: it is how a session is meant to finish.
     ///
@@ -103,7 +101,7 @@ pub enum State {
     Done,
 }
 
-impl State {
+impl<T: WindowingServer<ClientData, WindowState>> State<T> {
     /// One frame: advance the session, and draw where it got to.
     ///
     /// Consumes `self` and returns the state it moved to, so a step that awaits owns what it
@@ -116,8 +114,8 @@ impl State {
         self,
         content: Rect,
         buf: &mut Buffer,
-        session: &mut Session,
-    ) -> Result<State, String> {
+        session: &mut Session<T>,
+    ) -> Result<State<T>, String> {
         match self {
             // The choice, and then straight past it.
             //
@@ -219,10 +217,11 @@ impl State {
                             session.program.display(),
                             session.size
                         );
-                        // Built here rather than inside the future: the encoder is a
-                        // codec handle that is not `Send`, and a future the runtime
-                        // moves between workers must be. A `Result` is what the state
-                        // carries, so a failure is drawn like any other.
+                        // Built here rather than inside the future: the server is
+                        // a compositor handle that is not `Send`, and a future
+                        // the runtime moves between workers must be. A `Result`
+                        // is what the state carries, so a failure is drawn like
+                        // any other.
                         //
                         // The pane in cells comes from the output in pixels and the
                         // terminal's cell size, which are the two numbers the session
@@ -235,16 +234,20 @@ impl State {
                             (session.size.0 / cell_w.max(1)) as u16,
                             (session.size.1 / cell_h.max(1)) as u16,
                         );
-                        let mut compositor = Compositor::new(session.size, pane, session.codec)
-                            .map_err(|e| format!("could not start a compositor: {e}"))?;
-                        compositor.spawn(&session.program).map_err(|e| {
-                            format!("could not start {}: {e}", session.program.display())
-                        })?;
-                        Ok(State::Streaming {
-                            connection,
-                            compositor,
-                            capture: session.input_listener.capture(),
-                        })
+                        let _ = pane;
+                        // The session is taken now: it was built where the
+                        // session began, and the compositor owns it from here.
+                        let mut server = session
+                            .server
+                            .take()
+                            .ok_or("the window session was already taken")?;
+                        server
+                            .spawn(&session.program)
+                            .map_err(|e| {
+                                format!("could not start {}: {e}", session.program.display())
+                            })?;
+                        let compositor = Compositor::new(server, session.debug.clone());
+                        Ok(State::Streaming { connection, compositor })
                     }
                     std::task::Poll::Ready(Err(e)) => Err(format!("could not be dialed: {e}")),
                     std::task::Poll::Pending => Ok(State::Connecting { advert, waiting }),
@@ -259,12 +262,7 @@ impl State {
                 render_centered(content, buf, "starting the program...".to_string());
                 match futures::poll!(starting.as_mut()) {
                     std::task::Poll::Ready(Ok(compositor)) => {
-                        let capture = session.input_listener.capture();
-                        Ok(State::Streaming {
-                            connection,
-                            compositor,
-                            capture,
-                        })
+                        Ok(State::Streaming { connection, compositor })
                     }
                     std::task::Poll::Ready(Err(e)) => Err(e.to_string()),
                     std::task::Poll::Pending => Ok(State::StartingApp {
@@ -281,33 +279,27 @@ impl State {
             // finds where a picture goes, so the draw is not decoration, it is the
             // placement.
             State::Streaming {
-                mut connection,
+                connection,
                 mut compositor,
-                capture,
             } => {
-                // The input that arrived since the last frame. The reader is still
-                // running, so this is a reading and not a hand-off: the next capture gets
-                // whatever arrives after this one.
-                let events = capture.finish();
-                let capture = session.input_listener.capture();
-                for event in &events {
+                // The input that arrived since the last frame. The reader thread
+                // keeps reading, so this is a drain of what is queued and not a
+                // hand-off: whatever arrives after it waits for the next frame.
+                while let Ok(event) = session.input_receiver.try_recv() {
                     compositor
-                        .input(event, session.cell)
+                        .input(&event)
                         .map_err(|e| format!("could not deliver input: {e}"))?;
                 }
 
-                // One turn: step the compositor, capture every window, send what changed.
-                // Bounded by the compositor's own step, and by the caller's frame.
-                compositor
-                    .frame(&connection)
-                    .await
-                    .map_err(|e| format!("the compositor failed: {e}"))?;
+                // One turn: advance the session, then draw where it got to.
+                // Bounded by the caller's frame.
+                compositor.advance(QUIET);
 
                 // And then draw it. The draw is not decoration: each window's content
                 // area is filled with that window's surface, and those cells are what
                 // the other side scans for to find where a picture goes. A frame that
                 // did not draw is a frame with nothing to place.
-                StatefulWidget::render(&mut compositor, content, buf, &mut connection);
+                StatefulWidget::render(&mut compositor, content, buf, &mut ());
 
                 // The programs are the session: when the last one has exited there is
                 // nothing left to send, and nothing left for the pane to be.
@@ -316,11 +308,7 @@ impl State {
                     return Ok(State::Done);
                 }
 
-                Ok(State::Streaming {
-                    connection,
-                    compositor,
-                    capture,
-                })
+                Ok(State::Streaming { connection, compositor })
             }
 
             // Over. Drawn so the pane says so rather than going blank, which would look

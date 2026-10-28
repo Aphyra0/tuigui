@@ -4,3 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "The platform-neutral foundation both the wayland session and the macOS backend speak"
+
+[dependencies]
+# The `WidgetRef` trait a window is: rendering by reference, so a window can
+# be drawn through a trait object. Unstable in ratatui, but shipped.
+ratatui = { workspace = true, features = ["unstable-widget-ref"] }

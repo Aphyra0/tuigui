@@ -104,9 +104,11 @@ where
 /// The admission common to both client kinds: configure, activate, and build
 /// the window that will hold the surface.
 ///
-/// `size` is the size to configure with. `None` proposes nothing: the client
-/// keeps whatever size it asked for, clamped to `server_size`, which is the
-/// most this session can ever show.
+/// `size` is the size to configure with — the root window's, the server's own
+/// resolution. `None` proposes nothing: the client keeps whatever size it
+/// asked for, clamped to `server_size`, which is the most this session can
+/// ever show. Either way the window's recorded size is the size it was
+/// configured at.
 fn admit<W: Default>(
     surface: &ToplevelSurface,
     size: Option<(u32, u32)>,
@@ -124,7 +126,12 @@ fn admit<W: Default>(
             None => server_size,
         }
     });
-    let win = Window::new(surface.wl_surface().clone(), Some(wanted), W::default());
+    let win = Window::new(
+        surface.wl_surface().clone(),
+        surface.clone(),
+        wanted,
+        W::default(),
+    );
     surface.with_pending_state(|pending| {
         if size.is_some() {
             pending.size = Some((wanted.0 as i32, wanted.1 as i32).into());
@@ -149,14 +156,9 @@ where
     let serial = state.next_serial();
     let root = state.root_client.as_ref().expect("root data seen");
 
-    // Whether this lands in the empty root slot decides the configured size,
-    // so the tree is consulted before the window is built.
-    let has_root = root
-        .root_window
-        .read()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|t| t.surface.committed || t.surface.size.is_some());
+    // Whether the root slot is occupied decides the configured size, so the
+    // tree is consulted before the window is built.
+    let has_root = root.root_window.read().unwrap().is_some();
     let size = if has_root { None } else { Some(server_size) };
     let win = admit(&surface, size, server_size, serial);
 
@@ -200,18 +202,13 @@ where
     C: proto::Shared + Default,
     W: proto::Shared + Default,
 {
-    let server_size = state.server_size;
+    // A sub-client's windows never fill the output: one window does, and it
+    // is the root client's. The configure proposes nothing, so the window
+    // keeps the size its own program asked for.
     let serial = state.next_serial();
     let client = surface.wl_surface().client().expect("seen above");
     let sub = client.get_data::<SubClient<C, W>>().expect("seen above");
-    let has_root = sub
-        .root_window
-        .read()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|t| t.surface.committed || t.surface.size.is_some());
-    let size = if has_root { None } else { Some(server_size) };
-    let win = admit(&surface, size, server_size, serial);
+    let win = admit(&surface, None, state.server_size, serial);
 
     let mut tree = sub.root_window.write().unwrap();
     match tree.as_mut() {

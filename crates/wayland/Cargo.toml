@@ -11,7 +11,9 @@ path = "src/bin/wayland-smoke.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 proto = { workspace = true }
+wire = { workspace = true }
 smithay = { workspace = true }
+ratatui = { workspace = true }
 wayland-protocols = { workspace = true }
 tracing = { workspace = true }
 # Diagnostics through the `log` facade, like the rest of the workspace: the binary

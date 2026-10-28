@@ -19,14 +19,19 @@
 //! drawn, so the step is driven from the draw: one frame is one step. See
 //! [`widget::Session`].
 
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
+use std::sync::Arc;
 
 use codecs::CodecId;
+use proto::windowing::WindowingServer;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use widget::{GuiWidget, Session};
 
+use compositor::{ClientData, WindowState};
+
 mod compositor;
+mod inputs;
 mod widget;
 
 /// A program to stream into this pane.
@@ -82,6 +87,15 @@ impl StreamingOptions {
 // same thing is a command that refuses to build at all.
 #[group(id = "gui-debug")]
 pub struct DebugOptions {
+    /// Draw the compositor itself, with no session behind it.
+    ///
+    /// No link is waited for and no program is started: the pane is the
+    /// compositor's own drawing, with a red background standing in for every
+    /// picture a session would paint underneath it. What that leaves to look
+    /// at is the compositing itself — the borders, the titles, the stacking,
+    /// the dragging.
+    #[arg(long = "dbg-dummy-windowing")]
+    pub dummy_windowing: bool,
     /// Play the runnable again from the start when it ends, forever.
     ///
     /// A clip is short and a session is not, so a run that ends after a few seconds is hard
@@ -130,6 +144,12 @@ impl Gui {
         // Drawn to the writer the caller gave, not to `io::stdout()`: the caller is what
         // knows where this pane's screen is, and writing to the process's own stdout would
         // ignore it.
+        //
+        // Mouse reporting is the reader's protocol, and nothing turns it on by
+        // itself: asked for here, through that same writer, once, with
+        // crossterm's own capture — SGR encoding under it, no pixel mode.
+        let mut stdout = stdout;
+        crossterm::execute!(stdout, crossterm::event::EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -148,18 +168,48 @@ impl Gui {
         // Held for the whole session: dropping it restores the terminal, which is
         // what the name and the lack of an underscore say.
         let _tty = Raw::install()?;
-        let listener = termputs::Listener::new(
-            Box::new(stdin) as widget::Input,
-            Box::new(std::io::stdout()) as widget::Output,
-        )?;
 
-        let mut session = Session::new(self.program, output, cell, listener, self.streaming.codec());
+        // The pane's input, read and parsed on a thread of its own: a read of
+        // the raw terminal blocks until the pane has something to say, and the
+        // draw loop cannot sit in that read. Nothing typed while the session
+        // connects is lost — the events wait in the channel until a state
+        // reads them.
+        let input = BufReader::new(Box::new(stdin) as widget::Input);
+        let input_receiver = inputs::start(input)?;
+
+        // The window session this pane composites: the dummy one under
+        // `--dbg-dummy-windowing`, which draws windows nobody is running, the
+        // wayland server otherwise. Boxed once here, so the session does not
+        // care which one it was.
+        let server: Box<dyn WindowingServer<ClientData, WindowState>> =
+            if self.debug.dummy_windowing {
+                Box::new(crate::compositor::DummyServer::default())
+            } else {
+                Box::new(
+                    wayland::WaylandServer::new(wayland::Options {
+                        resolution: output,
+                        dpi: 1.0,
+                        show_cursor: true,
+                        use_x11: false,
+                    })
+                    .map_err(|e| std::io::Error::other(e.to_string()))?,
+                )
+            };
+        let mut session = Session::new(
+            self.program,
+            output,
+            cell,
+            input_receiver,
+            self.streaming.codec(),
+            server,
+            Arc::new(self.debug),
+        );
 
         loop {
             // The frame's span is on `GuiWidget::render`, which is what one call
             // to `draw` actually is.
             terminal.draw(|frame| {
-                frame.render_stateful_widget(GuiWidget, frame.area(), &mut session)
+                frame.render_stateful_widget(GuiWidget::default(), frame.area(), &mut session)
             })?;
             if session.done() {
                 return Ok(());

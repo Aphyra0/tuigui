@@ -17,9 +17,11 @@ wayland = { workspace = true }
 # The platform-neutral vocabulary the session is driven through: a client, its
 # windows, and the inputs they take. Nothing here names the backend.
 proto = { workspace = true }
-# The terminal's input, as events, with keys mapped to the codes the
-# session's seat takes.
-termputs = { workspace = true }
+# The terminal's input parser: raw bytes from the pane go in, typed events
+# (keys, mouse, protocol responses) come out.
+termina = { workspace = true }
+# The capybara demo image, converted to ANSI art cells (halftone).
+halftone = { version = "0.10", default-features = false }
 # The codec the client encodes with, behind the trait a codec can be swapped
 # behind. Which codec it is, is announced on the wire, not assumed here.
 codecs = { workspace = true }

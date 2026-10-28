@@ -31,7 +31,6 @@ pub use inputs::{Button, Input, Key, KeyState, PointerState, ScrollDelta};
 pub use window::Window;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use smithay::reexports::wayland_server::backend::GlobalId;
@@ -234,130 +233,9 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
         Ok(output)
     }
 
-    /// Advance the session: accept new clients, drain their input mailboxes,
-    /// dispatch their protocol, fire pending frame callbacks, and flush
-    /// everything back down the sockets.
-    ///
-    /// The server only moves forward when this is called, so the caller's loop
-    /// is the session's heartbeat.
-    #[tracing::instrument(name = "server.step", skip(self))]
-    pub fn step(&mut self, timeout: Duration) -> Result<(), CompError> {
-        let WaylandServer {
-            state,
-            event_loop,
-            display,
-            socket,
-            ..
-        } = self;
-
-        // New clients on our private socket. The socket is polled here rather
-        // than as a loop source, so `step` owns every part of the turn.
-        while let Ok(Some(stream)) = socket.accept() {
-            state.accept_client(stream)?;
-        }
-
-        // Queued inputs dispatch here, against the window each queue came
-        // from, so they land at a well-defined point in the protocol stream.
-        state.dispatch_inputs();
-
-        event_loop
-            .dispatch(Some(timeout), state)
-            .map_err(|e| CompError::Server(e.to_string()))?;
-        display
-            .dispatch_clients(state)
-            .map_err(|e| CompError::Server(e.to_string()))?;
-        display
-            .flush_clients()
-            .map_err(|e| CompError::Server(e.to_string()))?;
-        Ok(())
-    }
-
-    /// The root client, and through it every window it has.
-    ///
-    /// Weak, so a caller cannot keep the session's record alive past the connection:
-    /// the owning `Arc` is the connection's data slot, and this is a share of a count,
-    /// not a keep-alive.
-    pub fn root_client(&self) -> Option<Weak<RootClient<C, W>>> {
-        self.state.root_client.as_ref().map(Arc::downgrade)
-    }
-
     /// The output's resolution in pixels.
     pub fn size(&self) -> (u32, u32) {
         self.state.server_size
-    }
-
-    /// Spawn `path` into the session and return at once.
-    ///
-    /// Native Wayland clients reach our private socket via `WAYLAND_DISPLAY`;
-    /// X11-only clients are routed to the XWayland server we own via `DISPLAY`.
-    ///
-    /// Nothing is waited for. The client has not connected yet, so it has no
-    /// window: the caller learns about both by stepping the server and asking
-    /// `root_client` again, which is what makes the loop the caller's to own.
-    #[tracing::instrument(name = "server.spawn", skip_all)]
-    pub fn spawn(&mut self, path: impl AsRef<Path>) -> Result<Weak<RootClient<C, W>>, CompError>
-    where
-        C: Default,
-        W: Default,
-    {
-        tracing::info!(path = %path.as_ref().display(), "spawning client");
-
-        // The command that can reach both display stacks, scrubbed of
-        // everything that could reach a host compositor.
-        let mut command = Self::new_command(path.as_ref(), &self.socket_name);
-
-        // X11-only clients are routed to our XWayland; step until it is up.
-        if self.use_x11 {
-            self.route_display(&mut command)?;
-        } else {
-            command.env_remove("DISPLAY");
-        }
-
-        // What the child is told, said out loud: a program that reports "no display"
-        // cannot be asked which value it read, so the value goes in the log next to
-        // whether the socket is really there. The diff between this line and what the
-        // program says is the whole diagnosis.
-        //
-        // Through `log`, not `tracing`: the binary installs a `log` capturer, and a
-        // `tracing` event only reaches it when no tracing subscriber is installed. The
-        // profiler build installs one that keeps every event to itself.
-        log::info!(
-            "launching {} with WAYLAND_DISPLAY={} (socket exists: {})",
-            path.as_ref().display(),
-            self.socket_name.display(),
-            self.socket_name.exists()
-        );
-
-        // A program's own diagnostics go to a file, not the pane: this process owns the
-        // terminal, and a toolkit's warnings written to stdout would land in the middle
-        // of the screen the pane is drawing on.
-        //
-        // Descriptors rather than pipes: a pipe can fill, and a program blocked writing
-        // to one is a program that never draws. A file never blocks.
-        let chatter = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/tuigui-client.log")
-            .map_err(|e| CompError::Spawn(format!("opening the client log: {e}")))?;
-        let chatter_err = chatter
-            .try_clone()
-            .map_err(|e| CompError::Spawn(format!("cloning the client log: {e}")))?;
-        command.stdout(std::process::Stdio::from(chatter));
-        command.stderr(std::process::Stdio::from(chatter_err));
-        let child = command
-            .spawn()
-            .map_err(|e| CompError::Spawn(format!("{}: {e}", path.as_ref().display())))?;
-
-        // The child becomes the session's root client; its connection
-        // attaches at the next step.
-        self.state.attach_root_client(child)?;
-
-        Ok(self
-            .state
-            .root_client
-            .as_ref()
-            .map(Arc::downgrade)
-            .expect("the root client was just attached"))
     }
 
     /// The command a client is launched with: a native Wayland client
@@ -399,10 +277,146 @@ impl<C: proto::Shared + Default, W: proto::Shared + Default> WaylandServer<C, W>
                     return Ok(());
                 }
                 None => {
-                    self.step(Duration::from_millis(10))?;
+                    proto::windowing::WindowingServer::advance(self, Duration::from_millis(10));
                 }
             }
         }
+    }
+}
+
+impl<C, W> proto::windowing::WindowingServer<C, W> for WaylandServer<C, W>
+where
+    C: proto::Shared + Default,
+    W: proto::Shared + Default,
+{
+    /// The root client, as a trait object. The borrow is of the session's own
+    /// field, so it lives as long as the `&self`.
+    fn root_client(&self) -> Option<&dyn proto::windowing::Client<C, W>> {
+        Some(self.state.root_client.as_ref()?.as_ref())
+    }
+
+    /// Spawn `path` into the session and return at once.
+    ///
+    /// Native Wayland clients reach our private socket via `WAYLAND_DISPLAY`;
+    /// X11-only clients are routed to the XWayland server we own via `DISPLAY`.
+    ///
+    /// Nothing is waited for. The client has not connected yet, so it has no
+    /// window: the caller learns about both by advancing the server and asking
+    /// `root_client` again, which is what makes the loop the caller's to own.
+    #[tracing::instrument(name = "server.spawn", skip_all)]
+    fn spawn(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        tracing::info!(path = %path.display(), "spawning client");
+
+        // The command that can reach both display stacks, scrubbed of
+        // everything that could reach a host compositor.
+        let mut command = Self::new_command(path, &self.socket_name);
+
+        // X11-only clients are routed to our XWayland; step until it is up.
+        if self.use_x11 {
+            self.route_display(&mut command)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        } else {
+            command.env_remove("DISPLAY");
+        }
+
+        // What the child is told, said out loud: a program that reports "no display"
+        // cannot be asked which value it read, so the value goes in the log next to
+        // whether the socket is really there. The diff between this line and what the
+        // program says is the whole diagnosis.
+        //
+        // Through `log`, not `tracing`: the binary installs a `log` capturer, and a
+        // `tracing` event only reaches it when no tracing subscriber is installed. The
+        // profiler build installs one that keeps every event to itself.
+        log::info!(
+            "launching {} with WAYLAND_DISPLAY={} (socket exists: {})",
+            path.display(),
+            self.socket_name.display(),
+            self.socket_name.exists()
+        );
+
+        // A program's own diagnostics go to a file, not the pane: this process owns the
+        // terminal, and a toolkit's warnings written to stdout would land in the middle
+        // of the screen the pane is drawing on.
+        //
+        // Descriptors rather than pipes: a pipe can fill, and a program blocked writing
+        // to one is a program that never draws. A file never blocks.
+        let chatter = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/tuigui-client.log")
+            .map_err(|e| std::io::Error::other(format!("opening the client log: {e}")))?;
+        let chatter_err = chatter
+            .try_clone()
+            .map_err(|e| std::io::Error::other(format!("cloning the client log: {e}")))?;
+        command.stdout(std::process::Stdio::from(chatter));
+        command.stderr(std::process::Stdio::from(chatter_err));
+        let child = command
+            .spawn()
+            .map_err(|e| std::io::Error::other(format!("{}: {e}", path.display())))?;
+
+        // The child becomes the session's root client; its connection
+        // attaches at the next step.
+        self.state
+            .attach_root_client(child)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    /// Advance the session: accept new clients, drain their input mailboxes,
+    /// dispatch their protocol, fire pending frame callbacks, and flush
+    /// everything back down the sockets.
+    ///
+    /// The server only moves forward when this is called, so the caller's loop
+    /// is the session's heartbeat.
+    #[tracing::instrument(name = "server.step", skip(self))]
+    fn advance(&mut self, timeout: Duration) {
+        let WaylandServer {
+            state,
+            event_loop,
+            display,
+            socket,
+            ..
+        } = self;
+
+        // New clients on our private socket. The socket is polled here rather
+        // than as a loop source, so `advance` owns every part of the turn.
+        while let Ok(Some(stream)) = socket.accept() {
+            if let Err(e) = state.accept_client(stream) {
+                log::warn!("a connection was not admitted: {e}");
+            }
+        }
+
+        // Queued inputs dispatch here, against the window each queue came
+        // from, so they land at a well-defined point in the protocol stream.
+        state.dispatch_inputs();
+
+        if let Err(e) = event_loop.dispatch(Some(timeout), state) {
+            log::warn!("the event loop did not dispatch: {e}");
+        }
+        if let Err(e) = display.dispatch_clients(state) {
+            log::warn!("the display did not dispatch: {e}");
+        }
+        if let Err(e) = display.flush_clients() {
+            log::warn!("the display did not flush: {e}");
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.state.root_client.is_some()
+    }
+
+    /// Resize the session: the output's mode, and the resolution future
+    /// windows are configured and captured at. Windows are not re-configured
+    /// here; whoever wants one resized asks the window itself, through
+    /// `proto::windowing::Window::set_size`.
+    fn set_size(&mut self, size: (u32, u32)) {
+        let mode = smithay::output::Mode {
+            size: (size.0 as i32, size.1 as i32).into(),
+            refresh: 60_000,
+        };
+        self.state.output.change_current_state(Some(mode), None, None, None);
+        self.state.output.set_preferred(mode);
+        self.state.server_size = size;
+        log::info!("resized the session to {}x{}", size.0, size.1);
     }
 }
 

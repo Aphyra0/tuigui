@@ -48,6 +48,9 @@ cell_map = { path = "crates/cell_map" }
 pollster = "0.4"
 fxhash = "0.2"
 crossterm = { version = "0.28", default-features = false, features = ["events"] }
+# The terminal input parser: the gui client's reader thread feeds it the pane's
+# raw bytes and reads typed events out, instead of parsing escapes by hand.
+termina = "0.4"
 derive_deref = "1.1"
 derive-getters = "0.5"
 derive_setters = "0.1"

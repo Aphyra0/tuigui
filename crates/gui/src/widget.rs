@@ -18,6 +18,12 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, StatefulWidget, Widget as _};
 use codecs::CodecId;
+use proto::windowing::WindowingServer;
+
+use std::sync::Arc;
+
+use crate::compositor::{ClientData, WindowState};
+use crate::DebugOptions;
 
 /// What the session holds while a step is running.
 ///
@@ -61,24 +67,21 @@ pub const FILL: char = '❋';
 /// This terminal's input, boxed so a caller may hand in its own.
 ///
 /// The session holds one of these for its whole life, and `Gui::run` is generic
-/// over what it was given, so the two handles are boxed rather than named.
-///
-/// The input is `termputs`'s trait rather than plain `Read`: the reader has to
-/// wait on the same descriptor it reads, and a box of `Read` alone has no
-/// descriptor to wait on.
-pub type Input = Box<dyn termputs::Input>;
-/// This terminal's output, boxed for the same reason.
-pub type Output = Box<dyn std::io::Write + Send>;
+/// over what it was given, so the handle is boxed rather than named.
+pub type Input = Box<dyn std::io::Read + Send>;
 
 /// One session: where it is, and what is open over it.
-pub struct Session {
+///
+/// `T` is the window session this one composites; it is chosen once, where the
+/// session is created, from the debug options.
+pub struct Session<T: WindowingServer<ClientData, WindowState>> {
     /// Where the session is, or what went wrong getting there.
     ///
     /// A `Result` and not a state, because a step consumes the state it is given: there
     /// has to be something in its place while the step runs, and a failure is the only
     /// honest thing to put there. A step that never returns its next state leaves the
     /// failure behind, and the pane shows it.
-    pub state: Result<State, String>,
+    pub state: Result<State<T>, String>,
     /// What is open over it.
     pub popup_state: PopupState,
     /// The buttons along the bottom.
@@ -88,18 +91,22 @@ pub struct Session {
     /// The codec the session streams with, chosen at the command line and
     /// announced on the wire before any frame.
     pub codec: CodecId,
+    /// The window session waiting to be composited: taken when the dial
+    /// comes up, and started then.
+    pub server: Option<T>,
+    /// The switches this pane runs with (`--dbg-*`).
+    pub debug: Arc<DebugOptions>,
     /// The compositor's output size, which is also the program's window size.
     ///
     /// Fixed when the session starts: the compositor's output being the window is what
     /// the MVP fixes, so this is read once and reused for every later step.
     pub size: (u32, u32),
-    /// This terminal's input, with the mouse and keyboard protocols requested.
+    /// This terminal's input, as parsed events.
     ///
-    /// Kept for the whole session and not per frame: it owns the requests that
-    /// turn reporting on, so dropping it between frames would turn a terminal's
-    /// mouse reporting off and on again. The `Capture`s it hands out are the
-    /// disposable part.
-    pub input_listener: termputs::Listener<Input, Output>,
+    /// The reader thread owns the parsing and the reading; this end only
+    /// receives. Nothing is lost while a state is not reading: the channel
+    /// holds whatever arrived, and the streaming step drains it all at once.
+    pub input_receiver: std::sync::mpsc::Receiver<termina::Event>,
     /// What one terminal cell is in output pixels.
     ///
     /// A mouse event arrives in cells and the compositor's pointer is in pixels,
@@ -108,18 +115,20 @@ pub struct Session {
     pub cell: (u32, u32),
 }
 
-impl Session {
+impl<T: WindowingServer<ClientData, WindowState>> Session<T> {
     /// Start a session over a terminal's input.
     ///
-    /// The listener is made here, not later, because making it is what asks the
-    /// terminal for its mouse and keyboard events: a session that waited until
-    /// it was streaming would miss everything typed while it connected.
+    /// The receive end is taken here, not later, so nothing typed while the
+    /// session connects is lost: the events wait in the channel until a state
+    /// reads them.
     pub fn new(
         program: std::path::PathBuf,
         size: (u32, u32),
         cell: (u32, u32),
-        input: termputs::Listener<Input, Output>,
+        input_receiver: std::sync::mpsc::Receiver<termina::Event>,
         codec: CodecId,
+        server: T,
+        debug: Arc<DebugOptions>,
     ) -> Self {
         Self {
             state: Ok(State::ConnSelect),
@@ -127,9 +136,11 @@ impl Session {
             footer: Footer,
             program,
             codec,
+            server: Some(server),
+            debug,
             size,
             cell,
-            input_listener: input,
+            input_receiver,
         }
     }
 
@@ -144,10 +155,22 @@ impl Session {
 }
 
 /// The client itself: a widget over [`Session`].
-pub struct GuiWidget;
+pub struct GuiWidget<T: WindowingServer<ClientData, WindowState>>(std::marker::PhantomData<T>);
 
-impl StatefulWidget for GuiWidget {
-    type State = Session;
+impl<T: WindowingServer<ClientData, WindowState>> GuiWidget<T> {
+    pub fn new() -> Self {
+        GuiWidget(std::marker::PhantomData)
+    }
+}
+
+impl<T: WindowingServer<ClientData, WindowState>> Default for GuiWidget<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: WindowingServer<ClientData, WindowState>> StatefulWidget for GuiWidget<T> {
+    type State = Session<T>;
 
     /// One frame.
     ///
@@ -156,7 +179,7 @@ impl StatefulWidget for GuiWidget {
     /// capture, the encode — so this is where the profiler's timeline should be
     /// divided. Every stage below it lands inside the frame it belongs to.
     #[tracing::instrument(name = "frame", skip_all)]
-    fn render(self, area: Rect, buf: &mut Buffer, session: &mut Session) {
+    fn render(self, area: Rect, buf: &mut Buffer, session: &mut Session<T>) {
         // The bottom line holds the buttons, and the rest belongs to the session. Split
         // once, so the state and the buttons agree about where the content ends.
         let [content, footer] =

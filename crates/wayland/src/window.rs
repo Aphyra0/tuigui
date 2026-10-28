@@ -11,15 +11,18 @@
 //! derived getters and setters mark what is exposed beyond the crate.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use derive_getters::Getters;
 use derive_setters::Setters;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::wayland::shell::xdg::ToplevelSurface;
 
 use crate::inputs::Input;
 use crate::state::State;
-use crate::CompError;
 
 /// One admitted window: its surface, its input mailbox, and the toplevels its
 /// program spawned.
@@ -28,6 +31,13 @@ use crate::CompError;
 pub struct Window<W = ()> {
     /// The admitted surface: buffer bookkeeping and the committed contents.
     pub(crate) surface: Surface,
+    /// The surface id this window draws itself as: its identity on the pane
+    /// and on the wire.
+    pub(crate) id: wire::message::SurfaceId,
+    /// The xdg toplevel behind this window: what a configure (a size
+    /// proposal) is sent through. Kept because admission is the only place
+    /// that holds one, and `set_size` has to reach it later.
+    pub(crate) toplevel: ToplevelSurface,
     /// Serial of the last configure sent (spawn waits for the first commit).
     pub(crate) last_configure_serial: Mutex<Option<u64>>,
     /// Toplevels this window's program spawned after being admitted. Detaching
@@ -48,9 +58,13 @@ pub struct Window<W = ()> {
 pub(crate) struct Surface {
     /// The admitted surface (an xdg toplevel's, or an X11 window's wl_surface).
     pub(crate) wl_surface: WlSurface,
-    /// The client-facing window size (the session's resolution). `None` for a
-    /// root surface, which is configured rather than sized here.
-    pub(crate) size: Option<(u32, u32)>,
+    /// The client-facing window size: what the window was last configured
+    /// at. Set at admission and rewritten by every later configure.
+    ///
+    /// An `RwLock`, not a plain field: a re-configure arrives through `&self`
+    /// (the same `Arc` the holder reads capture from), so the size a client
+    /// was last configured at has to change behind a lock.
+    pub(crate) size: RwLock<(u32, u32)>,
     /// Set once this window committed a readable buffer at least once.
     pub(crate) committed: bool,
     /// Latest committed contents, owned by us, written on commit.
@@ -58,14 +72,16 @@ pub(crate) struct Surface {
 }
 
 impl<W> Window<W> {
-    pub fn new(surface: WlSurface, size: Option<(u32, u32)>, attached: W) -> Self {
+    pub fn new(surface: WlSurface, toplevel: ToplevelSurface, size: (u32, u32), attached: W) -> Self {
         Window {
             surface: Surface {
                 wl_surface: surface,
-                size,
+                size: RwLock::new(size),
                 committed: false,
                 pixels: Mutex::new(Vec::new()),
             },
+            id: wire::message::SurfaceId::random(),
+            toplevel,
             last_configure_serial: Mutex::new(None),
             children: Vec::new(),
             inputs: Mutex::new(VecDeque::new()),
@@ -159,9 +175,38 @@ impl<W: proto::Shared> proto::windowing::Window<W> for Window<W> {
         f(&self.attached);
     }
 
+    fn set_size(&self, size: (u32, u32)) {
+        // The size proposal travels on the toplevel, not the surface; the
+        // client answers by committing a buffer at whatever size it chose.
+        self.toplevel.with_pending_state(|pending| {
+            pending.size = Some((size.0 as i32, size.1 as i32).into());
+        });
+        self.toplevel.send_configure();
+        *self.surface.size.write().unwrap() = size;
+    }
+
     fn with_children(&self, f: &mut dyn FnMut(&dyn proto::windowing::Window<W>)) {
         for child in &self.children {
             f(child);
+        }
+    }
+}
+
+/// A wayland window, the way the pane draws it: every cell filled with the
+/// window's own surface, which is the anchor the other side scans for.
+impl<W> ratatui::widgets::WidgetRef for Window<W> {
+    fn render_ref(&self, area: Rect, buf: &mut Buffer) {
+        let id = self.id;
+        let style = Style::new()
+            .fg(Color::Rgb(id.fg.0, id.fg.1, id.fg.2))
+            .bg(Color::Rgb(id.bg.0, id.bg.1, id.bg.2));
+        buf.set_style(area, style);
+        for row in area.y..area.bottom() {
+            for column in area.x..area.right() {
+                if let Some(cell) = buf.cell_mut((column, row)) {
+                    cell.set_char(id.symbol);
+                }
+            }
         }
     }
 }

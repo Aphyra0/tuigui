@@ -171,6 +171,40 @@ pub struct SurfaceId {
 }
 
 impl SurfaceId {
+    /// A surface id, made fresh.
+    ///
+    /// Random in all three fields so it cannot be mistaken for ordinary content and two
+    /// windows cannot collide by accident. The entropy comes from `RandomState`, which the
+    /// process seeds from the OS, mixed with a counter so two calls in the same nanosecond
+    /// still differ.
+    pub fn random() -> Self {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u32(n);
+        let a = hasher.finish();
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u64(a);
+        let b = hasher.finish();
+
+        // Glyphs that no program draws by accident: block elements and geometric shapes,
+        // nowhere near the ASCII a terminal UI is made of.
+        const SYMBOLS: &[char] = &[
+            '░', '▒', '▓', '█', '▚', '▞', '◧', '◨', '◩', '◪', '⬒', '⬓', '⬔', '⬕', '▛', '▜',
+        ];
+        // Two independent colours, each drawn from its own hash. Deriving one from the
+        // other — `rgb(b)` and `rgb(b >> 8)` — leaves their bytes overlapping, and a
+        // signature whose halves share bytes is one another window's cells can match.
+        SurfaceId {
+            symbol: SYMBOLS[(a % SYMBOLS.len() as u64) as usize],
+            fg: colour(a ^ 0x9e37_79b9_7f4a_7c15),
+            bg: colour(b),
+        }
+    }
+
     /// Whether `cell` is one of this surface's cells.
     ///
     /// Both colours must be true colour to compare: a palette index names whatever
@@ -187,6 +221,17 @@ impl SurfaceId {
         };
         self.symbol == symbol && self.fg == (fr, fg_, fb) && self.bg == (br, bg_, bb)
     }
+}
+
+/// A colour from `seed`, kept away from the extremes so a surface never looks like a
+/// plain default cell.
+fn colour(seed: u64) -> (u8, u8, u8) {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(seed);
+    let value = hasher.finish().to_le_bytes();
+    // 1..=254: never a pure black or a pure white, both of which read as "no colour".
+    (value[0].clamp(1, 254), value[1].clamp(1, 254), value[2].clamp(1, 254))
 }
 
 /// A request from the server down to the compositor.

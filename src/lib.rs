@@ -65,6 +65,9 @@ impl TuiGui {
         if self.gui.loop_video {
             args.push("--dbg-loop-video".into());
         }
+        if self.gui.dummy_windowing {
+            args.push("--dbg-dummy-windowing".into());
+        }
         #[cfg(feature = "tracy")]
         if self.gui.trace_gui {
             args.push("--dbg-trace-gui".into());

@@ -78,6 +78,25 @@
             '';
           };
 
+          # Capybara photos, from the freds0/capybara_dataset repo: the image
+          # set the dummy windowing path picks one of at random for its
+          # background. Pinned to the repo's last commit (2021-12).
+          # Exposed to the dev shell as `CAPYBARA_IMG_DIR` (the train images).
+          capyImages = pkgs.stdenv.mkDerivation {
+            pname = "capybara-images";
+            version = "0.1.0";
+            src = pkgs.fetchFromGitHub {
+              owner = "freds0";
+              repo = "capybara_dataset";
+              rev = "f6ba28f22064176c574629ea5a7cc2354acbcc78";
+              hash = "sha256-tFdjk6XVrzQ1VG4GAJnzwfpHws9jbzUj2Jd/v9+zKoA=";
+            };
+            installPhase = ''
+              mkdir -p $out
+              cp -r $src/images/train $out/train
+            '';
+          };
+
           # revdiff — TUI diff-review tool used by the repo's Crush skill
           # (.agents/skills/revdiff). Not packaged in this nixpkgs pin, so
           # fetch the upstream static release tarball (hashes match the
@@ -172,11 +191,16 @@
           # can stream it with `tuigui --video "$CAPY_VID_PATH"` without
           # handling licensing or re-encoding themselves.
           capy = self.packages.${system}.capyVideo or (pkgs.runCommand "capy-video" {} "mkdir -p $out; touch $out/capybara.mp4; echo 'no capybara package; build default first' >&2");
+          # Capybara demo images, pinned to the capyImages package above.
+          # `CAPYBARA_IMG_DIR` points at the train images so the dummy
+          # windowing path can pick one of them at random.
+          capys = self.packages.${system}.capyImages or (pkgs.runCommand "capybara-images" {} "mkdir -p $out/train; echo 'no capybara images package; build default first' >&2");
         in
         {
           default = pkgs.mkShell {
             shellHook = ''
               export CAPY_VID_PATH="${capy}/capybara.mp4"
+              export CAPYBARA_IMG_DIR="${capys}/train"
             '';
             packages = [
               # rustup "minimal" profile (rustc, cargo, rust-std) plus the two
