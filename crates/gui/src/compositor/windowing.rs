@@ -12,21 +12,24 @@
 //! logical — a key, a button, a wheel step — and the backend owns the mapping.
 
 pub mod dummy;
+pub mod event_map;
 pub mod wayland;
 
 use std::sync::Weak;
 
+use ratatui::layout::Rect;
 use ratatui::widgets::WidgetRef;
 
-/// A window's state, as the compositor keeps it: its size and its position
-/// inside its parent, in cells. This is what a window is drawn from, and what
-/// a drag moves or a border pull resizes.
+/// Where a window is and how big it is, in cells: the layout the compositor
+/// draws from, and the thing a drag moves or a frame pull resizes.
+///
+/// The rectangle is on the pane, whose origin is `(0, 0)`, so it is already the
+/// screen rectangle. Nothing here is the pointer's business: which gesture is in
+/// flight belongs to the compositor, in [`InputMode`](super::window::InputMode).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WindowState {
-    /// The window's size, in cells.
-    pub size: (u16, u16),
-    /// The window's position inside its parent, in cells.
-    pub position: (u16, u16),
+    /// The window's rectangle on the pane, in cells.
+    pub area: Rect,
 }
 
 /// The window session as a whole: what a program runs in.
@@ -102,8 +105,16 @@ impl WindowingServer for Box<dyn WindowingServer> {
 /// put it. Children are handed out as weak handles, so the compositor can
 /// keep a registry of what it has seen and prune what died.
 pub trait StatefulWindow: WidgetRef + Send + Sync {
-    /// Queue one input event for delivery to this window.
-    fn input(&self, input: Input) -> Result<(), Error>;
+    /// Queue one key event for delivery to this window.
+    ///
+    /// Keys and pointer events arrive through separate methods because UI Events
+    /// keeps them apart, and a seat depends on it: a modified key is a sequence
+    /// of key events that only means something in order, while a pointer event
+    /// carries a whole state and must not be interleaved into that sequence.
+    fn key_input(&self, event: ui_events::keyboard::KeyboardEvent) -> Result<(), Error>;
+
+    /// Queue one pointer event for delivery to this window.
+    fn pointer_input(&self, event: ui_events::pointer::PointerEvent) -> Result<(), Error>;
 
     /// What the window last drew: RGBA8, row-major, `width * height * 4` bytes.
     /// `NotReady` until it has drawn at least once.
@@ -114,7 +125,8 @@ pub trait StatefulWindow: WidgetRef + Send + Sync {
     /// The client decides whether to follow: its next commit is the answer.
     fn set_size(&self, size: (u32, u32));
 
-    /// The window's state: its size and its place inside its parent.
+    // TODO: use get_state -> &mut State instead
+    /// The window's state: its rectangle on the pane.
     fn state(&self) -> WindowState;
 
     /// Put the window somewhere else, or make it another size.
@@ -124,68 +136,6 @@ pub trait StatefulWindow: WidgetRef + Send + Sync {
     /// them: the caller keeps what it has not seen before — told apart by the
     /// pointer, not by bookkeeping — and prunes the ones that died.
     fn get_children(&self) -> Vec<Weak<dyn StatefulWindow>>;
-}
-
-/// One queued input event. Positions are window-local cells, top-left origin.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Input {
-    /// A key, by the character or the named key it is.
-    Key { key: Key, state: KeyState },
-    /// The pointer moved to a position inside the window.
-    ///
-    /// `held` is the button carried down while the move happened: a drag. A
-    /// plain motion carries none.
-    MouseMove { x: f64, y: f64, held: Option<Button> },
-    /// A pointer button went down or up.
-    Button { button: Button, down: bool },
-    /// A wheel or trackpad scroll.
-    Scroll { delta: ScrollDelta },
-}
-
-/// A key, logically: printable text as a character, everything else by name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Key {
-    Char(char),
-    Return,
-    Tab,
-    Backspace,
-    Delete,
-    Escape,
-    Space,
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,
-    End,
-    PageUp,
-    PageDown,
-}
-
-/// Whether a key or button went down or up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyState {
-    Pressed,
-    Released,
-}
-
-/// A pointer button, by role rather than by code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Button {
-    Left,
-    Middle,
-    Right,
-    Back,
-    Forward,
-}
-
-/// How far a wheel or trackpad scrolled, in steps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ScrollDelta {
-    /// Vertical steps: positive is down.
-    pub vertical: i32,
-    /// Horizontal steps: positive is right.
-    pub horizontal: i32,
 }
 
 /// Why a window could not do what was asked of it.
@@ -207,3 +157,13 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// Delivering input is the only failure this module hands back as an I/O error:
+/// the caller writes it to the pane's log beside the reads and writes it sits
+/// between, so a window that took an event and could not pass it on becomes one
+/// error rather than a stdout-shaped one at every call site.
+impl From<Error> for std::io::Error {
+    fn from(error: Error) -> Self {
+        std::io::Error::other(error)
+    }
+}

@@ -12,7 +12,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::WidgetRef;
 
-use super::{Input, Key, KeyState, StatefulWindow, WindowState, WindowingServer};
+use super::{StatefulWindow, WindowState, WindowingServer};
 
 /// The dummy window session.
 #[derive(Default)]
@@ -29,8 +29,11 @@ pub struct DummyWindow {
     state: RwLock<WindowState>,
     /// The windows this one's program opened after it.
     children: RwLock<Vec<Arc<DummyWindow>>>,
-    /// The capybara this window shows, as ANSI cells, from the demo set.
-    capy: std::sync::OnceLock<Option<halftone::pipeline::Grid>>,
+    /// The capybara this window shows, as ANSI cells, from the demo set, and the
+    /// width it was halftoned for: a grid made for a narrower window fills only
+    /// its left, so the width is kept with it and the grid rebuilt when the window
+    /// is drawn wider.
+    capy: RwLock<(u16, Option<halftone::pipeline::Grid>)>,
 }
 
 impl WindowingServer for DummyServer {
@@ -53,8 +56,7 @@ impl WindowingServer for DummyServer {
     /// left. It is the one window that fills the screen.
     fn set_size(&mut self, size: (u32, u32)) {
         let state = WindowState {
-            size: (size.0 as u16, size.1 as u16),
-            position: (0, 0),
+            area: Rect::new(0, 0, size.0 as u16, size.1 as u16),
         };
         let mut root = self.root.write().unwrap();
         match root.as_ref() {
@@ -71,29 +73,28 @@ impl WindowingServer for DummyServer {
 impl StatefulWindow for DummyWindow {
     /// A key is what grows the tree: `C` or `W` spawns a window this one
     /// opened after it, stepped over by how many already sit here.
-    fn input(&self, input: Input) -> Result<(), super::Error> {
-        let Input::Key {
-            key: Key::Char(c),
-            state: KeyState::Pressed,
-        } = input
-        else {
+    fn key_input(&self, event: ui_events::keyboard::KeyboardEvent) -> Result<(), super::Error> {
+        use ui_events::keyboard::Key;
+        if !event.state.is_down() {
+            return Ok(());
+        }
+        let Key::Character(typed) = &event.key else {
             return Ok(());
         };
-        match c {
-            'c' | 'C' | 'w' | 'W' => {
-                let size = self.state.read().unwrap().size;
-                let (half_w, half_h) = ((size.0 / 2).max(1), (size.1 / 2).max(1));
-                let mut children = self.children.write().unwrap();
-                let cascade = children.len() as u16 * 2;
-                let window = DummyWindow::default();
-                window.set_state(WindowState {
-                    size: (half_w, half_h),
-                    position: (2 + cascade, 2 + cascade),
-                });
-                children.push(Arc::new(window));
-            }
-            _ => {}
+        if !matches!(typed.as_str(), "c" | "C" | "w" | "W") {
+            return Ok(());
         }
+        let window = DummyWindow::default();
+        window.set_state(WindowState {
+            area: Rect::new(10, 10, 30, 10),
+        });
+        self.children.write().unwrap().push(Arc::new(window));
+        Ok(())
+    }
+
+    /// A dummy window has no program to send a pointer event to: the keys are
+    /// the whole of what it understands.
+    fn pointer_input(&self, _event: ui_events::pointer::PointerEvent) -> Result<(), super::Error> {
         Ok(())
     }
 
@@ -127,62 +128,75 @@ impl StatefulWindow for DummyWindow {
 /// background.
 impl WidgetRef for DummyWindow {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
-        let capy = self.capy.get_or_init(|| {
-            let dir = std::env::var_os("CAPYBARA_IMG_DIR")?;
-            let files: Vec<_> = std::fs::read_dir(&dir)
-                .ok()?
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.is_file())
-                .collect();
-            if files.is_empty() {
-                return None;
-            }
-            use std::hash::{BuildHasher, Hash, Hasher};
-            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-            files.hash(&mut hasher);
-            let start = (hasher.finish() % files.len() as u64) as usize;
-            // One image after another, from a random start, until one reads
-            // and converts: a bad file in the set is skipped, and only a set
-            // where none works leaves the window its black background. Each
-            // failure is reported, since a skipped image is otherwise invisible.
-            for offset in 0..files.len() {
-                let file = &files[(start + offset) % files.len()];
-                let Ok(bytes) = std::fs::read(file) else {
-                    log::warn!("could not read {}", file.display());
-                    continue;
-                };
-                match halftone::pipeline::convert_bytes(
-                    &bytes,
-                    &halftone::pipeline::ConvertSettings {
-                        width: area.width.max(1) as u32,
-                        cell_bg: true,
-                        bg: None,
-                        tone: halftone::pipeline::Tone::Natural,
-                    },
-                ) {
-                    Ok(conversion) => return Some(conversion.grid),
-                    Err(e) => log::warn!("could not halftone {}: {e}", file.display()),
-                }
-            }
-            None
-        });
         buf.set_style(area, Style::new().bg(Color::Rgb(0x00, 0x00, 0x00)));
-        if let Some(grid) = capy {
-            for (index, cell) in grid.cells.iter().enumerate() {
-                let row = (index as u32 / grid.width) as u16;
-                if row >= area.height {
-                    break;
-                }
-                let place = (area.x + (index as u32 % grid.width) as u16, area.y + row);
-                if let Some(slot) = buf.cell_mut(place) {
-                    slot.set_char(cell.glyph);
-                    let [r, g, b] = cell.color;
-                    slot.set_fg(Color::Rgb(r, g, b));
-                    let [r, g, b] = cell.shade;
-                    slot.set_bg(Color::Rgb(r, g, b));
-                }
+
+        let mut capy = self.capy.write().unwrap();
+        if capy.0 != area.width {
+            *capy = (area.width, halftone(area.width));
+        }
+        let Some(grid) = &capy.1 else {
+            return;
+        };
+        for (index, cell) in grid.cells.iter().enumerate() {
+            let row = (index as u32 / grid.width) as u16;
+            if row >= area.height {
+                break;
+            }
+            let place = (area.x + (index as u32 % grid.width) as u16, area.y + row);
+            if let Some(slot) = buf.cell_mut(place) {
+                slot.set_char(cell.glyph);
+                let [r, g, b] = cell.color;
+                slot.set_fg(Color::Rgb(r, g, b));
+                let [r, g, b] = cell.shade;
+                slot.set_bg(Color::Rgb(r, g, b));
             }
         }
     }
+}
+
+/// One image from the demo set, halftoned to `width` cells.
+///
+/// The set is walked from a random start, and one image after another is tried
+/// until one reads and converts: a bad file is skipped, and only a set where none
+/// works leaves the window its black background. Each failure is reported, since
+/// a skipped image is otherwise invisible.
+fn halftone(width: u16) -> Option<halftone::pipeline::Grid> {
+    let dir = std::env::var_os("CAPYBARA_IMG_DIR")?;
+    let files: Vec<_> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    files.hash(&mut hasher);
+    let start = (hasher.finish() % files.len() as u64) as usize;
+
+    (0..files.len()).find_map(|offset| {
+        let file = &files[(start + offset) % files.len()];
+        let Ok(bytes) = std::fs::read(file) else {
+            log::warn!("could not read {}", file.display());
+            return None;
+        };
+        match halftone::pipeline::convert_bytes(
+            &bytes,
+            &halftone::pipeline::ConvertSettings {
+                width: width.max(1) as u32,
+                cell_bg: true,
+                bg: None,
+                tone: halftone::pipeline::Tone::Natural,
+            },
+        ) {
+            Ok(conversion) => Some(conversion.grid),
+            Err(e) => {
+                log::warn!("could not halftone {}: {e}", file.display());
+                None
+            }
+        }
+    })
 }

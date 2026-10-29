@@ -19,6 +19,10 @@ wayland = { workspace = true }
 # The terminal's input parser: raw bytes from the pane go in, typed events
 # (keys, mouse, protocol responses) come out.
 termina = { workspace = true }
+# What an event becomes for a window: W3C UI Events as data. `dpi` is the
+# coordinate type those events are expressed in — physical pixels, as f64.
+ui-events = { workspace = true }
+dpi = "0.1"
 # The capybara demo image, converted to ANSI art cells (halftone).
 halftone = { version = "0.10", default-features = false }
 # The codec the client encodes with, behind the trait a codec can be swapped

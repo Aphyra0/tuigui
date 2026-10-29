@@ -34,8 +34,7 @@ impl Raw {
     /// the bytes on their way through.
     ///
     /// Nothing here touches the *terminal's* modes (`?7` autowrap and the like), which
-    /// live outside the tty and cannot be read back. Setting `?7l` was tried and did not
-    /// change the drift; see `spec/DRIFT.md` for what that leaves.
+    /// live outside the tty and cannot be read back.
     pub fn install() -> io::Result<Self> {
         let stdin = io::stdin();
         let original = rustix::termios::tcgetattr(&stdin)?;

@@ -18,7 +18,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, StatefulWidget, Widget as _};
+use ratatui::widgets::{Paragraph, Widget};
 use wire::message::Message;
 use wire::transport::{BoxFuture, Connection, Transport};
 use wire::unix::UnixSocket;
@@ -298,7 +298,7 @@ impl<T: WindowingServer> State<T> {
                 // area is filled with that window's surface, and those cells are what
                 // the other side scans for to find where a picture goes. A frame that
                 // did not draw is a frame with nothing to place.
-                StatefulWidget::render(&mut compositor, content, buf, &mut ());
+                Widget::render(&mut compositor, content, buf);
 
                 // The programs are the session: when the last one has exited there is
                 // nothing left to send, and nothing left for the pane to be.

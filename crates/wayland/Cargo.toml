@@ -12,6 +12,11 @@ path = "src/bin/wayland-smoke.rs"
 [target.'cfg(target_os = "linux")'.dependencies]
 wire = { workspace = true }
 smithay = { workspace = true }
+# The input vocabulary, and the table that turns a physical key into this
+# platform's own number. `ui-events` is W3C UI Events as data — keyboard and
+# pointer in separate modules, which is the split this crate's queue keeps.
+ui-events = { workspace = true }
+keycode = { workspace = true }
 ratatui = { workspace = true }
 wayland-protocols = { workspace = true }
 tracing = { workspace = true }

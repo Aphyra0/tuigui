@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
+use ratatui::layout::Rect;
 use wayland::WaylandServer as Native;
 
 use super::{StatefulWindow, WindowState, WindowingServer};
@@ -91,8 +92,7 @@ impl WindowingServer for Server {
     fn root_window(&self) -> Option<Weak<dyn StatefulWindow>> {
         let tree = self.inner.root_tree()?;
         let state = WindowState {
-            size: (self.inner.size().0 as u16, self.inner.size().1 as u16),
-            position: (0, 0),
+            area: Rect::new(0, 0, self.inner.size().0 as u16, self.inner.size().1 as u16),
         };
         let wrapped = self.wrappers.wrap(&tree, state);
         Some(Arc::downgrade(&wrapped) as Weak<dyn StatefulWindow>)
@@ -123,18 +123,20 @@ impl WindowingServer for Server {
 }
 
 impl StatefulWindow for SessionWindow {
-    fn input(&self, input: super::Input) -> Result<(), super::Error> {
-        let Some(inner) = self.inner.upgrade() else {
-            return Err(super::Error::Gone);
-        };
-        inner.queue_input(to_seat(input));
+    fn key_input(&self, event: ui_events::keyboard::KeyboardEvent) -> Result<(), super::Error> {
+        let inner = self.inner.upgrade().ok_or(super::Error::Gone)?;
+        inner.queue_key(event);
+        Ok(())
+    }
+
+    fn pointer_input(&self, event: ui_events::pointer::PointerEvent) -> Result<(), super::Error> {
+        let inner = self.inner.upgrade().ok_or(super::Error::Gone)?;
+        inner.queue_pointer(event);
         Ok(())
     }
 
     fn capture(&self) -> Result<Vec<u8>, super::Error> {
-        let Some(inner) = self.inner.upgrade() else {
-            return Err(super::Error::Gone);
-        };
+        let inner = self.inner.upgrade().ok_or(super::Error::Gone)?;
         inner.capture().ok_or(super::Error::NotReady)
     }
 
@@ -158,6 +160,8 @@ impl StatefulWindow for SessionWindow {
     /// is the wrapper it already had, so the compositor sees the same window
     /// as last frame.
     fn get_children(&self) -> Vec<Weak<dyn StatefulWindow>> {
+        // A window whose program exited has no children left to report, which is
+        // an empty list rather than a failure: the compositor prunes what it sees.
         let Some(inner) = self.inner.upgrade() else {
             return Vec::new();
         };
@@ -193,63 +197,5 @@ impl ratatui::widgets::WidgetRef for SessionWindow {
                 }
             }
         }
-    }
-}
-
-/// One input, from this crate's vocabulary to the seat's.
-fn to_seat(input: super::Input) -> wayland::Input {
-    use super::{Button as From, Key as FromKey, KeyState as FromState};
-    use wayland::{Button as To, Key as ToKey, KeyState as ToState};
-
-    let button = |button: From| match button {
-        From::Left => To::Left,
-        From::Middle => To::Middle,
-        From::Right => To::Right,
-        From::Back => To::Back,
-        From::Forward => To::Forward,
-    };
-
-    match input {
-        super::Input::Key { key, state } => wayland::Input::Key {
-            key: match key {
-                FromKey::Char(c) => ToKey::Char(c),
-                FromKey::Return => ToKey::Return,
-                FromKey::Tab => ToKey::Tab,
-                FromKey::Backspace => ToKey::Backspace,
-                FromKey::Delete => ToKey::Delete,
-                FromKey::Escape => ToKey::Escape,
-                FromKey::Space => ToKey::Space,
-                FromKey::Left => ToKey::Left,
-                FromKey::Right => ToKey::Right,
-                FromKey::Up => ToKey::Up,
-                FromKey::Down => ToKey::Down,
-                FromKey::Home => ToKey::Home,
-                FromKey::End => ToKey::End,
-                FromKey::PageUp => ToKey::PageUp,
-                FromKey::PageDown => ToKey::PageDown,
-            },
-            state: match state {
-                FromState::Pressed => ToState::Pressed,
-                FromState::Released => ToState::Released,
-            },
-        },
-        super::Input::MouseMove { x, y, held } => wayland::Input::MouseMove {
-            x,
-            y,
-            held: held.map(button),
-        },
-        super::Input::Button {
-            button: from,
-            down,
-        } => wayland::Input::Button {
-            button: button(from),
-            down,
-        },
-        super::Input::Scroll { delta } => wayland::Input::Scroll {
-            delta: wayland::ScrollDelta {
-                vertical: delta.vertical,
-                horizontal: delta.horizontal,
-            },
-        },
     }
 }

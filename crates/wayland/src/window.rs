@@ -17,8 +17,9 @@ use derive_getters::Getters;
 use derive_setters::Setters;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
+use ui_events::keyboard::KeyboardEvent;
+use ui_events::pointer::PointerEvent;
 
-use crate::inputs::Input;
 use crate::state::State;
 
 /// One admitted window: its surface, its input mailbox, and the toplevels its
@@ -41,11 +42,18 @@ pub struct Window {
     /// so weak handles can reach them from the session's holder. Detaching
     /// this window detaches its subtree with it.
     pub(crate) children: RwLock<Vec<Arc<Window>>>,
-    /// Input queued by the holder, drained by the session at the next step.
+    /// Key events queued by the holder, drained at the session's next step.
+    ///
     /// A plain queue behind a mutex rather than a channel: nothing waits on a
     /// receiver, so a channel's single-consumer machinery only buys the type
     /// `!Sync`.
-    pub(crate) inputs: Mutex<VecDeque<Input>>,
+    ///
+    /// Keys and pointers are queued apart because they are not the same kind of
+    /// event: a key is a position and a state, while a pointer event carries a
+    /// whole state. One queue would only mean sorting them out again.
+    pub(crate) keys: Mutex<VecDeque<KeyboardEvent>>,
+    /// Pointer events queued by the holder.
+    pub(crate) pointers: Mutex<VecDeque<PointerEvent>>,
 }
 
 /// The admitted surface of a window: its `wl_surface`, the client-facing size,
@@ -81,13 +89,19 @@ impl Window {
             toplevel,
             last_configure_serial: Mutex::new(None),
             children: RwLock::new(Vec::new()),
-            inputs: Mutex::new(VecDeque::new()),
+            keys: Mutex::new(VecDeque::new()),
+            pointers: Mutex::new(VecDeque::new()),
         }
     }
 
-    /// Queue one input event; drained by the session's next step.
-    pub fn queue_input(&self, input: Input) {
-        self.inputs.lock().unwrap().push_back(input);
+    /// Queue one key event; drained by the session's next step.
+    pub fn queue_key(&self, event: KeyboardEvent) {
+        self.keys.lock().unwrap().push_back(event);
+    }
+
+    /// Queue one pointer event; drained by the session's next step.
+    pub fn queue_pointer(&self, event: PointerEvent) {
+        self.pointers.lock().unwrap().push_back(event);
     }
 
     /// What the window last drew: RGBA8, row-major, `width * height * 4` bytes.
@@ -166,11 +180,21 @@ impl Window {
     ///
     /// The tree is walked shallow-to-deep; each window dispatches its own
     /// mailbox against itself, so an input reaches the window it was queued for.
+    ///
+    /// Keys go first, and as a group: a modified key is several key events that
+    /// only mean something in order, so slipping a pointer event between the
+    /// control press and the `c` press would leave the modifier dangling.
     pub(crate) fn dispatch_inputs(&self, state: &mut State) {
-        let inputs: Vec<Input> = self.inputs.lock().unwrap().drain(..).collect();
-        for input in inputs {
-            if let Err(e) = state.dispatch_input(self.surface.wl_surface(), input) {
-                tracing::debug!("a queued input did not dispatch: {e}");
+        let keys: Vec<KeyboardEvent> = self.keys.lock().unwrap().drain(..).collect();
+        for event in keys {
+            if let Err(e) = state.dispatch_key_input(self.surface.wl_surface(), &event) {
+                tracing::debug!("a queued key did not dispatch: {e}");
+            }
+        }
+        let pointers: Vec<PointerEvent> = self.pointers.lock().unwrap().drain(..).collect();
+        for event in pointers {
+            if let Err(e) = state.dispatch_mouse_input(self.surface.wl_surface(), &event) {
+                tracing::debug!("a queued pointer event did not dispatch: {e}");
             }
         }
         for child in &*self.children.read().unwrap() {

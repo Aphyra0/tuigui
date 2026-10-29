@@ -20,14 +20,18 @@
 mod client;
 mod error;
 mod handlers;
-mod inputs;
 mod state;
 mod utils;
 mod window;
 
 pub use client::{RootClient, SubClient};
 pub use error::{CompError, Result};
-pub use inputs::{Button, Input, Key, KeyState, ScrollDelta};
+// The input vocabulary both halves speak: W3C UI Events as data. Re-exported
+// because a caller queues these and never names the crate behind them — and
+// because the macOS and Windows backends will take the same two types.
+pub use ui_events::keyboard::{Code, Key, KeyState, KeyboardEvent, Modifiers};
+pub use ui_events::pointer::{PointerButton, PointerEvent, PointerState, PointerType};
+pub use ui_events::ScrollDelta;
 pub use window::Window;
 
 use std::path::{Path, PathBuf};

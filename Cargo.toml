@@ -6,7 +6,6 @@ members = [
     "crates/tui",
     "crates/gui",
     "crates/wayland",
-    "crates/termputs",
     "crates/codecs",
     "crates/cell_map",
 ]
@@ -109,7 +108,10 @@ wire = { path = "crates/wire" }
 tui = { path = "crates/tui" }
 gui = { path = "crates/gui" }
 wayland = { path = "crates/wayland" }
-termputs = { path = "crates/termputs" }
+# The input vocabulary both halves share: W3C UI Events as data, and the table
+# that turns a physical key into each platform's own number. Pure Rust, no C.
+ui-events = "0.3"
+keycode = "1"
 
 [package]
 name = "tuigui"
