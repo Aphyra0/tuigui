@@ -29,11 +29,15 @@ pub struct DummyWindow {
     state: RwLock<WindowState>,
     /// The windows this one's program opened after it.
     children: RwLock<Vec<Arc<DummyWindow>>>,
-    /// The capybara this window shows, as ANSI cells, from the demo set, and the
-    /// width it was halftoned for: a grid made for a narrower window fills only
-    /// its left, so the width is kept with it and the grid rebuilt when the window
-    /// is drawn wider.
-    capy: RwLock<(u16, Option<halftone::pipeline::Grid>)>,
+    /// The capybara this window shows, as ANSI cells, and the width it was
+    /// halftoned for: a grid made for a narrower window fills only its left, so
+    /// the width is kept with it and the grid rebuilt when the window is drawn
+    /// wider. The image's name is kept beside it, which is what the bar shows.
+    capy: RwLock<(u16, Option<(String, halftone::pipeline::Grid)>)>,
+    /// Set by `terminate`. Nothing runs behind a dummy window, so there is no
+    /// program to ask to close: being asked is the window being over, and its
+    /// parent stops reporting it at the next read.
+    gone: std::sync::atomic::AtomicBool,
 }
 
 impl WindowingServer for DummyServer {
@@ -115,12 +119,29 @@ impl StatefulWindow for DummyWindow {
     }
 
     fn get_children(&self) -> Vec<Weak<dyn StatefulWindow>> {
-        self.children
-            .read()
-            .unwrap()
+        // A child that was asked to close is dropped here rather than merely
+        // filtered: it is this list that keeps it alive, and a window nobody can
+        // see must not stay alive, or the weak handle asking for the keyboard is
+        // still good.
+        let mut children = self.children.write().unwrap();
+        children.retain(|child| !child.gone.load(std::sync::atomic::Ordering::Acquire));
+        children
             .iter()
             .map(|child| Arc::downgrade(child) as Weak<dyn StatefulWindow>)
             .collect()
+    }
+
+    /// A dummy window is named after the image it draws, which is the only thing
+    /// there is to call it.
+    fn title(&self) -> String {
+        let name = self.capy.read().unwrap().1.as_ref().map(|(name, _)| name.clone());
+        name.unwrap_or_else(|| "capybara".to_string())
+    }
+
+    /// Nothing runs behind a dummy window, so there is no program to ask: being
+    /// asked to close is the window being over, and its parent stops reporting it.
+    fn terminate(&self) {
+        self.gone.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -134,7 +155,7 @@ impl WidgetRef for DummyWindow {
         if capy.0 != area.width {
             *capy = (area.width, halftone(area.width));
         }
-        let Some(grid) = &capy.1 else {
+        let Some((_, grid)) = &capy.1 else {
             return;
         };
         for (index, cell) in grid.cells.iter().enumerate() {
@@ -154,13 +175,14 @@ impl WidgetRef for DummyWindow {
     }
 }
 
-/// One image from the demo set, halftoned to `width` cells.
+/// One image from the demo set, halftoned to `width` cells, with the name of the
+/// file it came from.
 ///
 /// The set is walked from a random start, and one image after another is tried
 /// until one reads and converts: a bad file is skipped, and only a set where none
 /// works leaves the window its black background. Each failure is reported, since
 /// a skipped image is otherwise invisible.
-fn halftone(width: u16) -> Option<halftone::pipeline::Grid> {
+fn halftone(width: u16) -> Option<(String, halftone::pipeline::Grid)> {
     let dir = std::env::var_os("CAPYBARA_IMG_DIR")?;
     let files: Vec<_> = std::fs::read_dir(dir)
         .ok()?
@@ -192,7 +214,13 @@ fn halftone(width: u16) -> Option<halftone::pipeline::Grid> {
                 tone: halftone::pipeline::Tone::Natural,
             },
         ) {
-            Ok(conversion) => Some(conversion.grid),
+            Ok(conversion) => {
+                let name = file
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| file.display().to_string());
+                Some((name, conversion.grid))
+            }
             Err(e) => {
                 log::warn!("could not halftone {}: {e}", file.display());
                 None

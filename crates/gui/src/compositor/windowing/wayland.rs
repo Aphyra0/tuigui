@@ -176,6 +176,24 @@ impl StatefulWindow for SessionWindow {
             .map(|child| Arc::downgrade(child) as Weak<dyn StatefulWindow>)
             .collect()
     }
+
+    /// What the program calls its window: the title it set, or its app id when it
+    /// set no title, or nothing when it set neither — the bar then has no name to
+    /// show, rather than a made-up one.
+    fn title(&self) -> String {
+        let Some(inner) = self.inner.upgrade() else {
+            return String::new();
+        };
+        inner.title().unwrap_or_default()
+    }
+
+    /// Ask the program to close the window. It is a request: the client is told
+    /// and decides, which is why the window may still be there afterwards.
+    fn terminate(&self) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.terminate();
+        }
+    }
 }
 
 /// A window, the way the pane draws it: every cell filled with the window's

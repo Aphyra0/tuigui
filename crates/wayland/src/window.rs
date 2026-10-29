@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use derive_getters::Getters;
 use derive_setters::Setters;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::wayland::shell::xdg::ToplevelSurface;
+use smithay::wayland::shell::xdg::{ToplevelSurface, XdgToplevelSurfaceData};
 use ui_events::keyboard::KeyboardEvent;
 use ui_events::pointer::PointerEvent;
 
@@ -137,6 +137,26 @@ impl Window {
         });
         self.toplevel.send_configure();
         *self.surface.size.write().unwrap() = size;
+    }
+
+    /// What this window calls itself: the title its program set, or the app id it
+    /// set instead. `None` when it set neither, which is a window with no name
+    /// rather than one with an invented name.
+    pub fn title(&self) -> Option<String> {
+        smithay::wayland::compositor::with_states(&self.surface.wl_surface, |states| {
+            let attributes = states.data_map.get::<XdgToplevelSurfaceData>()?;
+            let attributes = attributes.lock().unwrap();
+            attributes
+                .title
+                .clone()
+                .or_else(|| attributes.app_id.clone())
+        })
+    }
+
+    /// Ask the program to close this window: an xdg close request, which the
+    /// client may ignore. The window outlives this call until it does not.
+    pub fn terminate(&self) {
+        self.toplevel.send_close();
     }
 
     /// Everything under this window: the windows its program opened after it,

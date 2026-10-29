@@ -136,6 +136,14 @@ pub trait StatefulWindow: WidgetRef + Send + Sync {
     /// them: the caller keeps what it has not seen before — told apart by the
     /// pointer, not by bookkeeping — and prunes the ones that died.
     fn get_children(&self) -> Vec<Weak<dyn StatefulWindow>>;
+
+    /// What the window calls itself: the title its program set, or the name of
+    /// the program when it set none. Shown on the bar, and nowhere else.
+    fn title(&self) -> String;
+
+    /// Ask the window to close, the way a program's own quit is asked for: the
+    /// client is told, and it decides. A window whose program ignores it stays.
+    fn terminate(&self);
 }
 
 /// Why a window could not do what was asked of it.

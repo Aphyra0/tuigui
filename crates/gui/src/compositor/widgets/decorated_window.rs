@@ -52,6 +52,9 @@ impl Widget for &mut DecoratedWindow {
         Clear.render(area, buf);
         WidgetRef::render_ref(self.window.as_ref(), area, buf);
         if let Some(frame) = self.frame.as_mut() {
+            // The bar shows what the window calls itself, which only the window
+            // knows: it is read once per frame, here, rather than kept in step.
+            frame.set_title(self.window.title());
             frame.render(area, buf);
         }
     }

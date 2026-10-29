@@ -17,6 +17,11 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// Take the window's name for the frame about to be drawn, for the bar to show.
+    pub fn set_title(&mut self, title: String) {
+        self.bar.set_title(title);
+    }
+
     pub fn handle_mouse(
         &mut self,
         window: &dyn StatefulWindow,
@@ -71,7 +76,7 @@ impl Frame {
     }
 }
 
-impl Widget for &Frame {
+impl Widget for &mut Frame {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // `area` is the window's own cells; the chrome is the ring around them.
         Block::bordered()
