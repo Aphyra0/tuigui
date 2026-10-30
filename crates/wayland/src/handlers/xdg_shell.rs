@@ -186,10 +186,13 @@ fn admit_into_root_client(state: &mut State, surface: ToplevelSurface)
 
 /// Apply a commit held for a window that has just been admitted.
 fn apply_pending(held: Option<(Vec<u8>, (u32, u32))>, tree: &Arc<Window>) {
-    let Some((pixels, _size)) = held else {
+    let Some((pixels, size)) = held else {
         return;
     };
     *tree.surface.pixels.lock().unwrap() = pixels;
+    // The pixels were mapped to this size, so this is the size they are: the window's
+    // own configure never said, and a capture reports what it holds.
+    *tree.surface.size.write().unwrap() = size;
     tree.surface.committed.store(true, Ordering::Release);
     log::info!("applied a held commit to the window it belongs to");
 }

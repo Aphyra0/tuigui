@@ -137,13 +137,17 @@ impl Window {
 
     /// Ask this window to draw at `size` pixels instead of its current one.
     /// The client answers by committing a buffer at whatever size it chose.
+    ///
+    /// The recorded size is left alone: it is the size of the pixels we hold, and it
+    /// changes when a commit brings pixels of a new size, not when a configure asks for
+    /// one. Writing the request here would make `capture` label the current pixels with
+    /// a size they are not, between this call and the commit that answers it.
     pub fn set_size(&self, size: (u32, u32)) {
         // The size proposal travels on the toplevel, not the surface.
         self.toplevel.with_pending_state(|pending| {
             pending.size = Some((size.0 as i32, size.1 as i32).into());
         });
         self.toplevel.send_configure();
-        *self.surface.size.write().unwrap() = size;
     }
 
     /// What this window calls itself: the title its program set, or the app id it

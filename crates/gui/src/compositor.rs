@@ -156,6 +156,10 @@ impl<T: WindowingServer> Compositor<T> {
                 Ok(()) | Err(windowing::Error::NotReady) => {}
                 Err(e) => log::warn!("a frame was not sent: {e}"),
             }
+            // After the capture, never before it: a configure changes the size the
+            // window's next picture is expected at, so sending it first would leave the
+            // frame just encoded labelled with a size it does not have.
+            window.maybe_set_size(winsize);
         }
     }
 

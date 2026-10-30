@@ -41,13 +41,13 @@ impl CompositorHandler for State
         if let Some(root) = client.get_data::<crate::client::RootClient>() {
             let tree = root.root_window.read().unwrap().clone();
             match tree.and_then(|tree| crate::window::Window::commit_target(&tree, surface)) {
-                Some(win) => commit_into(&win, out_size, surface),
+                Some(win) => commit_into(&win, win.size(), surface),
                 None => hold(self, surface, out_size),
             }
         } else if let Some(sub) = client.get_data::<crate::client::SubClient>() {
             let tree = sub.root_window.read().unwrap().clone();
             match tree.and_then(|tree| crate::window::Window::commit_target(&tree, surface)) {
-                Some(win) => commit_into(&win, out_size, surface),
+                Some(win) => commit_into(&win, win.size(), surface),
                 // A client may commit between being configured and being admitted:
                 // `xdg-shell` sends the configure while the window is still being built,
                 // and this commit arrives before the window exists. Holding it is what
@@ -78,7 +78,7 @@ impl CompositorHandler for State
                     .as_ref()
                     .and_then(|root| root.root_window.read().unwrap().clone())
                 {
-                    commit_into(&win, out_size, surface);
+                    commit_into(&win, win.size(), surface);
                 }
             }
         }
@@ -147,6 +147,10 @@ fn commit_into(win: &crate::window::Window, out_size: (u32, u32), surface: &WlSu
     }
 
     if any_pixels {
+        // The size is recorded here, not by the configure that asked for it: these
+        // pixels were mapped to `out_size`, so that is the size they are, and
+        // `capture` reports it as such.
+        *win.surface.size.write().unwrap() = out_size;
         win.surface.committed.store(true, Ordering::Release);
     }
 }
