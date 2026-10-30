@@ -83,7 +83,10 @@ impl<T: WindowingServer> Compositor<T> {
     pub fn input(&mut self, event: &termina::Event) -> std::io::Result<()> {
         match event {
             termina::Event::Key(key) => {
-                if let Some(window) = self.focused_window().or_else(|| panic!("idiocracy")) {
+                // The window being typed into, or the root when nothing has been
+                // focused yet: the root is the program, so a key pressed before any
+                // window was chosen is a key for the program itself.
+                if let Some(window) = self.focused_window().or_else(|| self.root_window()) {
                     window.key_input(windowing::event_map::key(key))?;
                 }
             }
