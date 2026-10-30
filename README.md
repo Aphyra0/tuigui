@@ -1,6 +1,6 @@
 # tuigui
 
-[![Rust lines of code](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/4phyra/tuigui/master/.github/tokei.json)](https://github.com/4phyra/tuigui)
+[![Rust lines of code](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F4phyra%2Ftuigui%2Fmaster%2F.github%2Ftokei.json)](https://github.com/4phyra/tuigui)
 
 tuigui puts graphical programs in the terminal, alongside the text tools you
 already use. You give it a program; it gives you that program's window and
