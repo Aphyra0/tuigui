@@ -1,0 +1,43 @@
+name: Rust lines of code
+
+# Keeps `.github/tokei.json` current so the README badge shows the real count.
+#
+# The badge is a shields.io endpoint badge rather than the tokei.rs one, because
+# tokei.rs no longer resolves. Shields only serves a number it is given, so the
+# number has to live in the repository; this is what writes it.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  count:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: tokei
+
+      - name: Count Rust code lines
+        run: |
+          code=$(tokei . --types Rust --output json | jq -r '.Rust.code')
+          jq -n --arg n "$code" \
+            '{"schemaVersion": 1, "label": "Rust lines of code", "message": $n, "color": "blue"}' \
+            >.github/tokei.json
+
+      - name: Commit the count
+        run: |
+          if git diff --quiet .github/tokei.json; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/tokei.json
+          git commit -m "Update the Rust line count the README badge shows"
+          git push
