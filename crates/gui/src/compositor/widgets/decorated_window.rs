@@ -61,20 +61,35 @@ impl DecoratedWindow {
         ));
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent, pane: Rect) -> Option<MouseEvent> {
+    pub fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        pane: Rect,
+        winsize: rustix::termios::Winsize,
+    ) -> Option<MouseEvent> {
         let area = self.window.state().area;
-        let mouse = self
-            .frame
-            .as_mut()
-            .and_then(|frame| frame.handle_mouse(self.window.as_ref(), mouse, pane, area))?;
+        // A window without chrome has nothing to hit-test first, so the event goes
+        // straight on: `?` on an absent frame would report the window as having claimed
+        // it, and the root — which has no frame — would then deliver no pointer event at
+        // all.
+        let mouse = match self.frame.as_mut() {
+            Some(frame) => frame.handle_mouse(self.window.as_ref(), mouse, pane, area)?,
+            None => mouse,
+        };
         if !area.contains(Position::new(mouse.column, mouse.row)) {
             return Some(mouse);
         }
+        // The terminal reports the pointer in cells of the pane; the window's program
+        // thinks in pixels of its own picture. One cell is not one pixel, so the offset
+        // inside the window is multiplied by the cell before it is sent — a pointer sent
+        // in cells lands in the window's top-left corner and never reaches the widget the
+        // user aimed at.
+        let size = cell_size(winsize);
         if let Some(event) = event_map::pointer(
             &mouse,
             (
-                f64::from(mouse.column - area.x),
-                f64::from(mouse.row - area.y),
+                f64::from(mouse.column - area.x) * f64::from(size.0),
+                f64::from(mouse.row - area.y) * f64::from(size.1),
             ),
         ) {
             let _ = self.window.pointer_input(event);

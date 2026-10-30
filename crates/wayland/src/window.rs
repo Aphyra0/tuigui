@@ -222,9 +222,10 @@ impl Window {
                 tracing::debug!("a queued key did not dispatch: {e}");
             }
         }
-        // What this window's queue did not carry is a key nobody renewed: the
-        // terminal has no way to say a release, so letting go here is the only
-        // thing that stops the program repeating it forever.
+        // What this window's queue did not carry is a key nobody renewed: the terminal
+        // has no way to say a release, so letting go is the only thing that stops the
+        // program repeating it forever. Only the focused window does this — the guard is
+        // inside, because the pressed keys belong to the seat and not to a window.
         state.release_unrenewed(self.surface.wl_surface(), &keys);
         let pointers: Vec<PointerEvent> = self.pointers.lock().unwrap().drain(..).collect();
         for event in pointers {

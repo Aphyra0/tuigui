@@ -19,7 +19,8 @@
 use std::sync::{Arc, Weak};
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
+use ratatui::style::Color;
 use ratatui::widgets::Widget;
 
 use crate::DebugOptions;
@@ -29,6 +30,12 @@ pub mod widgets;
 pub mod windowing;
 
 pub use windowing::{StatefulWindow, WindowState, WindowingServer};
+
+/// The pointer, as the pane draws it.
+///
+/// An arrow, because a pointer is looked for rather than read: it sits on top of whatever
+/// window is under it, and the glyph only has to be findable at a glance.
+const CURSOR: char = '➤';
 
 /// A program, or several, running in a compositor of ours.
 ///
@@ -52,6 +59,13 @@ pub struct Compositor<T: WindowingServer> {
     debug: Arc<DebugOptions>,
     /// The pane's rectangle as of the last render, in cells.
     pane: Rect,
+    /// Where the pointer last was, in cells of the pane.
+    ///
+    /// Kept because it is asked for at a different time from the event that says it: a
+    /// mouse event arrives between frames and the pane is drawn once per frame, so the
+    /// cell has to outlive the event to be drawn. `None` until the pointer has moved,
+    /// which is a pane with no pointer on it yet rather than one at the origin.
+    pointer: Option<Position>,
 }
 
 impl<T: WindowingServer> Compositor<T> {
@@ -63,6 +77,7 @@ impl<T: WindowingServer> Compositor<T> {
             focused: None,
             debug,
             pane: Rect::ZERO,
+            pointer: None,
         }
     }
 
@@ -80,7 +95,11 @@ impl<T: WindowingServer> Compositor<T> {
     /// the pane is the program, and a key reaches the program first. A mouse event
     /// is offered to the windows from the front, and the first one that takes it
     /// ends the walk — see [`DecoratedWindow::handle_mouse`].
-    pub fn input(&mut self, event: &termina::Event) -> std::io::Result<()> {
+    pub fn input(
+        &mut self,
+        event: &termina::Event,
+        winsize: rustix::termios::Winsize,
+    ) -> std::io::Result<()> {
         match event {
             termina::Event::Key(key) => {
                 // The window being typed into, or the root when nothing has been
@@ -92,6 +111,9 @@ impl<T: WindowingServer> Compositor<T> {
             }
             termina::Event::Mouse(mouse) => {
                 let pane = self.pane;
+                // Where the pointer is, in cells of the pane, kept for the draw that
+                // comes after this event: the cursor is painted last, over everything.
+                self.pointer = Some(Position::new(mouse.column, mouse.row));
                 // Back to front: the frontmost window is the last of the vector,
                 // so the walk finds the one nearest the user first. The root sits
                 // at index 0 and fills the pane, so it is found when no window
@@ -99,7 +121,7 @@ impl<T: WindowingServer> Compositor<T> {
                 let Some(focus) = self
                     .windows
                     .iter_mut()
-                    .rposition(|window| window.handle_mouse(*mouse, pane).is_none())
+                    .rposition(|window| window.handle_mouse(*mouse, pane, winsize).is_none())
                 else {
                     return Ok(());
                 };
@@ -289,6 +311,21 @@ impl<T: WindowingServer> Widget for &mut Compositor<T> {
         for window in self.windows.iter_mut() {
             let window_area = window.window.state().area;
             window.render(window_area, buf);
+        }
+        // The pointer last, over every window: it belongs to the pane rather than to any
+        // one of them, and a window drawn after it would cover it.
+        //
+        // The glyph carries the pane's own anchor colours nowhere: the other side finds
+        // a window's picture by scanning for its surface's exact glyph and colours, so a
+        // pointer that matched one would be read as a stray cell of that window.
+        if let Some(pointer) = self.pointer {
+            if area.contains(pointer) {
+                if let Some(cell) = buf.cell_mut(pointer) {
+                    cell.set_char(CURSOR)
+                        .set_fg(Color::Rgb(0xff, 0xff, 0xff))
+                        .set_bg(Color::Rgb(0, 0, 0));
+                }
+            }
         }
     }
 }

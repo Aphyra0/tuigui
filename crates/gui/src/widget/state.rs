@@ -275,7 +275,7 @@ impl<T: WindowingServer> State<T> {
                 // hand-off: whatever arrives after it waits for the next frame.
                 while let Ok(event) = session.input_receiver.try_recv() {
                     compositor
-                        .input(&event)
+                        .input(&event, winsize)
                         .map_err(|e| format!("could not deliver input: {e}"))?;
                 }
 

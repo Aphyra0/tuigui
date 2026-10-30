@@ -83,13 +83,18 @@ impl State {
     /// A terminal reports a press and cannot report the release unless the keyboard
     /// protocol asked for event types, which nothing asks for. So a key that is down
     /// and was not in this step's queue is a key whose release was never said, and
-    /// leaving it pressed leaves the program repeating it for the rest of the
-    /// session. `queue` is that step's key events, drained before they were
-    /// dispatched.
+    /// leaving it pressed leaves the program repeating it for the rest of the session.
+    ///
+    /// Only the focused surface releases, because the pressed keys are the seat's and the
+    /// seat has one recipient: every other window in the walk has an empty queue, and
+    /// would let go of the key the focused one just pressed.
     pub(crate) fn release_unrenewed(&mut self, focus: &WlSurface, queue: &[KeyboardEvent]) {
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };
+        if keyboard.current_focus().as_ref() != Some(focus) {
+            return;
+        }
         for keycode in keyboard.pressed_keys() {
             // Wayland keycodes carry X11's offset of 8, which `press_keycode` adds.
             let evdev = u32::from(keycode.raw()).saturating_sub(8);
@@ -113,9 +118,21 @@ impl State {
     ) -> Result<(), CompError> {
         match event {
             PointerEvent::Move(update) => self.move_pointer(focus, update.current.position.x, update.current.position.y),
-            PointerEvent::Down(button) => self.press_button(focus, button.button, true),
-            PointerEvent::Up(button) => self.press_button(focus, button.button, false),
-            PointerEvent::Scroll(scroll) => self.scroll_pointer(focus, scroll.delta),
+            // A button is pressed where the pointer is, so the position travels with it:
+            // a click that did not move the pointer first would otherwise land wherever
+            // the last move left it, which for a window nobody has hovered is the corner.
+            PointerEvent::Down(button) => {
+                self.move_pointer(focus, button.state.position.x, button.state.position.y)?;
+                self.press_button(focus, button.button, true)
+            }
+            PointerEvent::Up(button) => {
+                self.move_pointer(focus, button.state.position.x, button.state.position.y)?;
+                self.press_button(focus, button.button, false)
+            }
+            PointerEvent::Scroll(scroll) => {
+                self.move_pointer(focus, scroll.state.position.x, scroll.state.position.y)?;
+                self.scroll_pointer(focus, scroll.delta)
+            }
             // Enter, leave, cancel and gestures say nothing a seat can be told:
             // a seat's focus is the surface, and it has no grab to cancel.
             PointerEvent::Enter(_)
@@ -203,12 +220,6 @@ impl State {
             return Ok(());
         };
         let pointer = self.seat.get_pointer().ok_or(CompError::NotReady)?;
-        // A button travels with a position, and the seat's is the pointer's own.
-        let at = pointer.current_location();
-        if at.x == 0.0 && at.y == 0.0 {
-            let (w, h) = self.server_size;
-            self.move_pointer(focus, w as f64 / 2.0, h as f64 / 2.0)?;
-        }
         let time = crate::server_time();
         let serial = self.next_serial();
         if down {
@@ -238,13 +249,8 @@ impl State {
         Ok(())
     }
 
-    fn scroll_pointer(&mut self, focus: &WlSurface, delta: ScrollDelta) -> Result<(), CompError> {
+    fn scroll_pointer(&mut self, _focus: &WlSurface, delta: ScrollDelta) -> Result<(), CompError> {
         let pointer = self.seat.get_pointer().ok_or(CompError::NotReady)?;
-        let at = pointer.current_location();
-        if at.x == 0.0 && at.y == 0.0 {
-            let (w, h) = self.server_size;
-            self.move_pointer(focus, w as f64 / 2.0, h as f64 / 2.0)?;
-        }
         // A wheel reports lines, a touchpad reports pixels, and the seat takes
         // both: the discrete count for clients that want steps, the pixel amount
         // for the ones that scroll smoothly.
