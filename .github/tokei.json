@@ -1,6 +1,6 @@
 {
-  "color": "blue",
+  "schemaVersion": 1,
   "label": "Rust lines of code",
-  "message": "7984",
-  "schemaVersion": 1
+  "message": "7965",
+  "color": "blue"
 }
