@@ -213,11 +213,15 @@ impl Window {
     /// control press and the `c` press would leave the modifier dangling.
     pub(crate) fn dispatch_inputs(&self, state: &mut State) {
         let keys: Vec<KeyboardEvent> = self.keys.lock().unwrap().drain(..).collect();
-        for event in keys {
-            if let Err(e) = state.dispatch_key_input(self.surface.wl_surface(), &event) {
+        for event in &keys {
+            if let Err(e) = state.dispatch_key_input(self.surface.wl_surface(), event) {
                 tracing::debug!("a queued key did not dispatch: {e}");
             }
         }
+        // What this window's queue did not carry is a key nobody renewed: the
+        // terminal has no way to say a release, so letting go here is the only
+        // thing that stops the program repeating it forever.
+        state.release_unrenewed(self.surface.wl_surface(), &keys);
         let pointers: Vec<PointerEvent> = self.pointers.lock().unwrap().drain(..).collect();
         for event in pointers {
             if let Err(e) = state.dispatch_mouse_input(self.surface.wl_surface(), &event) {

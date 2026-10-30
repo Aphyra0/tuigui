@@ -90,6 +90,27 @@ A full rebuild of `ring` / `rustls` / the TLS stack costs minutes. Avoid it.
 - Test after changes (`CARGO_TARGET_DIR=./target cargo test --workspace
   --all-targets`).
 
+## New state is a new concept (reach for a function first)
+
+Every field and every struct introduces a concept a reader has to learn and keep
+in their head, and a fact they have to keep in sync. A function introduces
+neither: what it needs arrives as parameters and is gone when it returns.
+
+- Before adding a field, ask what its lifetime really is. If the value is only
+  needed inside one call chain, thread it through as a parameter instead —
+  `render → frame → maybe_resize_root` takes the terminal's winsize that way,
+  and `release_unrenewed(focus, queue)` takes the key facts that way.
+- Before adding a struct, ask whether it would carry anything that is not
+  already somewhere. `pressed_keys()` is the seat's to answer and the drain of
+  the window's queue is the window's; a new `Pressed` set would be a third copy
+  of a fact that already has two homes.
+- Derived facts are computed where used, never cached. A cache is a second
+  truth, and the second truth is the one that goes stale.
+- This is not a ban on fields: state that genuinely outlives a frame — the
+  stacking order, a drag in flight, an encoder's stream history — belongs on a
+  struct. The rule is about new state that exists only because a parameter felt
+  awkward.
+
 ## Response length (hard rule)
 
 - Long answers are not acceptable. This agent cannot answer at length.

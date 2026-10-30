@@ -78,6 +78,33 @@ impl State {
         Ok(())
     }
 
+    /// Let go of every key the seat holds that this step's queue did not carry.
+    ///
+    /// A terminal reports a press and cannot report the release unless the keyboard
+    /// protocol asked for event types, which nothing asks for. So a key that is down
+    /// and was not in this step's queue is a key whose release was never said, and
+    /// leaving it pressed leaves the program repeating it for the rest of the
+    /// session. `queue` is that step's key events, drained before they were
+    /// dispatched.
+    pub(crate) fn release_unrenewed(&mut self, focus: &WlSurface, queue: &[KeyboardEvent]) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        for keycode in keyboard.pressed_keys() {
+            // Wayland keycodes carry X11's offset of 8, which `press_keycode` adds.
+            let evdev = u32::from(keycode.raw()).saturating_sub(8);
+            let renewed = queue.iter().any(|event| {
+                event.state == KeyState::Down && key_evdev(event.code) == Some(evdev)
+            });
+            if renewed {
+                continue;
+            }
+            if let Err(e) = self.press_keycode(focus, evdev, KeyState::Up) {
+                tracing::debug!("a key was not released: {e}");
+            }
+        }
+    }
+
     /// Deliver one pointer event to `focus`.
     pub(crate) fn dispatch_mouse_input(
         &mut self,
