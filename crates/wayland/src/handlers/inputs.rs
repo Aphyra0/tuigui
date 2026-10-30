@@ -133,7 +133,11 @@ impl State {
         state: KeyState,
     ) -> Result<(), CompError> {
         let keyboard = self.seat.get_keyboard().ok_or(CompError::NotReady)?;
-        if !keyboard.is_focused() {
+        // The keyboard follows the window the key was delivered to. Comparing against
+        // that surface rather than asking whether anything is focused is what lets
+        // focus move: `is_focused` answers true from the first window ever typed into,
+        // so the keyboard stayed with it and every later window got nothing.
+        if keyboard.current_focus().as_ref() != Some(focus) {
             let serial = self.next_serial();
             keyboard.set_focus(self, Some(focus.clone()), serial);
         }
@@ -208,11 +212,11 @@ impl State {
         let time = crate::server_time();
         let serial = self.next_serial();
         if down {
-            // Establish the keyboard focus on press, like anvil's
-            // `on_pointer_button`: a real client routes clicks/hover through the
-            // active window, and without a prior key event it never became active.
+            // A click makes the window the one the keyboard talks to, which is what
+            // the pane means by focusing it. Compared against the surface, so a click
+            // on a different window moves the keyboard to it.
             if let Some(kbd) = self.seat.get_keyboard() {
-                if !kbd.is_focused() {
+                if kbd.current_focus().as_ref() != Some(focus) {
                     kbd.set_focus(self, Some(focus.clone()), serial);
                 }
             }

@@ -36,9 +36,12 @@ pub fn image_id(surface: &SurfaceId) -> u32 {
     use std::hash::{Hash as _, Hasher as _};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     surface.hash(&mut hasher);
-    // Kept out of the low range: ids below a few hundred are the ones a terminal's
-    // own examples use, and a picture is not worth colliding with one over.
-    (hasher.finish() % (u32::MAX as u64 - 1024)) as u32 + 1024
+    // A small id on purpose. The protocol allows a wider range, but a terminal does
+    // not have to accept one: Ghostty keeps its own ids in the low thousands and
+    // ignores a transmit above them, with no reply that says so — the picture simply
+    // never appears. Two to 9999 leaves room for several windows and stays inside the
+    // range every implementation keeps.
+    (hasher.finish() % 9998) as u32 + 2
 }
 
 /// The z index a window's picture is drawn at.

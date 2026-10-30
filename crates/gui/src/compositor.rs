@@ -83,7 +83,7 @@ impl<T: WindowingServer> Compositor<T> {
     pub fn input(&mut self, event: &termina::Event) -> std::io::Result<()> {
         match event {
             termina::Event::Key(key) => {
-                if let Some(window) = self.focused_window().or_else(|| self.root_window()) {
+                if let Some(window) = self.focused_window().or_else(|| panic!("idiocracy")) {
                     window.key_input(windowing::event_map::key(key))?;
                 }
             }
@@ -93,21 +93,26 @@ impl<T: WindowingServer> Compositor<T> {
                 // so the walk finds the one nearest the user first. The root sits
                 // at index 0 and fills the pane, so it is found when no window
                 // above it wanted the event.
-                let Some(focus) = self.windows.iter_mut().rposition(|window| {
-                    window.handle_mouse(*mouse, pane).is_none()
-                        && matches!(mouse.kind, termina::event::MouseEventKind::Down(_))
-                }) else {
+                let Some(focus) = self
+                    .windows
+                    .iter_mut()
+                    .rposition(|window| window.handle_mouse(*mouse, pane).is_none())
+                else {
                     return Ok(());
                 };
+                // What claimed the event is what the keyboard talks to, the root
+                // included: the root is the pane, so over the pane is over the
+                // program. This is set before the raise below because the two are
+                // different decisions, and the root takes focus without ever coming up.
+                self.focused = Some(Arc::downgrade(&self.windows[focus].window));
                 // Index 0 is the root, which is the pane itself: raising it would
                 // cover its own windows, so it stays where it is. Anything else
-                // comes forward, and the root only answers for the pane.
+                // comes forward.
                 if focus == 0 {
                     return Ok(());
                 }
 
                 let window = self.windows.remove(focus);
-                self.focused = Some(Arc::downgrade(&window.window));
                 self.windows.push(window);
             }
             _ => {}
@@ -167,10 +172,7 @@ impl<T: WindowingServer> Compositor<T> {
         root: &Arc<dyn StatefulWindow>,
         winsize: rustix::termios::Winsize,
     ) {
-        let pixels = (
-            u32::from(winsize.ws_xpixel),
-            u32::from(winsize.ws_ypixel),
-        );
+        let pixels = (u32::from(winsize.ws_xpixel), u32::from(winsize.ws_ypixel));
         // A terminal that reports no pixels is one that cannot say, and it is not
         // an error: the grid is still known, so the program is configured at one
         // pixel a cell. That is the smallest picture that keeps the layout
@@ -245,6 +247,7 @@ impl<T: WindowingServer> Compositor<T> {
 
         // Whatever is left is new, and goes on top, in the order it was offered:
         // the root first if it is the one missing, which leaves it at index 0.
+        //
         for window in offered {
             let root = Arc::ptr_eq(&window, &root);
             // A window appearing is the event worth a line: what it is, where it
@@ -254,6 +257,9 @@ impl<T: WindowingServer> Compositor<T> {
                 if root { "the root" } else { "opened" },
                 window.state().area
             );
+            // New windows get focus: a window that just appeared is the one the user
+            // asked for by opening it, and so the one they are about to type into.
+            self.focused = Some(Arc::downgrade(&window));
             self.windows.push(DecoratedWindow::new(window, root));
         }
 
