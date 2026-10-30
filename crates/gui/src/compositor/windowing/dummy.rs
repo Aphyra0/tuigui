@@ -61,6 +61,7 @@ impl WindowingServer for DummyServer {
     fn set_size(&mut self, size: (u32, u32)) {
         let state = WindowState {
             area: Rect::new(0, 0, size.0 as u16, size.1 as u16),
+            surface: wire::message::SurfaceId::random(),
         };
         let mut root = self.root.write().unwrap();
         match root.as_ref() {
@@ -91,6 +92,7 @@ impl StatefulWindow for DummyWindow {
         let window = DummyWindow::default();
         window.set_state(WindowState {
             area: Rect::new(10, 10, 30, 10),
+            surface: wire::message::SurfaceId::random(),
         });
         self.children.write().unwrap().push(Arc::new(window));
         Ok(())
@@ -102,8 +104,9 @@ impl StatefulWindow for DummyWindow {
         Ok(())
     }
 
-    /// A dummy window never draws a picture.
-    fn capture(&self) -> Result<Vec<u8>, super::Error> {
+    /// A dummy window never draws a picture: nothing is running behind it to
+    /// capture, so there is no frame to send.
+    fn capture(&self, _link: &wire::transport::Connection) -> Result<(), super::Error> {
         Err(super::Error::NotReady)
     }
 

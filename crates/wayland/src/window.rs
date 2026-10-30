@@ -116,7 +116,7 @@ impl Window {
     /// frame too early and the client runs one encode period ahead. Move it
     /// to the presentation point (or gate it on the encode queue being empty)
     /// at that point.
-    pub fn capture(&self) -> Option<Vec<u8>> {
+    pub fn capture(&self) -> Option<(Vec<u8>, (u32, u32))> {
         if !self.surface.committed.load(Ordering::Acquire) {
             return None;
         }
@@ -124,8 +124,9 @@ impl Window {
         if pixels.is_empty() {
             return None;
         }
+        let size = *self.surface.size.read().unwrap();
         crate::utils::fire_frame_callbacks(&self.surface.wl_surface);
-        Some(pixels)
+        Some((pixels, size))
     }
 
     /// Ask this window to draw at `size` pixels instead of its current one.

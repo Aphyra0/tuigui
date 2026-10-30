@@ -115,10 +115,12 @@ impl<T: WindowingServer> Compositor<T> {
         Ok(())
     }
 
-    /// One session turn, advanced: accept what arrived, dispatch what the
-    /// program did, then bring the stack up to date with what it offers now. A
-    /// dummy session moves forward by being drawn instead.
-    pub fn advance(&mut self, timeout: std::time::Duration) {
+    /// One frame of the session: step it forward, catch the stack up with what
+    /// it offers now, and send every window's picture down `link`.
+    ///
+    /// Stepping first is what makes the captures worth taking: the pixels sent
+    /// here are the ones the programs committed during this step.
+    pub fn frame(&mut self, link: &wire::transport::Connection, timeout: std::time::Duration) {
         self.windowing.advance(timeout);
 
         let Some(root) = self.windowing.root_window().and_then(|root| root.upgrade()) else {
@@ -126,14 +128,37 @@ impl<T: WindowingServer> Compositor<T> {
         };
         self.maybe_resize_root(&root);
         self.sync(root);
+
+        // Each window encodes its own picture: the pixels are that window's, and
+        // so is the encoder, which is the pictures it has already sent. A window
+        // that has not drawn has nothing to send, which is not a failure — the
+        // next frame that commits carries a picture.
+        for window in &self.windows {
+            match window.window.capture(link) {
+                Ok(()) | Err(windowing::Error::NotReady) => {}
+                Err(e) => log::warn!("a frame was not sent: {e}"),
+            }
+        }
     }
 
     /// The root is the pane, so a change of pane is a change of the root window's
     /// size. The root takes the pane as its own rectangle, top left: it is the one
     /// window that fills the screen, and everything else is somewhere on it.
     fn maybe_resize_root(&mut self, root: &Arc<dyn StatefulWindow>) {
-        if root.state().area != self.pane {
-            root.set_state(WindowState { area: self.pane });
+        let was = root.state().area;
+        if was != self.pane {
+            // Worth a line every time it happens: the root is what the session
+            // hears about its own size, and a root that disagrees with the pane is
+            // a window drawn in the wrong place with nothing to show for it.
+            log::info!(
+                "compositor: the pane is {:?}, so the root goes from {:?} to it",
+                self.pane,
+                was
+            );
+            root.set_state(WindowState {
+                area: self.pane,
+                ..root.state()
+            });
             root.set_size((self.pane.width as u32, self.pane.height as u32));
             self.windowing
                 .set_size((self.pane.width as u32, self.pane.height as u32));
@@ -180,7 +205,18 @@ impl<T: WindowingServer> Compositor<T> {
         // the root first if it is the one missing, which leaves it at index 0.
         for window in offered {
             let root = Arc::ptr_eq(&window, &root);
+            // A window appearing is the event worth a line: what it is, where it
+            // was put, and whether it wears chrome.
+            log::info!(
+                "compositor: a window arrived, {} at {:?}",
+                if root { "the root" } else { "opened" },
+                window.state().area
+            );
             self.windows.push(DecoratedWindow::new(window, root));
+        }
+
+        if self.windows.is_empty() {
+            log::warn!("compositor: the stack is empty, nothing to draw");
         }
     }
 }
@@ -188,6 +224,12 @@ impl<T: WindowingServer> Compositor<T> {
 /// The compositor as the pane draws it: every window, bottom of the stack first.
 impl<T: WindowingServer> Widget for &mut Compositor<T> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // The pane is what every window is placed against, so a change of pane is
+        // worth a line: a frame drawn at a size nobody expected looks like a window
+        // in the wrong place, and this says whether the pane itself moved.
+        if self.pane != area {
+            log::info!("compositor: the pane is {area:?}, was {:?}", self.pane);
+        }
         self.pane = area;
         for window in self.windows.iter_mut() {
             let window_area = window.window.state().area;
@@ -216,6 +258,7 @@ fn collect(window: &Arc<dyn StatefulWindow>) -> Vec<Arc<dyn StatefulWindow>> {
                 area.width.max(MIN.0),
                 area.height.max(MIN.1),
             ),
+            ..window.state()
         });
     }
     for child in window.get_children() {

@@ -138,7 +138,11 @@ impl Gui {
         if self.debug.trace_gui {
             install_tracing()?;
         }
-        log::info!("gui {} starting, log at {}", self.program.display(), log_path.display());
+        log::info!(
+            "gui {} starting, log at {}",
+            self.program.display(),
+            log_path.display()
+        );
 
         // Drawn to the writer the caller gave, not to `io::stdout()`: the caller is what
         // knows where this pane's screen is, and writing to the process's own stdout would
@@ -183,12 +187,15 @@ impl Gui {
         let server: Box<dyn WindowingServer> = if self.debug.dummy_windowing {
             Box::new(compositor::windowing::dummy::DummyServer::default())
         } else {
-            Box::new(compositor::windowing::wayland::Server::new(wayland::Options {
-                resolution: output,
-                dpi: 1.0,
-                show_cursor: true,
-                use_x11: false,
-            })?)
+            Box::new(compositor::windowing::wayland::WaylandServer::new(
+                wayland::Options {
+                    resolution: output,
+                    dpi: 1.0,
+                    show_cursor: true,
+                    use_x11: false,
+                },
+                self.streaming.codec(),
+            )?)
         };
         let mut session = Session::new(
             self.program,
@@ -310,35 +317,23 @@ const DEFAULT_CELL: (u32, u32) = (10, 20);
 /// At the bottom of this file because it is small, and here rather than in a module
 /// because there is one of it.
 fn install_logger() -> std::path::PathBuf {
-    // One fixed path, so it is the same file every run and can simply be read afterwards.
-    // A path per process would mean knowing a pid before the log could be found, which is
-    // exactly what is not known when the session is the thing that failed.
-    let path = {
-        let dir = std::env::var("XDG_CACHE_HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                std::path::Path::new(&home).join(".cache")
-            })
-            .join("tuigui");
-        dir.join("gui.log")
-    };
+    // One fixed path, so it is the same file every run and can simply be read
+    // afterwards. A path per process would mean knowing a pid before the log could
+    // be found, which is exactly what is not known when the session is the thing
+    // that failed.
+    let path = std::path::PathBuf::from("/tmp/tuigui-gui.log");
 
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
-        .ok();
-    // A log that cannot be opened is not a reason to refuse the session: the pane is the
-    // job, and the log is a diagnostic for when the job goes wrong.
-    if let Some(file) = file {
-        static CAPTURER: std::sync::OnceLock<Capturer> = std::sync::OnceLock::new();
-        let capturer = CAPTURER.get_or_init(|| Capturer {
-            file: std::sync::Mutex::new(file),
-        });
-        let _ = log::set_logger(capturer);
-        log::set_max_level(log::LevelFilter::Trace);
-    }
+        .expect("the log is written to /tmp, which is always there");
+    static CAPTURER: std::sync::OnceLock<Capturer> = std::sync::OnceLock::new();
+    let capturer = CAPTURER.get_or_init(|| Capturer {
+        file: std::sync::Mutex::new(file),
+    });
+    log::set_logger(capturer).expect("the log is installed once, before anything logs");
+    log::set_max_level(log::LevelFilter::Trace);
     path
 }
 
@@ -395,10 +390,10 @@ fn install_tracing() -> std::io::Result<()> {
     //
     // A second call fails here too, which is right: one subscriber per process.
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(ours).with(layer))
-    .map_err(|e| {
-        log::error!("could not install the profiler: {e}");
-        std::io::Error::other(format!("could not install the profiler: {e}"))
-    })?;
+        .map_err(|e| {
+            log::error!("could not install the profiler: {e}");
+            std::io::Error::other(format!("could not install the profiler: {e}"))
+        })?;
 
     // One span, guaranteed, before anything else is instrumented. It answers "is
     // anything reaching the profiler at all", which is the first question when a

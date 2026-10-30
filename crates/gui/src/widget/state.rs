@@ -290,9 +290,9 @@ impl<T: WindowingServer> State<T> {
                         .map_err(|e| format!("could not deliver input: {e}"))?;
                 }
 
-                // One turn: advance the session, then draw where it got to.
-                // Bounded by the caller's frame.
-                compositor.advance(QUIET);
+                // One frame: step the session forward, and send every window's
+                // picture down the link. Bounded by the compositor's own step.
+                compositor.frame(&connection, QUIET);
 
                 // And then draw it. The draw is not decoration: each window's content
                 // area is filled with that window's surface, and those cells are what

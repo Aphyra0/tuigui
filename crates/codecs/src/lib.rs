@@ -30,7 +30,10 @@ pub enum CodecId {
 }
 
 /// Encode capture pixels into a stream the wire can carry, one frame at a time.
-pub trait Encoder {
+///
+/// `Send` because an encoder outlives the thread that built it: it is made where
+/// the session is and then lives beside the window whose frames it encodes.
+pub trait Encoder: Send {
     /// Encode one frame of B,G,R,A pixels at `width` x `height`, and return the
     /// bytes to send: headers before the first picture, pictures after that.
     ///
@@ -77,6 +80,22 @@ impl CodecId {
         match self {
             Self::H264 => Ok(Box::new(h264::Decoder::new())),
             Self::Jpeg => Ok(Box::new(jpeg::Decoder::new()?)),
+        }
+    }
+
+    /// Build the encoder for the codec the client streams with, which it keeps for
+    /// the session: one encoder, because its state is the stream.
+    ///
+    /// `size` is what the session draws at, which H.264 needs up front: its
+    /// parameter sets describe a picture of one size.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a codec this build does not carry, or one that refuses the size.
+    pub fn to_encoder(self, size: (u32, u32)) -> Result<Box<dyn Encoder>, Error> {
+        match self {
+            Self::H264 => Ok(Box::new(h264::Encoder::new(size.0, size.1)?)),
+            Self::Jpeg => Ok(Box::new(jpeg::Encoder::new()?)),
         }
     }
 }

@@ -70,7 +70,10 @@ impl Frame {
             Rect::new(x, y, w, from.bottom() - y)
         };
 
-        window.set_state(WindowState { area });
+        window.set_state(WindowState {
+            area,
+            ..window.state()
+        });
         self.resize = (!matches!(mouse.kind, MouseEventKind::Up(_))).then_some((pressed, from));
         None
     }

@@ -154,6 +154,7 @@ pub enum Message {
     Debug,
     Clone,
     Copy,
+    Default,
     PartialEq,
     Eq,
     Hash,

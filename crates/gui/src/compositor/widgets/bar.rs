@@ -73,6 +73,7 @@ impl Bar {
         let room = pane.resize(Size::new(pane.width, pane.height.saturating_sub(1)));
         window.set_state(WindowState {
             area: (window.state().area + delta).clamp(room),
+            ..window.state()
         });
         self.drag = (!matches!(mouse.kind, MouseEventKind::Up(_))).then_some(at);
         None

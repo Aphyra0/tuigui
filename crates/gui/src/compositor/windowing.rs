@@ -20,16 +20,19 @@ use std::sync::Weak;
 use ratatui::layout::Rect;
 use ratatui::widgets::WidgetRef;
 
-/// Where a window is and how big it is, in cells: the layout the compositor
-/// draws from, and the thing a drag moves or a frame pull resizes.
+/// Where a window is and how big it is, in cells, and the cells it draws into.
 ///
 /// The rectangle is on the pane, whose origin is `(0, 0)`, so it is already the
-/// screen rectangle. Nothing here is the pointer's business: which gesture is in
-/// flight belongs to the compositor, in [`InputMode`](super::window::InputMode).
+/// screen rectangle. The surface is the window's identity: what a frame is
+/// addressed by, and what the other side scans the pane for. Nothing here is the
+/// pointer's business: which gesture is in flight belongs to the compositor, in
+/// [`InputMode`](super::window::InputMode).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WindowState {
     /// The window's rectangle on the pane, in cells.
     pub area: Rect,
+    /// The cells this window's picture goes into.
+    pub surface: wire::message::SurfaceId,
 }
 
 /// The window session as a whole: what a program runs in.
@@ -116,9 +119,13 @@ pub trait StatefulWindow: WidgetRef + Send + Sync {
     /// Queue one pointer event for delivery to this window.
     fn pointer_input(&self, event: ui_events::pointer::PointerEvent) -> Result<(), Error>;
 
-    /// What the window last drew: RGBA8, row-major, `width * height * 4` bytes.
-    /// `NotReady` until it has drawn at least once.
-    fn capture(&self) -> Result<Vec<u8>, Error>;
+    /// What the window last drew, encoded and sent: one frame, addressed by the
+    /// cells it draws into. `NotReady` until it has drawn at least once.
+    ///
+    /// Encoding is the window's own business because the stream is: an encoder's
+    /// state is the pictures it has already sent, so it belongs beside the pixels
+    /// it encodes.
+    fn capture(&self, link: &wire::transport::Connection) -> Result<(), Error>;
 
     /// Ask this window to draw at `size` pixels instead of its current one.
     ///
@@ -147,12 +154,18 @@ pub trait StatefulWindow: WidgetRef + Send + Sync {
 }
 
 /// Why a window could not do what was asked of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     /// The client that owned the window is gone, so nothing is listening.
     Gone,
     /// The window exists but has not drawn yet: there is nothing to capture.
     NotReady,
+    /// The codec could not be built for this window's size.
+    Build(String),
+    /// The codec refused the frame.
+    Encode(String),
+    /// The frame was made and the link would not take it.
+    Send(String),
 }
 
 impl std::fmt::Display for Error {
@@ -160,11 +173,46 @@ impl std::fmt::Display for Error {
         match self {
             Error::Gone => f.write_str("the window is gone"),
             Error::NotReady => f.write_str("the window has not drawn yet"),
+            Error::Build(e) => write!(f, "the codec could not be built: {e}"),
+            Error::Encode(e) => write!(f, "the codec refused the frame: {e}"),
+            Error::Send(e) => write!(f, "the frame could not be sent: {e}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+/// How long one message is given to leave this side.
+///
+/// A message is a write to another process, which may be busy with the one
+/// before it. Bounded so a link that stopped draining is reported rather than
+/// waited on: without it the frame stalls with the message in hand and says
+/// nothing, which reads as a frozen pane.
+pub const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Write one message to the link from a draw, which is synchronous.
+///
+/// The blocking is what `block_in_place` makes safe: the draw runs on a runtime
+/// worker, and that call is the one that says so. Sending here rather than
+/// pushing the write onto the runtime keeps messages in the order the frames
+/// that produced them were made.
+///
+/// FIXME: this should go. A draw that blocks on a socket is a draw waiting for
+/// another process, and the frame loop should hand its messages over instead of
+/// writing them itself.
+pub fn send(
+    link: &wire::transport::Connection,
+    message: &wire::message::Message,
+) -> Result<(), Error> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            tokio::time::timeout(SEND_TIMEOUT, link.send(message))
+                .await
+                .map_err(|_| Error::Send(format!("the link took nothing within {SEND_TIMEOUT:?}")))?
+                .map_err(|e| Error::Send(e.to_string()))
+        })
+    })
+}
 
 /// Delivering input is the only failure this module hands back as an I/O error:
 /// the caller writes it to the pane's log beside the reads and writes it sits
