@@ -129,6 +129,12 @@ impl Window {
         Some((pixels, size))
     }
 
+    /// The size this window was last configured at, in pixels: what its client was
+    /// asked to draw, which is the size its next commit is expected at.
+    pub fn size(&self) -> (u32, u32) {
+        *self.surface.size.read().unwrap()
+    }
+
     /// Ask this window to draw at `size` pixels instead of its current one.
     /// The client answers by committing a buffer at whatever size it chose.
     pub fn set_size(&self, size: (u32, u32)) {

@@ -156,9 +156,9 @@ impl Gui {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        // The output size is the terminal's own, read once: the compositor's output is the
-        // program's window, and it does not change while the session runs.
-        let Size { output, cell } = output_size()?;
+        // The output size is the terminal's own, read once: it is the size the session
+        // is created at, and the pane's own report is what resizes it from then on.
+        let output = output_size()?;
 
         // The terminal is asked for its mouse and keyboard events before the
         // session starts, so nothing typed while it connects is lost.
@@ -200,7 +200,6 @@ impl Gui {
         let mut session = Session::new(
             self.program,
             output,
-            cell,
             input_receiver,
             self.streaming.codec(),
             server,
@@ -220,50 +219,30 @@ impl Gui {
     }
 }
 
-/// The size of this terminal, in output pixels and in one cell.
+/// The size of this terminal in pixels, as the session is created at.
 ///
 /// Taken from the terminal itself: the pane's geometry is what the picture is fitted to, so
-/// an output sized to it is one the program lays itself out against correctly. The cell size
-/// is kept as well, because a mouse event arrives in cells and the compositor's pointer is
-/// in pixels, so a click has to be converted with exactly the cell this derived.
+/// an output sized to it is one the program lays itself out against correctly. The same
+/// report is read again on every frame, which is what resizes the session afterwards; this
+/// is only the size it starts at, before any frame has been drawn.
 ///
 /// The pixel fields of a terminal's window size are documented as unreliable and often zero
 /// — they are a property of the graphics layer, not the tty. A terminal that does not report
-/// them is therefore not an error, and the cell size is assumed instead. Returning the
+/// them is therefore not an error, and one pixel a cell is assumed instead. Returning the
 /// reported pixels directly would be `0x0` in that case, and a zero-sized output is not a
 /// small window: it is no surface at all, so a program started into it never commits a
 /// buffer and never says why.
-fn output_size() -> std::io::Result<Size> {
-    let ws = ratatui::crossterm::terminal::window_size()?;
-    let (cols, rows) = (ws.columns as u32, ws.rows as u32);
-    let (cell_w, cell_h) = match (ws.width, ws.height) {
-        (w, h) if w > 0 && h > 0 => (
-            (w as u32 / cols.max(1)).max(1),
-            (h as u32 / rows.max(1)).max(1),
-        ),
-        _ => DEFAULT_CELL,
+fn output_size() -> std::io::Result<(u32, u32)> {
+    let ws = rustix::termios::tcgetwinsize(std::io::stdin()).map_err(std::io::Error::from)?;
+    let (cols, rows) = (u32::from(ws.ws_col).max(1), u32::from(ws.ws_row).max(1));
+    let output = match (u32::from(ws.ws_xpixel), u32::from(ws.ws_ypixel)) {
+        (0, _) | (_, 0) => (cols, rows),
+        pixels => pixels,
     };
-    let output = (cols.max(1) * cell_w, rows.max(1) * cell_h);
     log::info!(
-        "the terminal reports {cols}x{rows} cells, {}x{} pixels -> cell {cell_w}x{cell_h}, output {}x{}",
-        ws.width,
-        ws.height,
-        output.0,
-        output.1
+        "the terminal is {cols}x{rows} cells, {output:?} pixels, so the session starts at {output:?}"
     );
-    Ok(Size {
-        output,
-        cell: (cell_w, cell_h),
-    })
-}
-
-/// The terminal's size: the output in pixels, and one cell in pixels.
-struct Size {
-    /// The whole pane, in pixels, which is the compositor's output.
-    output: (u32, u32),
-    /// One cell, in pixels: how a mouse position in cells becomes a pointer in
-    /// pixels.
-    cell: (u32, u32),
+    Ok(output)
 }
 
 /// Holds this terminal in raw mode, and restores the old settings when dropped.
@@ -304,13 +283,6 @@ impl Drop for Raw {
         );
     }
 }
-
-/// The cell size assumed when the terminal does not report one, in pixels.
-///
-/// Standard for a monospace face at the sizes terminals ship with, and it only has to be
-/// close: the compositor's output is what the program lays out against, and the terminal
-/// fits the resulting picture to the same cell grid either way.
-const DEFAULT_CELL: (u32, u32) = (10, 20);
 
 /// Install the capturer every `log` record goes to, and return where it writes.
 ///

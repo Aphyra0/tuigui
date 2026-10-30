@@ -112,6 +112,7 @@ impl<T: WindowingServer> State<T> {
     pub async fn render(
         self,
         content: Rect,
+        winsize: rustix::termios::Winsize,
         buf: &mut Buffer,
         session: &mut Session<T>,
     ) -> Result<State<T>, String> {
@@ -222,18 +223,6 @@ impl<T: WindowingServer> State<T> {
                         // is what the state carries, so a failure is drawn like
                         // any other.
                         //
-                        // The pane in cells comes from the output in pixels and the
-                        // terminal's cell size, which are the two numbers the session
-                        // already holds: a window is laid out in cells, and its picture
-                        // is that box scaled to pixels.
-                        let (cell_w, cell_h) = session.cell;
-                        let pane = Rect::new(
-                            0,
-                            0,
-                            (session.size.0 / cell_w.max(1)) as u16,
-                            (session.size.1 / cell_h.max(1)) as u16,
-                        );
-                        let _ = pane;
                         // The session is taken now: it was built where the
                         // session began, and the compositor owns it from here.
                         let mut server = session
@@ -291,8 +280,9 @@ impl<T: WindowingServer> State<T> {
                 }
 
                 // One frame: step the session forward, and send every window's
-                // picture down the link. Bounded by the compositor's own step.
-                compositor.frame(&connection, QUIET);
+                // picture down the link. Bounded by the compositor's own step, and
+                // sized by the terminal as it is this frame.
+                compositor.frame(&connection, QUIET, winsize);
 
                 // And then draw it. The draw is not decoration: each window's content
                 // area is filled with that window's surface, and those cells are what

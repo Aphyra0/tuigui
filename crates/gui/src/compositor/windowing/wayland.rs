@@ -107,8 +107,14 @@ impl WindowingServer for WaylandServer {
 
     /// The session is resized: the output changes mode, and the root window is
     /// measured against the new size on its next read.
+    ///
+    /// The caller states the size the pane is every frame, so this is where the
+    /// comparing is done: a session already that size changes nothing, which is
+    /// what keeps an untouched terminal from a configure per frame.
     fn set_size(&mut self, size: (u32, u32)) {
-        self.inner.set_size(size);
+        if self.inner.size() != size {
+            self.inner.set_size(size);
+        }
     }
 }
 
@@ -188,8 +194,14 @@ impl StatefulWindow for WaylandWindow {
     }
 
     /// Ask the session's window to draw at a size. The next commit answers.
+    ///
+    /// Only when it differs from what the window was last asked for: this is
+    /// called every frame, and a configure per frame is a client re-laying itself
+    /// out per frame.
     fn set_size(&self, size: (u32, u32)) {
-        self.inner.set_size(size);
+        if self.inner.size() != size {
+            self.inner.set_size(size);
+        }
     }
 
     fn state(&self) -> WindowState {

@@ -106,12 +106,6 @@ pub struct Session<T: WindowingServer> {
     /// receives. Nothing is lost while a state is not reading: the channel
     /// holds whatever arrived, and the streaming step drains it all at once.
     pub input_receiver: std::sync::mpsc::Receiver<termina::Event>,
-    /// What one terminal cell is in output pixels.
-    ///
-    /// A mouse event arrives in cells and the compositor's pointer is in pixels,
-    /// so this is the conversion, and it is the same cell size `output_size`
-    /// derived the output from.
-    pub cell: (u32, u32),
 }
 
 impl<T: WindowingServer> Session<T> {
@@ -123,7 +117,6 @@ impl<T: WindowingServer> Session<T> {
     pub fn new(
         program: std::path::PathBuf,
         size: (u32, u32),
-        cell: (u32, u32),
         input_receiver: std::sync::mpsc::Receiver<termina::Event>,
         codec: CodecId,
         server: T,
@@ -138,7 +131,6 @@ impl<T: WindowingServer> Session<T> {
             server: Some(server),
             debug,
             size,
-            cell,
             input_receiver,
         }
     }
@@ -184,6 +176,19 @@ impl<T: WindowingServer> StatefulWidget for GuiWidget<T> {
         let [content, footer] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
+        // The terminal's own report of itself, read once here because this is the call
+        // that draws: the grid says how many cells the pane is, and `ws_xpixel`/
+        // `ws_ypixel` say how many pixels, which is the size the session's program is
+        // configured at. It is read rather than kept because a terminal changes shape
+        // without anything here being told: a font that grew keeps the grid and changes
+        // the picture.
+        //
+        // The read failing is a pane that cannot ask its own terminal what it is, and
+        // there is no size to draw at that is not invented: the session could only go on
+        // drawing at a size nobody measured.
+        let winsize = rustix::termios::tcgetwinsize(std::io::stdin())
+            .expect("the terminal must report its own size");
+
         // Where the session is may change because of drawing this frame: the async step is
         // driven here, and it draws itself where it stands.
         //
@@ -205,7 +210,12 @@ impl<T: WindowingServer> StatefulWidget for GuiWidget<T> {
             // draw is synchronous: it tells the runtime to move other tasks elsewhere
             // while this one blocks, which is what makes blocking here safe.
             let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(state.render(content, buf, session))
+                tokio::runtime::Handle::current().block_on(state.render(
+                    content,
+                    winsize,
+                    buf,
+                    session,
+                ))
             });
             result
         });

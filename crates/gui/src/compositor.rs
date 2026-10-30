@@ -120,13 +120,23 @@ impl<T: WindowingServer> Compositor<T> {
     ///
     /// Stepping first is what makes the captures worth taking: the pixels sent
     /// here are the ones the programs committed during this step.
-    pub fn frame(&mut self, link: &wire::transport::Connection, timeout: std::time::Duration) {
+    ///
+    /// `winsize` is the terminal's own report of itself, read once per frame by the
+    /// caller: it is the only place the pane's size in **pixels** comes from, and
+    /// a terminal may change it without changing its grid — a font that grew is a
+    /// bigger picture of the same number of cells.
+    pub fn frame(
+        &mut self,
+        link: &wire::transport::Connection,
+        timeout: std::time::Duration,
+        winsize: rustix::termios::Winsize,
+    ) {
         self.windowing.advance(timeout);
 
         let Some(root) = self.windowing.root_window().and_then(|root| root.upgrade()) else {
             return;
         };
-        self.maybe_resize_root(&root);
+        self.maybe_resize_root(&root, winsize);
         self.sync(root);
 
         // Each window encodes its own picture: the pixels are that window's, and
@@ -142,16 +152,44 @@ impl<T: WindowingServer> Compositor<T> {
     }
 
     /// The root is the pane, so a change of pane is a change of the root window's
-    /// size. The root takes the pane as its own rectangle, top left: it is the one
-    /// window that fills the screen, and everything else is somewhere on it.
-    fn maybe_resize_root(&mut self, root: &Arc<dyn StatefulWindow>) {
+    /// rectangle on the pane, and a change of the terminal's shape is a change of
+    /// the session's output. The root takes the pane as its own, top left: it is
+    /// the one window that fills the screen, and everything else is somewhere on
+    /// it.
+    ///
+    /// The program is configured in **pixels**, which is what the terminal reports
+    /// and not what the grid says: `ws_xpixel`/`ws_ypixel` are the whole pane in
+    /// pixels, and the cells merely say where that picture goes. Configuring the
+    /// program at the cell count instead gives it a window of `80x24` pixels for
+    /// the pane to stretch over `80x24` cells.
+    fn maybe_resize_root(
+        &mut self,
+        root: &Arc<dyn StatefulWindow>,
+        winsize: rustix::termios::Winsize,
+    ) {
+        let pixels = (
+            u32::from(winsize.ws_xpixel),
+            u32::from(winsize.ws_ypixel),
+        );
+        // A terminal that reports no pixels is one that cannot say, and it is not
+        // an error: the grid is still known, so the program is configured at one
+        // pixel a cell. That is the smallest picture that keeps the layout
+        // honest, and the pane stretches it to whatever the terminal really is.
+        let pixels = match pixels {
+            (0, _) | (_, 0) => (
+                u32::from(winsize.ws_col).max(1),
+                u32::from(winsize.ws_row).max(1),
+            ),
+            _ => pixels,
+        };
+
         let was = root.state().area;
         if was != self.pane {
             // Worth a line every time it happens: the root is what the session
             // hears about its own size, and a root that disagrees with the pane is
             // a window drawn in the wrong place with nothing to show for it.
             log::info!(
-                "compositor: the pane is {:?}, so the root goes from {:?} to it",
+                "compositor: the pane is {:?} cells ({pixels:?} pixels), so the root goes from {:?} to it",
                 self.pane,
                 was
             );
@@ -159,10 +197,14 @@ impl<T: WindowingServer> Compositor<T> {
                 area: self.pane,
                 ..root.state()
             });
-            root.set_size((self.pane.width as u32, self.pane.height as u32));
-            self.windowing
-                .set_size((self.pane.width as u32, self.pane.height as u32));
         }
+
+        // The output is told the size the pane is, every frame: a backend that is
+        // already that size does nothing, so an untouched terminal costs no
+        // configure, and a terminal that changed without changing its grid is
+        // still caught.
+        root.set_size(pixels);
+        self.windowing.set_size(pixels);
     }
 
     /// The window a key belongs to when nothing is focused: the root, which is
